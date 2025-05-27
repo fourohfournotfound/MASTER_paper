@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
+from scipy.stats import spearmanr # Added for IC calculation
 
 from master import MASTERModel
 # Assuming base_model.py contains the definition for SequenceModel
@@ -22,6 +23,30 @@ def log_to_memory(data):
 def log_lesson(lesson):
     # Basic implementation, can be expanded
     print(f"Lesson learned: {lesson}")
+
+def calculate_ic(predictions, actuals):
+    """Calculates Spearman Rank Correlation (Information Coefficient)."""
+    if len(predictions) < 2 or len(actuals) < 2:
+        return 0.0, 0.0 # Not enough data for correlation
+    
+    # Ensure inputs are 1D arrays
+    predictions = np.asarray(predictions).flatten()
+    actuals = np.asarray(actuals).flatten()
+
+    # Check for constant arrays which can cause issues with spearmanr
+    if np.all(predictions == predictions[0]) or np.all(actuals == actuals[0]):
+        log_to_memory({"event": "calculate_ic_constant_array_warning"})
+        return 0.0, 1.0 # Return 0 correlation, p-value 1 to indicate issue
+
+    try:
+        ic_value, p_value = spearmanr(predictions, actuals)
+        if np.isnan(ic_value): # spearmanr can return nan if std dev is zero
+            log_to_memory({"event": "calculate_ic_nan_result"})
+            return 0.0, 1.0
+        return ic_value, p_value
+    except Exception as e:
+        log_lesson(f"Error calculating IC: {e}")
+        return 0.0, 1.0
 
 def load_and_preprocess_data(csv_path, sequence_len=60):
     """
@@ -245,6 +270,10 @@ def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2, d
     epochs_no_improve = 0
     early_stopping_patience = 5
 
+    if n_epochs <= 0:
+        print(f"Warning: Number of training epochs is {n_epochs}. No training will occur and no epoch metrics will be printed.")
+        log_to_memory({"event": "training_skipped_due_to_n_epochs", "n_epochs_value": n_epochs})
+
     for epoch in range(n_epochs):
         model.model.train()
         epoch_train_loss = 0
@@ -262,18 +291,28 @@ def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2, d
 
         model.model.eval()
         epoch_val_loss = 0
+        all_val_preds = []
+        all_val_actuals = []
         with torch.no_grad():
             for batch_X_val, batch_y_val in val_loader:
                 batch_X_val, batch_y_val = batch_X_val.to(device), batch_y_val.to(device)
                 val_preds = model.model(batch_X_val)
                 loss = criterion(val_preds, batch_y_val)
                 epoch_val_loss += loss.item()
+                all_val_preds.append(val_preds.cpu().numpy())
+                all_val_actuals.append(batch_y_val.cpu().numpy())
+        
         avg_epoch_val_loss = epoch_val_loss / len(val_loader)
+        
+        all_val_preds_np = np.concatenate(all_val_preds)
+        all_val_actuals_np = np.concatenate(all_val_actuals)
+        val_ic, val_p_value = calculate_ic(all_val_preds_np, all_val_actuals_np)
 
-        print(f"Epoch [{epoch+1}/{n_epochs}], Train Loss: {avg_epoch_train_loss:.6f}, Val Loss: {avg_epoch_val_loss:.6f}")
+        print(f"Epoch [{epoch+1}/{n_epochs}], Train Loss: {avg_epoch_train_loss:.6f}, Val Loss: {avg_epoch_val_loss:.6f}, Val IC: {val_ic:.4f}")
         log_to_memory({
             "event": "epoch_end", "epoch": epoch+1, 
-            "train_loss": avg_epoch_train_loss, "val_loss": avg_epoch_val_loss
+            "train_loss": avg_epoch_train_loss, "val_loss": avg_epoch_val_loss,
+            "val_ic": val_ic, "val_ic_p_value": val_p_value
         })
 
         if avg_epoch_val_loss < best_val_loss:
@@ -291,8 +330,54 @@ def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2, d
             
     log_to_memory({"event": "training_complete"})
     
-    # TODO: Implement testing phase with X_test_tensor, y_test_tensor and target_scaler
-    print("Training finished.")
+    # Test phase
+    log_to_memory({"event": "test_phase_start"})
+    model.model.eval() # Ensure model is in evaluation mode
+    
+    # Prepare test data - assuming X_test_master is needed if model expects concatenated features
+    # Ensure X_test_tensor is correctly formed from preprocessed test data
+    if X_test_tensor.shape[2] == num_primary_features: # d_feat from preprocessing
+         X_test_master_input = torch.cat([X_test_tensor, X_test_tensor], dim=2).to(device)
+    else: # If X_test_tensor was already prepared like X_train_master
+         X_test_master_input = X_test_tensor.to(device)
+
+    all_test_preds = []
+    all_test_actuals = []
+    
+    # Create a DataLoader for the test set for batching, if memory is a concern
+    # For simplicity, if test set is small enough, can predict in one go
+    # Here, let's assume we might need a DataLoader for consistency
+    test_dataset = TensorDataset(X_test_master_input, y_test_tensor.to(device)) # y_test_tensor needs to be on device too
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+    with torch.no_grad():
+        for batch_X_test, batch_y_test in test_loader:
+            # batch_X_test is already on device from X_test_master_input
+            # batch_y_test is already on device from test_dataset
+            test_preds = model.model(batch_X_test)
+            all_test_preds.append(test_preds.cpu().numpy())
+            all_test_actuals.append(batch_y_test.cpu().numpy())
+
+    all_test_preds_np = np.concatenate(all_test_preds)
+    all_test_actuals_np = np.concatenate(all_test_actuals)
+
+    # Inverse transform predictions and actuals for scaled metrics like MSE
+    # Predictions are for the scaled target
+    test_preds_rescaled = target_scaler.inverse_transform(all_test_preds_np)
+    test_actuals_rescaled = target_scaler.inverse_transform(all_test_actuals_np)
+
+    test_mse = np.mean((test_preds_rescaled - test_actuals_rescaled)**2)
+    test_ic, test_p_value = calculate_ic(all_test_preds_np, all_test_actuals_np) # IC on scaled or unscaled should be similar for rank
+
+    print(f"Test Results - MSE: {test_mse:.6f}, IC: {test_ic:.4f}")
+    log_to_memory({
+        "event": "test_phase_end", 
+        "test_mse": test_mse, 
+        "test_ic": test_ic,
+        "test_ic_p_value": test_p_value
+    })
+    
+    print("Training and testing finished.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MASTER model on multi-index stock data.")
@@ -303,7 +388,7 @@ if __name__ == "__main__":
     parser.add_argument("--s_nhead", type=int, default=2, help="Number of heads for spatial attention.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
     parser.add_argument("--beta", type=float, default=1.0, help="Beta for feature gate.")
-    parser.add_argument("--n_epochs", type=int, default=10, help="Number of training epochs.")
+    parser.add_argument("--n_epochs", type=int, default=2, help="Number of training epochs.")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     
     args = parser.parse_args()
