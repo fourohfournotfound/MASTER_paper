@@ -36,7 +36,14 @@ class DailyBatchSamplerRandom(Sampler):
         self.data_source = data_source
         self.shuffle = shuffle
         # calculate number of samples in each batch
-        self.daily_count = pd.Series(index=self.data_source.get_index()).groupby("datetime").size().values
+        idx = self.data_source.get_index()
+        if 'datetime' in idx.names:
+            level = 'datetime'
+        elif 'date' in idx.names:
+            level = 'date'
+        else:
+            level = idx.names[0]
+        self.daily_count = pd.Series(index=idx).groupby(level=level).size().values
         self.daily_index = np.roll(np.cumsum(self.daily_count), 1)  # calculate begin index of each batch
         self.daily_index[0] = 0
 
@@ -143,9 +150,10 @@ class SequenceModel():
         return float(np.mean(losses))
 
     def _init_data_loader(self, data, shuffle=True, drop_last=True):
+        if hasattr(data, 'is_multiindex_dataset'):
+            return DataLoader(data, batch_size=1, shuffle=shuffle, drop_last=drop_last)
         sampler = DailyBatchSamplerRandom(data, shuffle)
-        data_loader = DataLoader(data, sampler=sampler, drop_last=drop_last)
-        return data_loader
+        return DataLoader(data, sampler=sampler, drop_last=drop_last)
 
     def load_param(self, param_path):
         self.model.load_state_dict(torch.load(param_path, map_location=self.device))

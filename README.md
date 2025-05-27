@@ -37,6 +37,17 @@ For any questions, please first check on the closed issues, and then open a new 
 
 5. We provide models trained on the original data or opensource data: <code> model/csi300_original_0.pkl, model/csi800_original_0.pkl, model/csi300_opensource_0.pkl, model/csi800_opensource_0.pkl</code>
 
+6. To train on your own CSV file with a `ticker`/`date` multi-index, first convert it into a pandas `DataFrame` and build a `MultiIndexDataset`:
+
+```python
+import pandas as pd
+from dataset import MultiIndexDataset
+
+df = pd.read_csv("your_file.csv", parse_dates=["date"]).set_index(["ticker", "date"]).sort_index()
+ds = MultiIndexDataset(df, lookback=8, return_col="closeadj")
+```
+Pass `ds` to `MASTERModel.fit` or `predict` just like the provided pickled datasets. Make sure the repository root is in your `PYTHONPATH` so that `dataset.py` can be imported.
+
 
 ## Dataset
 ### Form
