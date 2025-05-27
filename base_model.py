@@ -58,7 +58,14 @@ class SequenceModel():
     def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= ''):
         self.n_epochs = n_epochs
         self.lr = lr
-        self.device = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            if GPU is None:
+                self.device = torch.device("cuda") # Default to cuda if GPU is None
+            else:
+                self.device = torch.device(f"cuda:{GPU}") # Use specified GPU
+        else:
+            self.device = torch.device("cpu")
+        
         self.seed = seed
         self.train_stop_loss_thred = train_stop_loss_thred
 
