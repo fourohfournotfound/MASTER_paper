@@ -1,327 +1,498 @@
-import numpy as np
+import argparse
 import pandas as pd
-import copy
-
+import numpy as np
 import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, Sampler # Changed Sampler to Dataset for TensorDataset
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import DataLoader, Dataset
+from scipy.stats import spearmanr
+from statsmodels.tsa.stattools import adfuller
 
-def calc_ic(pred, label):
-    # Ensure inputs are numpy arrays
-    if isinstance(pred, torch.Tensor):
-        pred = pred.cpu().numpy()
-    if isinstance(label, torch.Tensor):
-        label = label.cpu().numpy()
+# Attempt to import from user-provided master.py and base_model.py
+# These files should be in the same directory or Python path.
+try:
+    from master import MASTERModel
+    # DailyBatchSamplerRandom is not used by the current base_model.py's SequenceModel
+    # but keeping the import for now in case of future changes or if user reverts base_model.py
+    from base_model import SequenceModel, DailyBatchSamplerRandom, zscore, calc_ic as base_calc_ic
+    # calc_ic from base_model.py will be used by SequenceModel.predict
+except ImportError as e:
+    print(f"Error importing MASTERModel or SequenceModel: {e}")
+    print("Please ensure master.py and base_model.py (with your provided code) are in the same directory.")
+    raise
+
+# Memory and Logging (placeholders for now)
+LONG_SHORT_TERM_MEMORY_FILE = "memory_log.json"
+LESSONS_LEARNED_FILE = "lessons_learned.md"
+
+def log_to_memory(data):
+    # Basic implementation, can be expanded
+    print(f"Memory log: {data}")
+
+def log_lesson(lesson):
+    # Basic implementation, can be expanded
+    print(f"Lesson learned: {lesson}")
+
+def calculate_ic(predictions, actuals):
+    """Calculates Spearman Rank Correlation (Information Coefficient)."""
+    if len(predictions) < 2 or len(actuals) < 2:
+        return 0.0, 0.0 # Not enough data for correlation
     
-    pred = pred.flatten()
-    label = label.flatten()
+    # Ensure inputs are 1D arrays
+    predictions = np.asarray(predictions).flatten()
+    actuals = np.asarray(actuals).flatten()
 
-    df = pd.DataFrame({'pred':pred, 'label':label})
-    # Drop rows where label might be NaN after potential processing,
-    # or if pred is NaN (though less likely for model output)
-    df.dropna(subset=['label', 'pred'], inplace=True)
-    if df.shape[0] < 2: # Not enough data points for correlation
-        return 0.0, 0.0
+    # Check for constant arrays which can cause issues with spearmanr
+    if np.all(predictions == predictions[0]) or np.all(actuals == actuals[0]):
+        log_to_memory({"event": "calculate_ic_constant_array_warning"})
+        return 0.0, 1.0 # Return 0 correlation, p-value 1 to indicate issue
 
-    # Check for constant series after NaN drop
-    if df['pred'].nunique() <= 1 or df['label'].nunique() <= 1:
-        return 0.0, 0.0 # Or handle as an error/warning
+    try:
+        ic_value, p_value = spearmanr(predictions, actuals)
+        if np.isnan(ic_value): # spearmanr can return nan if std dev is zero
+            log_to_memory({"event": "calculate_ic_nan_result"})
+            return 0.0, 1.0
+        return ic_value, p_value
+    except Exception as e:
+        log_lesson(f"Error calculating IC: {e}")
+        return 0.0, 1.0
 
-    ic = df['pred'].corr(df['label'], method='pearson')
-    ric = df['pred'].corr(df['label'], method='spearman')
-    return ic if not np.isnan(ic) else 0.0, ric if not np.isnan(ric) else 0.0
-
-def zscore(x: torch.Tensor):
-    # Ensure we don't try to zscore an empty or all-NaN tensor after filtering
-    if x.numel() == 0 or torch.isnan(x).all():
-        return x # Return as is, or handle error
-    mean = x.mean()
-    std = x.std()
-    if std == 0: # Avoid division by zero
-        return x - mean # Just center if std is zero
-    return (x - mean) / std
-
-def drop_extreme(x: torch.Tensor):
-    # Ensure x is 1D
-    x_1d = x.flatten()
-    if x_1d.numel() == 0:
-        return torch.empty_like(x_1d, dtype=torch.bool), x_1d
-
-    sorted_tensor, indices = torch.sort(x_1d)
-    N = x_1d.shape[0]
-    percent_2_5 = int(0.025*N)
-    
-    # Handle cases where N is too small for 2.5% drop from both ends
-    if N <= 1 or percent_2_5 * 2 >= N : # If dropping 2.5% from each end removes everything or more
-        # Don't drop anything if the tensor is too small to meaningfully apply the rule
-        mask = torch.ones_like(x_1d, device=x.device, dtype=torch.bool)
-        return mask, x_1d[mask]
-
-    filtered_indices = indices[percent_2_5 : N - percent_2_5] # Corrected slicing
-    
-    mask = torch.zeros_like(x_1d, device=x.device, dtype=torch.bool)
-    if filtered_indices.numel() > 0: # Ensure filtered_indices is not empty
-      mask[filtered_indices] = True
-    return mask, x_1d[mask]
-
-
-class DailyBatchSamplerRandom(Sampler):
-    def __init__(self, data_source, shuffle=False):
-        super().__init__(data_source) # Added: Call to superclass constructor
-        self.data_source = data_source
-        self.shuffle = shuffle
-        # calculate number of samples in each batch
-        # Assuming data_source has a get_index() method that returns a pandas MultiIndex like StockDataset
-        idx = self.data_source.get_index()
-        self.daily_count = pd.Series(index=idx).groupby(idx.get_level_values('datetime')).size().values
-        self.daily_index = np.roll(np.cumsum(self.daily_count), 1)  # calculate begin index of each batch
-        self.daily_index[0] = 0
-
-    def __iter__(self):
-        if self.shuffle:
-            # Shuffle the order of days, not samples within a day for typical financial TS
-            day_indices = np.arange(len(self.daily_count))
-            np.random.shuffle(day_indices)
-            for i in day_indices:
-                yield np.arange(self.daily_index[i], self.daily_index[i] + self.daily_count[i])
+class StockDataset(Dataset):
+    def __init__(self, features_tensor, labels_tensor, index_df_for_sampler=None):
+        """
+        Args:
+            features_tensor (torch.Tensor): Tensor of shape (num_samples, seq_len, num_features)
+            labels_tensor (torch.Tensor): Tensor of shape (num_samples, 1) or (num_samples,)
+            index_df_for_sampler (pd.DataFrame, optional): DataFrame with 'datetime' and 'instrument' (ticker)
+                                                      for get_index(), if DailyBatchSamplerRandom is used.
+        """
+        self.features_tensor = features_tensor
+        self.labels_tensor = labels_tensor
+        
+        # The following is for compatibility with DailyBatchSamplerRandom if it were to be used.
+        # The current base_model.py's SequenceModel uses a standard DataLoader.
+        self.index_df_for_sampler = index_df_for_sampler
+        if self.index_df_for_sampler is not None:
+            self.index_df_for_sampler = self.index_df_for_sampler.reset_index(drop=True)
+            self.pd_index_for_sampler = pd.MultiIndex.from_frame(self.index_df_for_sampler[['datetime', 'instrument']])
         else:
-            for idx_start, count in zip(self.daily_index, self.daily_count):
-                yield np.arange(idx_start, idx_start + count)
+            self.pd_index_for_sampler = None
+
 
     def __len__(self):
-        # This should return the number of batches (days), not total samples
-        return len(self.daily_count)
+        return len(self.features_tensor)
+
+    def __getitem__(self, idx):
+        return self.features_tensor[idx], self.labels_tensor[idx]
+
+    def get_index(self):
+        # Required by DailyBatchSamplerRandom, not used by current SequenceModel's DataLoader
+        if self.pd_index_for_sampler is None:
+            # Fallback or raise error if DailyBatchSamplerRandom tries to use this without proper setup
+            # This indicates a mismatch if DailyBatchSamplerRandom is re-introduced without updating dataset creation.
+            raise NotImplementedError("index_df_for_sampler was not provided to StockDataset, but get_index() was called.")
+        return self.pd_index_for_sampler
 
 
-class SequenceModel():
-    def __init__(self, n_epochs, lr, batch_size=64, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= ''):
-        self.n_epochs = n_epochs
-        self.lr = lr
-        self.batch_size = batch_size # Added batch_size for standard DataLoader
-        self.device = torch.device(f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available() else "cpu")
-        self.seed = seed
-        self.train_stop_loss_thred = train_stop_loss_thred # This is a loss threshold
+def load_and_preprocess_data(csv_path, sequence_len=60):
+    log_to_memory({"event": "load_and_preprocess_data_start", "csv_path": csv_path})
 
-        if self.seed is not None:
-            np.random.seed(self.seed)
-            torch.manual_seed(self.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.seed)
-            torch.backends.cudnn.deterministic = True #type: ignore
-        self.fitted = -1 # Tracks epochs trained or status
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        log_lesson(f"File not found: {csv_path}. Ensure correct path.")
+        print(f"Error: File not found at {csv_path}")
+        return (None,) * 4 # Returning (datasets_tuple, d_feat_csv)
 
-        self.model = None
-        self.train_optimizer = None
+    try:
+        df['date'] = pd.to_datetime(df['date'], format='%Y-%m-%d')
+    except ValueError as e:
+        log_lesson(f"Date conversion error: {e}. Check date format in CSV. Expected YYYY-MM-DD.")
+        print(f"Error converting date column: {e}. Please ensure dates are in YYYY-MM-DD format.")
+        return (None,) * 4
 
-        self.save_path = save_path
-        self.save_prefix = save_prefix
-        # Ensure save_path directory exists
-        import os
-        if not os.path.exists(self.save_path):
-            os.makedirs(self.save_path, exist_ok=True)
+    df = df.set_index(['ticker', 'date'])
+    df = df.sort_index()
 
-
-    def init_model(self):
-        if self.model is None:
-            raise ValueError("model has not been initialized")
-
-        self.train_optimizer = optim.Adam(self.model.parameters(), self.lr)
-        self.model.to(self.device)
-
-    def loss_fn(self, pred, label):
-        mask = ~torch.isnan(label)
-        if torch.sum(mask).item() == 0: # No valid labels
-            return torch.tensor(0.0, device=pred.device, requires_grad=True) # Or handle as appropriate
-        loss = (pred[mask]-label[mask])**2
-        return torch.mean(loss)
-
-    def train_epoch(self, data_loader):
-        self.model.train()
-        losses = []
-
-        for feature_batch, label_batch in data_loader: # Adapted for (feature, label) from DataLoader
-            feature = feature_batch.to(self.device).float()
-            label_original = label_batch.to(self.device).float().squeeze(-1) # Assuming label_batch might be (batch, 1)
-
-            # Process labels per batch: drop_extreme then zscore
-            # Ensure label is 1D for drop_extreme and zscore as implemented
-            if label_original.numel() > 0:
-                mask_extreme, label_processed = drop_extreme(label_original)
-                if label_processed.numel() > 0: # Ensure not empty after dropping extremes
-                    feature = feature[mask_extreme, :, :] # Filter features based on labels
-                    label = zscore(label_processed)
-                else: # All labels dropped
-                    continue # Skip batch if no valid labels remain
-            else: # Empty label tensor
-                continue
-
-            if label.numel() == 0: # Double check after processing
-                continue
-
-            pred = self.model(feature)
-            loss = self.loss_fn(pred, label)
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print("Warning: NaN or Inf loss detected during training. Skipping batch.")
-                continue
-
-            losses.append(loss.item())
-
-            self.train_optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
-            self.train_optimizer.step()
+    df['returns'] = df.groupby(level='ticker')['closeadj'].pct_change().fillna(0)
+    
+    features_to_use = ['open', 'high', 'low', 'close', 'volume', 'closeadj']
+    missing_features = [f for f in features_to_use if f not in df.columns]
+    if missing_features:
+        log_lesson(f"Missing expected features: {missing_features}. Required: {features_to_use}")
+        print(f"Error: Missing features in CSV: {missing_features}. Required: {features_to_use}")
+        return (None,) * 4
         
-        if not losses: # Handle case where all batches were skipped
-            return float('nan') # Or some indicator of no training done
-        return float(np.mean(losses))
+    df_features = df[features_to_use].copy()
+    df_target_raw = df[['returns']].copy() # Raw returns, SequenceModel will handle zscore
 
-    def test_epoch(self, data_loader): # Used for validation loss during fit
-        self.model.eval()
-        losses = []
-
-        with torch.no_grad():
-            for feature_batch, label_batch in data_loader:
-                feature = feature_batch.to(self.device).float()
-                label_original = label_batch.to(self.device).float().squeeze(-1)
-
-                # Process labels per batch: zscore only for test/validation
-                if label_original.numel() > 0:
-                    label = zscore(label_original)
-                else:
-                    continue # Skip if empty
-
-                if label.numel() == 0:
-                    continue
-                
-                pred = self.model(feature)
-                loss = self.loss_fn(pred, label)
-                
-                if not (torch.isnan(loss) or torch.isinf(loss)):
-                    losses.append(loss.item())
-                else:
-                    print("Warning: NaN or Inf loss detected during testing/validation.")
-
-
-        if not losses:
-            return float('nan')
-        return float(np.mean(losses))
-
-    def _init_data_loader(self, data_set: Dataset, shuffle=True, drop_last=True):
-        # data_set is now expected to be a torch.utils.data.Dataset object
-        return DataLoader(data_set, batch_size=self.batch_size, shuffle=shuffle, drop_last=drop_last)
-
-    def load_param(self, param_path):
-        try:
-            self.model.load_state_dict(torch.load(param_path, map_location=self.device))
-            self.fitted = f'Loaded from {param_path}'
-            print(f"Model parameters loaded from {param_path}")
-        except FileNotFoundError:
-            print(f"Error: Model file not found at {param_path}")
-            raise
-        except Exception as e:
-            print(f"Error loading model parameters: {e}")
-            raise
-
-
-    def fit(self, train_data: Dataset, valid_data: Dataset = None):
-        # Ensure model is initialized
-        if self.model is None: self.init_model()
-        if self.train_optimizer is None: self.init_model() # Redundant if init_model called, but safe
-
-        train_loader = self._init_data_loader(train_data, shuffle=True, drop_last=True)
-        if valid_data:
-            valid_loader = self._init_data_loader(valid_data, shuffle=False, drop_last=False)
-
-        best_valid_loss = float('inf')
-        best_param = None
-
-        for step in range(self.n_epochs):
-            train_loss = self.train_epoch(train_loader)
+    # Stationarity processing per ticker
+    processed_features_list = []
+    for ticker_name, group in df_features.groupby(level='ticker'):
+        # Initial fill for existing NaNs within the group
+        group_filled_and_stationary = group.ffill().bfill() 
+        
+        for col in group_filled_and_stationary.columns:
+            series_to_test = group_filled_and_stationary[col].dropna()
             
-            log_msg = f"Epoch {step + 1}/{self.n_epochs}, Train Loss: {train_loss:.6f}"
+            if len(series_to_test) == 0: # Skip if column is all NaNs after ffill/bfill
+                log_to_memory({
+                    "event": "adf_test_skipped_all_nans", 
+                    "ticker": ticker_name, "feature": col
+                })
+                continue
 
-            if valid_data:
-                # Original predict gives ICs, test_epoch gives loss. For validation loop, usually loss is primary.
-                # If original fit method called predict for metrics, let's align.
-                # The original fit() example showed predict(dl_valid).
-                predictions_val, metrics_val = self.predict(valid_data) # This will use its own loader
-                valid_loss = self.test_epoch(valid_loader) # More direct for validation loss monitoring
+            # Check for constant series before ADF test
+            if len(series_to_test) > 1 and np.all(series_to_test == series_to_test.iloc[0]):
+                log_to_memory({
+                    "event": "adf_test_skipped_constant_series", 
+                    "ticker": ticker_name, "feature": col
+                })
+                # No differencing needed for constant series
+                continue 
 
-                log_msg += f", Valid Loss: {valid_loss:.6f}, Valid IC: {metrics_val.get('IC', float('nan')):.4f}, Valid RIC: {metrics_val.get('RIC', float('nan')):.4f}"
-                print(log_msg)
-                
-                current_metric_for_saving = valid_loss # Or could be metrics_val['IC'] if optimizing for that
-                if current_metric_for_saving < best_valid_loss: # Assuming lower loss is better
-                    best_valid_loss = current_metric_for_saving
-                    best_param = copy.deepcopy(self.model.state_dict())
-                    print(f"New best validation loss: {best_valid_loss:.6f}. Saving model.")
-                    if self.save_path and self.save_prefix:
-                         torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed if self.seed is not None else "model"}_best.pkl')
-
+            # Proceed with ADF if enough data points (e.g., > 20) and not constant
+            if len(series_to_test) > 20: # Heuristic minimum number of observations for ADF
+                try:
+                    adf_result = adfuller(series_to_test, autolag='AIC')
+                    p_value = adf_result[1]
+                    log_to_memory({
+                        "event": "adf_test_result", "ticker": ticker_name, "feature": col, 
+                        "p_value": p_value, "adf_stat": adf_result[0]
+                    })
+                    if p_value > 0.05: # If non-stationary
+                        log_to_memory({"event": "feature_differenced", "ticker": ticker_name, "feature": col})
+                        # Difference and fill the first NaN value (from diff) with 0
+                        # This preserves the series length.
+                        group_filled_and_stationary[col] = group_filled_and_stationary[col].diff().fillna(0)
+                except Exception as e: # Catches LinAlgError, ValueError from adfuller
+                    log_lesson(f"ADF test or differencing failed for {ticker_name}, {col}: {e}")
             else:
-                print(log_msg)
-                # If no validation, save based on train_stop_loss_thred if provided
-                if self.train_stop_loss_thred is not None and train_loss <= self.train_stop_loss_thred:
-                    print(f"Training loss {train_loss:.6f} reached threshold {self.train_stop_loss_thred}. Saving model.")
-                    best_param = copy.deepcopy(self.model.state_dict())
-                    if self.save_path and self.save_prefix:
-                        torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed if self.seed is not None else "model"}_final.pkl')
-                    break # Stop training
-            
-            self.fitted = step + 1 # Number of epochs completed
+                log_to_memory({
+                    "event": "adf_test_skipped_insufficient_data", 
+                    "ticker": ticker_name, "feature": col, "num_values": len(series_to_test)
+                })
+        
+        processed_features_list.append(group_filled_and_stationary)
+    
+    if not processed_features_list:
+        log_lesson("No data available after stationarity processing and initial fill attempts.")
+        print("Error: DataFrame became empty after stationarity processing and initial fill.")
+        # Ensure df_features is an empty DataFrame with correct columns if list is empty
+        df_features = pd.DataFrame(columns=features_to_use) 
+    else:
+        df_features = pd.concat(processed_features_list)
 
-        if best_param is None and self.save_path and self.save_prefix: # Save last model if no best was found/saved
-             torch.save(self.model.state_dict(), f'{self.save_path}/{self.save_prefix}_{self.seed if self.seed is not None else "model"}_last_epoch.pkl')
-             print("Saved model from last epoch as no improvement or threshold condition met for 'best' model.")
-        elif best_param:
-             print("Best model saved during training.")
+    # Drop rows that still have any NaNs after all processing steps.
+    # This is crucial as scalers cannot handle NaNs.
+    df_features.dropna(how='any', inplace=True) 
+    
+    # Re-align df_target_raw with df_features *after* any rows might have been dropped from df_features.
+    # This ensures that features and target data correspond to the same time points and tickers.
+    common_index = df_features.index.intersection(df_target_raw.index)
+    df_features = df_features.loc[common_index]
+    df_target_raw = df_target_raw.loc[common_index]
 
+    if df_features.empty:
+        log_lesson("DataFrame became empty after handling missing values, stationarity, and final alignment.")
+        print("Error: DataFrame empty after all preprocessing steps including stationarity and alignment.")
+        return (None,) * 4
 
-    def predict(self, test_data: Dataset):
-        if self.fitted == -1 and not (hasattr(self.model, 'state_dict') and any(self.model.state_dict())):
-            # A bit of a loose check if model might have been loaded without setting self.fitted string.
-            # A better way is to ensure load_param sets self.fitted appropriately.
-            print("Warning: Model might not be fitted or loaded. Predictions may be random.")
-            if self.model is None: self.init_model() # Initialize if not even done that
+    feature_scaler_map = {}
+    scaled_features_list = []
+    for ticker, group in df_features.groupby(level='ticker'):
+        if not group.empty and not group.isnull().all().all():
+            scaler = MinMaxScaler()
+            scaled_group_features = scaler.fit_transform(group)
+            scaled_features_list.append(pd.DataFrame(scaled_group_features, index=group.index, columns=group.columns))
+            feature_scaler_map[ticker] = scaler
+    
+    if not scaled_features_list:
+        log_lesson("No data available after attempting to scale features.")
+        print("Error: No data to process after feature scaling step.")
+        return (None,) * 4
+        
+    df_scaled_features = pd.concat(scaled_features_list)
+    d_feat_csv = df_scaled_features.shape[1] # Number of primary features from CSV
+    log_to_memory({"event": "features_scaled_per_ticker", "d_feat_csv": d_feat_csv})
 
-        test_loader = self._init_data_loader(test_data, shuffle=False, drop_last=False)
+    # Align target with scaled features
+    df_target_aligned = df_target_raw.loc[df_scaled_features.index]
 
-        preds_list = []
-        labels_list = [] # Collect actual labels to compute IC/RIC correctly batch-wise or overall
+    # Prepare data for SequenceModel:
+    # Features: (num_samples, sequence_len, d_feat_csv * 2)
+    # Labels: (num_samples, 1)
+    # Metadata: (end_date, ticker) for each sample (for DailyBatchSamplerRandom, if used)
+    
+    all_feature_sequences_list = []
+    all_label_sequences_list = []
+    all_sequences_metadata_list = [] # List of dicts {'datetime': end_date, 'instrument': ticker}
 
-        self.model.eval()
-        with torch.no_grad():
-            for feature_batch, label_batch in test_loader:
-                feature = feature_batch.to(self.device).float()
-                label_original = label_batch.to(self.device).float().squeeze(-1)
+    for ticker, group_data in df_scaled_features.groupby(level='ticker'):
+        ticker_features_np = group_data.values # (num_days_for_ticker, d_feat_csv)
+        # Ensure target is aligned with features for this ticker
+        ticker_target_np = df_target_aligned.loc[group_data.index]['returns'].values # (num_days_for_ticker,)
+
+        if len(ticker_features_np) >= sequence_len + 1: # Need one more for the label
+            for i in range(len(ticker_features_np) - sequence_len):
+                # X_primary: (sequence_len, d_feat_csv)
+                X_primary_seq = ticker_features_np[i : i + sequence_len, :]
                 
-                # For prediction, the original applied zscore to label for consistency in loss calc
-                # but for IC/RIC, raw or consistently scaled labels are better.
-                # Here, we just collect raw labels associated with predictions.
-                # The `calc_ic` function will handle its own requirements.
+                # X_for_gate: (sequence_len, d_feat_csv) - duplicating primary for now
+                X_gate_seq = X_primary_seq 
+                
+                # Concatenate for MASTER model input: (sequence_len, d_feat_csv * 2)
+                X_model_input_seq = np.concatenate([X_primary_seq, X_gate_seq], axis=1)
+                
+                current_label = ticker_target_np[i + sequence_len] # Label corresponds to next step
+                
+                all_feature_sequences_list.append(X_model_input_seq)
+                all_label_sequences_list.append(current_label)
+                
+                # Metadata: end date of sequence is date of label
+                end_date_of_sequence = group_data.index[i + sequence_len][1] # date part of MultiIndex
+                all_sequences_metadata_list.append({'datetime': end_date_of_sequence, 'instrument': ticker})
 
-                pred = self.model(feature).cpu() # Bring preds to CPU
-                preds_list.append(pred.numpy())
-                labels_list.append(label_original.cpu().numpy())
+    if not all_feature_sequences_list:
+        log_lesson(f"Not enough data to create sequences of length {sequence_len}.")
+        print(f"Error: Insufficient data to create sequences with length {sequence_len}.")
+        return (None,) * 4
+
+    # Convert lists to numpy arrays first, then to tensors
+    all_features_np = np.array(all_feature_sequences_list, dtype=np.float32)
+    all_labels_np = np.array(all_label_sequences_list, dtype=np.float32).reshape(-1, 1) # Ensure labels are (N, 1)
+
+    all_features_tensor = torch.tensor(all_features_np, dtype=torch.float32)
+    all_labels_tensor = torch.tensor(all_labels_np, dtype=torch.float32)
+    
+    all_sequences_metadata_df = pd.DataFrame(all_sequences_metadata_list)
+    
+    log_to_memory({"event": "sequences_created_for_stockdataset", 
+                   "num_samples": all_features_tensor.shape[0],
+                   "d_feat_csv": d_feat_csv})
+
+    # Temporal split
+    # Sort metadata by date to ensure chronological split if not already
+    all_sequences_metadata_df_sorted = all_sequences_metadata_df.sort_values(by='datetime').reset_index(drop=True)
+    sorted_indices = all_sequences_metadata_df_sorted.index.to_numpy() # Use index of sorted metadata
+    
+    # Apply sorting to feature and label tensors
+    all_features_tensor = all_features_tensor[sorted_indices]
+    all_labels_tensor = all_labels_tensor[sorted_indices]
+    # The metadata_df passed to StockDataset should also be the sorted one if DailyBatchSamplerRandom is used.
+    # For current SequenceModel, this metadata_df isn't strictly necessary for DataLoader operation.
 
 
-        predictions_np = np.concatenate(preds_list).flatten()
-        actual_labels_np = np.concatenate(labels_list).flatten()
+    num_samples = all_features_tensor.shape[0]
+    train_size = int(num_samples * 0.7)
+    val_size = int(num_samples * 0.15)
+
+    # Slicing based on sorted order
+    train_features = all_features_tensor[:train_size]
+    train_labels = all_labels_tensor[:train_size]
+    train_meta = all_sequences_metadata_df_sorted.iloc[:train_size]
+
+    val_features = all_features_tensor[train_size : train_size + val_size]
+    val_labels = all_labels_tensor[train_size : train_size + val_size]
+    val_meta = all_sequences_metadata_df_sorted.iloc[train_size : train_size + val_size]
+    
+    test_features = all_features_tensor[train_size + val_size :]
+    test_labels = all_labels_tensor[train_size + val_size :]
+    test_meta = all_sequences_metadata_df_sorted.iloc[train_size + val_size :]
+
+
+    log_to_memory({
+        "event": "data_split_shapes",
+        "train_features": train_features.shape, "train_labels": train_labels.shape,
+        "val_features": val_features.shape, "val_labels": val_labels.shape,
+        "test_features": test_features.shape, "test_labels": test_labels.shape,
+    })
+
+    if train_features.shape[0] == 0 or val_features.shape[0] == 0:
+        log_lesson("Data splitting resulted in empty train or validation sets.")
+        print("Error: Train or validation data splits are empty.")
+        return (None,) * 4
+
+    # Pass the corresponding metadata if DailyBatchSamplerRandom might be used later.
+    train_dataset = StockDataset(train_features, train_labels, train_meta)
+    val_dataset = StockDataset(val_features, val_labels, val_meta)
+    test_dataset = StockDataset(test_features, test_labels, test_meta)
+    
+    # No explicit target scaler needed here, SequenceModel handles zscore
+
+    return (train_dataset, val_dataset, test_dataset), d_feat_csv
+
+
+def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2, 
+                 dropout=0.1, beta=1.0, n_epochs=10, lr=1e-4, seed=0, 
+                 save_path='model_output/', save_prefix='master_model', gpu_id=0,
+                 batch_size=64): # Added batch_size parameter
+    log_to_memory({"event": "run_training_start", "params": {k:v for k,v in locals().items() if k != 'datasets_tuple'}})
+
+
+    datasets_tuple, d_feat_csv = load_and_preprocess_data(csv_path, sequence_len)
+    
+    if datasets_tuple is None or d_feat_csv is None:
+        log_lesson("Data loading/preprocessing failed. Aborting training.")
+        print("Failed to load or preprocess data. Aborting training.")
+        return
+
+    dl_train, dl_valid, dl_test = datasets_tuple
+    
+    # Parameters for MASTERModel based on d_feat_csv and original MASTER logic
+    master_d_feat_param = d_feat_csv # Primary features
+    master_gate_input_start_index = d_feat_csv # Start of gate features in concatenated input
+    master_gate_input_end_index = d_feat_csv * 2 # End of gate features
+
+    log_to_memory({
+        "event": "model_hyperparameters_for_master",
+        "d_feat_model": master_d_feat_param, "d_model": d_model, "t_nhead": t_nhead, 
+        "s_nhead": s_nhead, "dropout": dropout, "beta": beta,
+        "gate_input_start_index": master_gate_input_start_index,
+        "gate_input_end_index": master_gate_input_end_index,
+        "n_epochs_arg": n_epochs, "lr_arg": lr, "seed": seed,
+        "save_path": save_path, "save_prefix": save_prefix, "gpu_id": gpu_id,
+        "batch_size": batch_size
+    })
+    
+    # Ensure save_path directory exists
+    import os
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+        log_to_memory({"event": "created_save_path_directory", "path": save_path})
+
+
+    # Instantiate MASTERModel (which inherits from SequenceModel)
+    # SequenceModel handles device placement, optimizer, etc.
+    model = MASTERModel(
+        d_feat=master_d_feat_param,
+        d_model=d_model,
+        t_nhead=t_nhead,
+        s_nhead=s_nhead,
+        T_dropout_rate=dropout,  # Assuming T_dropout_rate and S_dropout_rate are same
+        S_dropout_rate=dropout,
+        beta=beta,
+        gate_input_start_index=master_gate_input_start_index,
+        gate_input_end_index=master_gate_input_end_index,
+        # SequenceModel specific parameters
+        n_epochs=n_epochs,
+        lr=lr,
+        batch_size=batch_size, # Pass batch_size to SequenceModel
+        GPU=gpu_id, 
+        seed=seed,
+        train_stop_loss_thred=0.95, # Example from original main.py, adjust as needed
+        save_path=save_path,
+        save_prefix=f'{save_prefix}_{seed}'
+    )
+    
+    log_to_memory({"event": "MASTERModel_initialized", "device": str(model.device)})
+
+    if n_epochs <= 0:
+        print(f"Warning: Number of training epochs is {n_epochs}. No training will occur.")
+        log_to_memory({"event": "training_skipped_due_to_n_epochs", "n_epochs_value": n_epochs})
+        if dl_test is not None and dl_test.__len__() > 0:
+            print("Attempting to load a pre-trained model for testing if parameters allow...")
+            # This would require a load_param call, which is usually handled by user or specific workflow
+            # For now, if n_epochs is 0, we just don't train.
+        else:
+            print("No test data to evaluate.")
+        return
+
+
+    print("Starting model training...")
+    model.fit(dl_train, dl_valid) # Uses SequenceModel's fit method
+    log_to_memory({"event": "training_complete_via_model_fit"})
+    
+    print("\nStarting model testing...")
+    if dl_test is not None and dl_test.__len__() > 0 :
+        # To load the best model saved by fit, if applicable by SequenceModel's logic:
+        # model.load_param(f'{save_path}/{save_prefix}_{seed}.pkl') # Or however SequenceModel saves/loads
+        # The original SequenceModel saves if train_loss <= train_stop_loss_thred.
+        # If you want to test the *last* state, no load is needed.
+        # If you want to test the *best* saved state, ensure load_param is called.
+        # For now, assume SequenceModel.fit leaves the model in its final trained state
+        # or handles best model loading internally if a save occurred.
+
+        predictions, metrics = model.predict(dl_test) # Uses SequenceModel's predict method
         
-        # The original calc_ic was daily. Here we do it over the whole test set.
-        # For multi-index data, if dl_test had get_index(), one could try to group by date.
-        # For now, overall IC/RIC.
-        ic, ric = calc_ic(predictions_np, actual_labels_np)
-
-        metrics = {
-            'IC': ic,
-            'ICIR': np.nan, # ICIR requires daily ICs, not directly computable here
-            'RIC': ric,
-            'RICIR': np.nan # RICIR also requires daily RICs
-        }
+        print("\nTest Metrics:")
+        if metrics:
+            for key, value in metrics.items():
+                print(f"{key}: {value:.4f}")
+            log_to_memory({"event": "test_phase_end", "metrics": metrics})
+        else:
+            print("No metrics returned from predict.")
+            log_to_memory({"event": "test_phase_end", "status": "no_metrics"})
         
-        # The original returned pd.Series. If test_data is TensorDataset, it has no index.
-        # For now, return numpy array of predictions.
-        # If an index is available from test_data (e.g. if it were a custom Dataset subclass), use it.
-        return predictions_np, metrics
+        # Example: Save predictions if needed
+        # predictions.to_csv(f"{save_path}/predictions_{save_prefix}_{seed}.csv")
+        # log_to_memory({"event": "predictions_saved"})
+
+    else:
+        print("No test data available to evaluate.")
+        log_to_memory({"event": "test_phase_skipped_no_data"})
+    
+    print("\nTraining and testing script finished.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train MASTER model using original pipeline structure.")
+    parser.add_argument("--csv_path", type=str, required=True, help="Path to the input CSV file.")
+    parser.add_argument("--sequence_len", type=int, default=60, help="Length of input sequences.")
+    parser.add_argument("--d_model", type=int, default=128, help="Dimension of model internal state (d_model in MASTER).")
+    parser.add_argument("--t_nhead", type=int, default=4, help="Number of heads for temporal attention.")
+    parser.add_argument("--s_nhead", type=int, default=2, help="Number of heads for spatial attention.")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
+    parser.add_argument("--beta", type=float, default=1.0, help="Beta for feature gate.")
+    parser.add_argument("--n_epochs", type=int, default=2, help="Number of training epochs.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
+    parser.add_argument("--save_path", type=str, default="model_artefacts/", help="Directory to save models and results.")
+    parser.add_argument("--save_prefix", type=str, default="master_custom_data", help="Prefix for saved model files.")
+    parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use if CUDA is available.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for DataLoader.")
+    
+    args = parser.parse_args()
+
+    log_to_memory({"event": "main_script_start", "args": vars(args)})
+    
+    # Override some defaults with original paper's typical values if desired, or keep as CLI args
+    # For example, if we assume 'csi300' like scenario from original main.py for some params:
+    # args.d_model = 256
+    # args.dropout = 0.5
+    # args.beta = 5 # This was universe-dependent in original
+    # args.n_epochs = 1 # Often very few for such models if data is large
+    # args.lr = 1e-5
+
+    run_training(
+        csv_path=args.csv_path,
+        sequence_len=args.sequence_len,
+        d_model=args.d_model,
+        t_nhead=args.t_nhead,
+        s_nhead=args.s_nhead,
+        dropout=args.dropout,
+        beta=args.beta,
+        n_epochs=args.n_epochs,
+        lr=args.lr,
+        seed=args.seed,
+        save_path=args.save_path,
+        save_prefix=args.save_prefix,
+        gpu_id=args.gpu_id,
+        batch_size=args.batch_size
+    )
+    log_to_memory({"event": "main_script_end"})
+
+    # TODOs based on original structure and current implementation:
+    # 1. Stationarity checks (ADF, differencing) - currently skipped. Add if essential before scaling.
+    # 2. Time-series cross-validation: Current split is a simple chronological percentage split.
+    #    The original DailyBatchSamplerRandom processes day by day, which is good for TS.
+    #    Consider if more sophisticated CV (like rolling origin) is needed for hyperparam tuning (not part of fit/predict).
+    # 3. Feature Engineering: Current script uses basic OHLCV. The original MASTER (158 features) implies more extensive feature engineering.
+    #    The current setup will use the available CSV features for `d_feat` and duplicate them for the gate.
+    # 4. SAttention: Review if `DailyBatchSamplerRandom` logic (batching all stocks for a given day)
+    #    is fully compatible with how SAttention expects to see inter-stock relations.
+    #    The original Qlib data loaders might have handled this transparently. Current StockDataset + DailyBatchSampler
+    #    will provide all sequences ending on a particular day as one batch to the model.
+    # 5. Pytests for the new data loading and StockDataset.
+    # 6. Memory logging and lessons learned to be filled more thoroughly.
+    # 7. Ensure `master.py` and `base_model.py` are present with the code you provided.
+# End of script marker 
