@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, Dataset
+from scipy.stats import spearmanr
+from statsmodels.tsa.stattools import adfuller
 
 # Attempt to import from user-provided master.py and base_model.py
 # These files should be in the same directory or Python path.
@@ -123,25 +125,76 @@ def load_and_preprocess_data(csv_path, sequence_len=60):
     df_features = df[features_to_use].copy()
     df_target_raw = df[['returns']].copy() # Raw returns, SequenceModel will handle zscore
 
-    filled_features_list = []
+    # Stationarity processing per ticker
+    processed_features_list = []
     for ticker_name, group in df_features.groupby(level='ticker'):
-        filled_group = group.ffill().bfill()
-        filled_features_list.append(filled_group)
+        # Initial fill for existing NaNs within the group
+        group_filled_and_stationary = group.ffill().bfill() 
+        
+        for col in group_filled_and_stationary.columns:
+            series_to_test = group_filled_and_stationary[col].dropna()
+            
+            if len(series_to_test) == 0: # Skip if column is all NaNs after ffill/bfill
+                log_to_memory({
+                    "event": "adf_test_skipped_all_nans", 
+                    "ticker": ticker_name, "feature": col
+                })
+                continue
+
+            # Check for constant series before ADF test
+            if len(series_to_test) > 1 and np.all(series_to_test == series_to_test.iloc[0]):
+                log_to_memory({
+                    "event": "adf_test_skipped_constant_series", 
+                    "ticker": ticker_name, "feature": col
+                })
+                # No differencing needed for constant series
+                continue 
+
+            # Proceed with ADF if enough data points (e.g., > 20) and not constant
+            if len(series_to_test) > 20: # Heuristic minimum number of observations for ADF
+                try:
+                    adf_result = adfuller(series_to_test, autolag='AIC')
+                    p_value = adf_result[1]
+                    log_to_memory({
+                        "event": "adf_test_result", "ticker": ticker_name, "feature": col, 
+                        "p_value": p_value, "adf_stat": adf_result[0]
+                    })
+                    if p_value > 0.05: # If non-stationary
+                        log_to_memory({"event": "feature_differenced", "ticker": ticker_name, "feature": col})
+                        # Difference and fill the first NaN value (from diff) with 0
+                        # This preserves the series length.
+                        group_filled_and_stationary[col] = group_filled_and_stationary[col].diff().fillna(0)
+                except Exception as e: # Catches LinAlgError, ValueError from adfuller
+                    log_lesson(f"ADF test or differencing failed for {ticker_name}, {col}: {e}")
+            else:
+                log_to_memory({
+                    "event": "adf_test_skipped_insufficient_data", 
+                    "ticker": ticker_name, "feature": col, "num_values": len(series_to_test)
+                })
+        
+        processed_features_list.append(group_filled_and_stationary)
     
-    if not filled_features_list:
+    if not processed_features_list:
+        log_lesson("No data available after stationarity processing and initial fill attempts.")
+        print("Error: DataFrame became empty after stationarity processing and initial fill.")
+        # Ensure df_features is an empty DataFrame with correct columns if list is empty
         df_features = pd.DataFrame(columns=features_to_use) 
     else:
-        df_features = pd.concat(filled_features_list)
+        df_features = pd.concat(processed_features_list)
 
-    df_features.dropna(how='any', inplace=True) # Drop rows with any NaNs in features
+    # Drop rows that still have any NaNs after all processing steps.
+    # This is crucial as scalers cannot handle NaNs.
+    df_features.dropna(how='any', inplace=True) 
     
+    # Re-align df_target_raw with df_features *after* any rows might have been dropped from df_features.
+    # This ensures that features and target data correspond to the same time points and tickers.
     common_index = df_features.index.intersection(df_target_raw.index)
     df_features = df_features.loc[common_index]
     df_target_raw = df_target_raw.loc[common_index]
 
     if df_features.empty:
-        log_lesson("DataFrame became empty after handling missing values.")
-        print("Error: DataFrame empty after handling missing values.")
+        log_lesson("DataFrame became empty after handling missing values, stationarity, and final alignment.")
+        print("Error: DataFrame empty after all preprocessing steps including stationarity and alignment.")
         return (None,) * 4
 
     feature_scaler_map = {}
