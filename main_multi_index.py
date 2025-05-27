@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader, Dataset
 # These files should be in the same directory or Python path.
 try:
     from master import MASTERModel
+    # DailyBatchSamplerRandom is not used by the current base_model.py's SequenceModel
+    # but keeping the import for now in case of future changes or if user reverts base_model.py
     from base_model import SequenceModel, DailyBatchSamplerRandom, zscore, calc_ic as base_calc_ic
     # calc_ic from base_model.py will be used by SequenceModel.predict
 except ImportError as e:
@@ -53,28 +55,40 @@ def calculate_ic(predictions, actuals):
         return 0.0, 1.0
 
 class StockDataset(Dataset):
-    def __init__(self, data_tensor, index_df):
+    def __init__(self, features_tensor, labels_tensor, index_df_for_sampler=None):
         """
         Args:
-            data_tensor (torch.Tensor): Tensor of shape (num_samples, seq_len, num_features_incl_label)
-                                       The label is expected to be at data_tensor[:, -1, -1].
-            index_df (pd.DataFrame): DataFrame with 'datetime' and 'instrument' (ticker) for get_index().
-                                     The 'datetime' should be the end date of the sequence.
+            features_tensor (torch.Tensor): Tensor of shape (num_samples, seq_len, num_features)
+            labels_tensor (torch.Tensor): Tensor of shape (num_samples, 1) or (num_samples,)
+            index_df_for_sampler (pd.DataFrame, optional): DataFrame with 'datetime' and 'instrument' (ticker)
+                                                      for get_index(), if DailyBatchSamplerRandom is used.
         """
-        self.data_tensor = data_tensor
-        self.index_df = index_df.reset_index(drop=True) # Ensure simple integer index for __getitem__
-        self.pd_index = pd.MultiIndex.from_frame(self.index_df[['datetime', 'instrument']])
+        self.features_tensor = features_tensor
+        self.labels_tensor = labels_tensor
+        
+        # The following is for compatibility with DailyBatchSamplerRandom if it were to be used.
+        # The current base_model.py's SequenceModel uses a standard DataLoader.
+        self.index_df_for_sampler = index_df_for_sampler
+        if self.index_df_for_sampler is not None:
+            self.index_df_for_sampler = self.index_df_for_sampler.reset_index(drop=True)
+            self.pd_index_for_sampler = pd.MultiIndex.from_frame(self.index_df_for_sampler[['datetime', 'instrument']])
+        else:
+            self.pd_index_for_sampler = None
 
 
     def __len__(self):
-        return len(self.data_tensor)
+        return len(self.features_tensor)
 
     def __getitem__(self, idx):
-        return self.data_tensor[idx]
+        return self.features_tensor[idx], self.labels_tensor[idx]
 
     def get_index(self):
-        # Required by DailyBatchSamplerRandom
-        return self.pd_index
+        # Required by DailyBatchSamplerRandom, not used by current SequenceModel's DataLoader
+        if self.pd_index_for_sampler is None:
+            # Fallback or raise error if DailyBatchSamplerRandom tries to use this without proper setup
+            # This indicates a mismatch if DailyBatchSamplerRandom is re-introduced without updating dataset creation.
+            raise NotImplementedError("index_df_for_sampler was not provided to StockDataset, but get_index() was called.")
+        return self.pd_index_for_sampler
 
 
 def load_and_preprocess_data(csv_path, sequence_len=60):
@@ -152,11 +166,12 @@ def load_and_preprocess_data(csv_path, sequence_len=60):
     df_target_aligned = df_target_raw.loc[df_scaled_features.index]
 
     # Prepare data for SequenceModel:
-    # Each sample: (T, F_model_input + 1), where F_model_input = d_feat_csv * 2
-    # Label is at sample[:, -1, -1]
-    # Metadata: (end_date, ticker) for each sample
+    # Features: (num_samples, sequence_len, d_feat_csv * 2)
+    # Labels: (num_samples, 1)
+    # Metadata: (end_date, ticker) for each sample (for DailyBatchSamplerRandom, if used)
     
-    all_sequences_data = []
+    all_feature_sequences_list = []
+    all_label_sequences_list = []
     all_sequences_metadata_list = [] # List of dicts {'datetime': end_date, 'instrument': ticker}
 
     for ticker, group_data in df_scaled_features.groupby(level='ticker'):
@@ -177,65 +192,77 @@ def load_and_preprocess_data(csv_path, sequence_len=60):
                 
                 current_label = ticker_target_np[i + sequence_len] # Label corresponds to next step
                 
-                # Create combined tensor: (sequence_len, d_feat_csv * 2 + 1)
-                # The last "feature column" will hold the label at its last time step
-                combined_sample = np.zeros((sequence_len, d_feat_csv * 2 + 1), dtype=np.float32)
-                combined_sample[:, :-1] = X_model_input_seq
-                combined_sample[-1, -1] = current_label # Label at last time step of last feature column
-                
-                all_sequences_data.append(combined_sample)
+                all_feature_sequences_list.append(X_model_input_seq)
+                all_label_sequences_list.append(current_label)
                 
                 # Metadata: end date of sequence is date of label
                 end_date_of_sequence = group_data.index[i + sequence_len][1] # date part of MultiIndex
                 all_sequences_metadata_list.append({'datetime': end_date_of_sequence, 'instrument': ticker})
 
-    if not all_sequences_data:
+    if not all_feature_sequences_list:
         log_lesson(f"Not enough data to create sequences of length {sequence_len}.")
         print(f"Error: Insufficient data to create sequences with length {sequence_len}.")
         return (None,) * 4
 
-    all_sequences_tensor = torch.tensor(np.array(all_sequences_data), dtype=torch.float32)
+    # Convert lists to numpy arrays first, then to tensors
+    all_features_np = np.array(all_feature_sequences_list, dtype=np.float32)
+    all_labels_np = np.array(all_label_sequences_list, dtype=np.float32).reshape(-1, 1) # Ensure labels are (N, 1)
+
+    all_features_tensor = torch.tensor(all_features_np, dtype=torch.float32)
+    all_labels_tensor = torch.tensor(all_labels_np, dtype=torch.float32)
+    
     all_sequences_metadata_df = pd.DataFrame(all_sequences_metadata_list)
     
     log_to_memory({"event": "sequences_created_for_stockdataset", 
-                   "num_samples": all_sequences_tensor.shape[0],
+                   "num_samples": all_features_tensor.shape[0],
                    "d_feat_csv": d_feat_csv})
 
     # Temporal split
     # Sort metadata by date to ensure chronological split if not already
-    all_sequences_metadata_df = all_sequences_metadata_df.sort_values(by='datetime').reset_index(drop=True)
-    sorted_indices = all_sequences_metadata_df.index.to_numpy() # Use index of sorted metadata
+    all_sequences_metadata_df_sorted = all_sequences_metadata_df.sort_values(by='datetime').reset_index(drop=True)
+    sorted_indices = all_sequences_metadata_df_sorted.index.to_numpy() # Use index of sorted metadata
     
-    all_sequences_tensor = all_sequences_tensor[sorted_indices]
+    # Apply sorting to feature and label tensors
+    all_features_tensor = all_features_tensor[sorted_indices]
+    all_labels_tensor = all_labels_tensor[sorted_indices]
+    # The metadata_df passed to StockDataset should also be the sorted one if DailyBatchSamplerRandom is used.
+    # For current SequenceModel, this metadata_df isn't strictly necessary for DataLoader operation.
 
 
-    num_samples = all_sequences_tensor.shape[0]
+    num_samples = all_features_tensor.shape[0]
     train_size = int(num_samples * 0.7)
     val_size = int(num_samples * 0.15)
 
     # Slicing based on sorted order
-    train_data = all_sequences_tensor[:train_size]
-    train_meta = all_sequences_metadata_df.iloc[:train_size]
+    train_features = all_features_tensor[:train_size]
+    train_labels = all_labels_tensor[:train_size]
+    train_meta = all_sequences_metadata_df_sorted.iloc[:train_size]
 
-    val_data = all_sequences_tensor[train_size : train_size + val_size]
-    val_meta = all_sequences_metadata_df.iloc[train_size : train_size + val_size]
+    val_features = all_features_tensor[train_size : train_size + val_size]
+    val_labels = all_labels_tensor[train_size : train_size + val_size]
+    val_meta = all_sequences_metadata_df_sorted.iloc[train_size : train_size + val_size]
     
-    test_data = all_sequences_tensor[train_size + val_size :]
-    test_meta = all_sequences_metadata_df.iloc[train_size + val_size :]
+    test_features = all_features_tensor[train_size + val_size :]
+    test_labels = all_labels_tensor[train_size + val_size :]
+    test_meta = all_sequences_metadata_df_sorted.iloc[train_size + val_size :]
+
 
     log_to_memory({
         "event": "data_split_shapes",
-        "train_data": train_data.shape, "val_data": val_data.shape, "test_data": test_data.shape,
+        "train_features": train_features.shape, "train_labels": train_labels.shape,
+        "val_features": val_features.shape, "val_labels": val_labels.shape,
+        "test_features": test_features.shape, "test_labels": test_labels.shape,
     })
 
-    if train_data.shape[0] == 0 or val_data.shape[0] == 0:
+    if train_features.shape[0] == 0 or val_features.shape[0] == 0:
         log_lesson("Data splitting resulted in empty train or validation sets.")
         print("Error: Train or validation data splits are empty.")
         return (None,) * 4
 
-    train_dataset = StockDataset(train_data, train_meta)
-    val_dataset = StockDataset(val_data, val_meta)
-    test_dataset = StockDataset(test_data, test_meta)
+    # Pass the corresponding metadata if DailyBatchSamplerRandom might be used later.
+    train_dataset = StockDataset(train_features, train_labels, train_meta)
+    val_dataset = StockDataset(val_features, val_labels, val_meta)
+    test_dataset = StockDataset(test_features, test_labels, test_meta)
     
     # No explicit target scaler needed here, SequenceModel handles zscore
 
@@ -244,8 +271,10 @@ def load_and_preprocess_data(csv_path, sequence_len=60):
 
 def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2, 
                  dropout=0.1, beta=1.0, n_epochs=10, lr=1e-4, seed=0, 
-                 save_path='model_output/', save_prefix='master_model', gpu_id=0):
-    log_to_memory({"event": "run_training_start", "params": locals()})
+                 save_path='model_output/', save_prefix='master_model', gpu_id=0,
+                 batch_size=64): # Added batch_size parameter
+    log_to_memory({"event": "run_training_start", "params": {k:v for k,v in locals().items() if k != 'datasets_tuple'}})
+
 
     datasets_tuple, d_feat_csv = load_and_preprocess_data(csv_path, sequence_len)
     
@@ -268,7 +297,8 @@ def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2,
         "gate_input_start_index": master_gate_input_start_index,
         "gate_input_end_index": master_gate_input_end_index,
         "n_epochs_arg": n_epochs, "lr_arg": lr, "seed": seed,
-        "save_path": save_path, "save_prefix": save_prefix, "gpu_id": gpu_id
+        "save_path": save_path, "save_prefix": save_prefix, "gpu_id": gpu_id,
+        "batch_size": batch_size
     })
     
     # Ensure save_path directory exists
@@ -290,13 +320,15 @@ def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2,
         beta=beta,
         gate_input_start_index=master_gate_input_start_index,
         gate_input_end_index=master_gate_input_end_index,
+        # SequenceModel specific parameters
         n_epochs=n_epochs,
         lr=lr,
-        GPU=gpu_id, # For SequenceModel
-        seed=seed,  # For SequenceModel
+        batch_size=batch_size, # Pass batch_size to SequenceModel
+        GPU=gpu_id, 
+        seed=seed,
         train_stop_loss_thred=0.95, # Example from original main.py, adjust as needed
-        save_path=save_path,      # For SequenceModel
-        save_prefix=f'{save_prefix}_{seed}' # For SequenceModel, includes seed
+        save_path=save_path,
+        save_prefix=f'{save_prefix}_{seed}'
     )
     
     log_to_memory({"event": "MASTERModel_initialized", "device": str(model.device)})
@@ -353,17 +385,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MASTER model using original pipeline structure.")
     parser.add_argument("--csv_path", type=str, required=True, help="Path to the input CSV file.")
     parser.add_argument("--sequence_len", type=int, default=60, help="Length of input sequences.")
-    parser.add_argument("--d_model", type=int, default=128, help="Dimension of model internal state (d_model in MASTER).") # original main.py: 256
+    parser.add_argument("--d_model", type=int, default=128, help="Dimension of model internal state (d_model in MASTER).")
     parser.add_argument("--t_nhead", type=int, default=4, help="Number of heads for temporal attention.")
     parser.add_argument("--s_nhead", type=int, default=2, help="Number of heads for spatial attention.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.") # original main.py: 0.5
-    parser.add_argument("--beta", type=float, default=1.0, help="Beta for feature gate.") # original main.py: 5 for csi300, 2 for csi800
-    parser.add_argument("--n_epochs", type=int, default=2, help="Number of training epochs.") # original main.py: 1
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.") # original main.py: 1e-5
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
+    parser.add_argument("--beta", type=float, default=1.0, help="Beta for feature gate.")
+    parser.add_argument("--n_epochs", type=int, default=2, help="Number of training epochs.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
     parser.add_argument("--save_path", type=str, default="model_artefacts/", help="Directory to save models and results.")
     parser.add_argument("--save_prefix", type=str, default="master_custom_data", help="Prefix for saved model files.")
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use if CUDA is available.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for DataLoader.")
     
     args = parser.parse_args()
 
@@ -390,7 +423,8 @@ if __name__ == "__main__":
         seed=args.seed,
         save_path=args.save_path,
         save_prefix=args.save_prefix,
-        gpu_id=args.gpu_id
+        gpu_id=args.gpu_id,
+        batch_size=args.batch_size
     )
     log_to_memory({"event": "main_script_end"})
 
