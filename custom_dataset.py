@@ -54,6 +54,16 @@ class MultiIndexTimeSeriesDataset:
         self.d_feat = len(self.feature_names)
         print(f"Selected features ({self.d_feat}): {self.feature_names}")
 
+        # Robustly convert all feature columns to numeric and fill NaNs
+        print(f"Identified feature columns for numeric conversion: {self.feature_names}")
+        for col_name in self.feature_names:
+            if col_name in self.df.columns:
+                self.df[col_name] = pd.to_numeric(self.df[col_name], errors='coerce')
+                self.df[col_name] = self.df[col_name].fillna(0.0) # Fill NaNs with 0.0
+            else:
+                print(f"Warning: Column {col_name} not found in DataFrame during numeric conversion.")
+        print("Finished numeric conversion and NaN fill for feature columns.")
+
 
         # Label Calculation
         self.df['label'] = self.df.groupby('ticker')['closeadj'].transform(
@@ -71,11 +81,12 @@ class MultiIndexTimeSeriesDataset:
             # Fill NaNs or drop rows. For simplicity, let's fill with 0 for features, but this might need better handling.
             # Labels with NaN (last day of sequence) are handled by dropping those sequences.
             
-            numeric_features_df = group_data[self.feature_names].fillna(0) # Example: fillna with 0
+            # Features are already numeric and NaNs filled from the main df
+            features_for_ticker = group_data[self.feature_names]
             labels_series = group_data['label']
 
             for i in range(len(group_data) - self.lookback_window): # Ensure there's a label for the last day of window
-                feature_sequence = numeric_features_df.iloc[i : i + self.lookback_window].values
+                feature_sequence_df_values = features_for_ticker.iloc[i : i + self.lookback_window].values
                 
                 # Label corresponds to the last day of the sequence
                 # The label for date D is calculated using closeadj of D and D+1
@@ -85,7 +96,7 @@ class MultiIndexTimeSeriesDataset:
                 current_date = group_data.index[i + self.lookback_window -1][1] # date is the second part of multi-index
 
                 if not np.isnan(label): # Only add if label is not NaN
-                    self.features.append(feature_sequence)
+                    self.features.append(feature_sequence_df_values.astype(np.float32))
                     self.labels.append(label)
                     self.index_tuples.append((current_date, ticker_name))
                 # else:
@@ -110,7 +121,16 @@ class MultiIndexTimeSeriesDataset:
         return len(self.features)
 
     def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx]
+        # Ensure idx is a Python scalar integer
+        if hasattr(idx, 'item'): # Covers numpy scalars and 0-dim arrays
+            idx = idx.item()
+
+        # Ensure features are float32 and labels are float32 for PyTorch
+        # self.features elements are already float32 from __init__
+        # self.labels elements are Python floats, convert to np.float32 here
+        feature_sequence = self.features[idx] 
+        label = np.float32(self.labels[idx])
+        return feature_sequence, label
 
 if __name__ == '__main__':
     # Dummy CSV data based on user issue description
@@ -291,9 +311,13 @@ class MultiIndexTimeSeriesDataset:
         return len(self.features)
 
     def __getitem__(self, idx):
+        # Ensure idx is a Python scalar integer
+        if hasattr(idx, 'item'): # Covers numpy scalars and 0-dim arrays
+            idx = idx.item()
+
         # Ensure features are float32 and labels are float32 for PyTorch
         feature_sequence = np.array(self.features[idx], dtype=np.float32)
-        label = np.array(self.labels[idx], dtype=np.float32)
+        label = np.float32(self.labels[idx]) # Using np.float32() for scalar label
         return feature_sequence, label
 
 if __name__ == '__main__':
