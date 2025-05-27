@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
-from scipy.stats import spearmanr # Added for IC calculation
+from scipy.stats import spearmanr
 
 from master import MASTERModel
 # Assuming base_model.py contains the definition for SequenceModel
@@ -282,7 +282,7 @@ def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2, d
             
             optimizer.zero_grad()
             predictions = model.model(batch_X)
-            loss = criterion(predictions, batch_y)
+            loss = criterion(predictions, batch_y.squeeze(-1))
             loss.backward()
             optimizer.step()
             epoch_train_loss += loss.item()
@@ -297,7 +297,7 @@ def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2, d
             for batch_X_val, batch_y_val in val_loader:
                 batch_X_val, batch_y_val = batch_X_val.to(device), batch_y_val.to(device)
                 val_preds = model.model(batch_X_val)
-                loss = criterion(val_preds, batch_y_val)
+                loss = criterion(val_preds, batch_y_val.squeeze(-1))
                 epoch_val_loss += loss.item()
                 all_val_preds.append(val_preds.cpu().numpy())
                 all_val_actuals.append(batch_y_val.cpu().numpy())
@@ -363,8 +363,9 @@ def run_training(csv_path, sequence_len=60, d_model=256, t_nhead=4, s_nhead=2, d
 
     # Inverse transform predictions and actuals for scaled metrics like MSE
     # Predictions are for the scaled target
-    test_preds_rescaled = target_scaler.inverse_transform(all_test_preds_np)
-    test_actuals_rescaled = target_scaler.inverse_transform(all_test_actuals_np)
+    # Reshape 1D arrays to 2D (-1, 1) before inverse_transform
+    test_preds_rescaled = target_scaler.inverse_transform(all_test_preds_np.reshape(-1, 1))
+    test_actuals_rescaled = target_scaler.inverse_transform(all_test_actuals_np.reshape(-1, 1))
 
     test_mse = np.mean((test_preds_rescaled - test_actuals_rescaled)**2)
     test_ic, test_p_value = calculate_ic(all_test_preds_np, all_test_actuals_np) # IC on scaled or unscaled should be similar for rank
