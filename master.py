@@ -174,10 +174,10 @@ class MASTER(nn.Module):
     def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, gate_input_start_index, gate_input_end_index, beta):
         super(MASTER, self).__init__()
         # market
-        # self.gate_input_start_index = gate_input_start_index # No longer strictly needed for slicing in forward
-        # self.gate_input_end_index = gate_input_end_index # No longer strictly needed for slicing in forward
-        # self.d_gate_input = (gate_input_end_index - gate_input_start_index) # F' # Not used
-        self.feature_gate = Gate(d_feat, d_feat, beta=beta) # Gate input is now d_feat
+        self.gate_input_start_index = gate_input_start_index
+        self.gate_input_end_index = gate_input_end_index
+        self.d_gate_input = (gate_input_end_index - gate_input_start_index) # F'
+        self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
 
         self.layers = nn.Sequential(
             # feature layer
@@ -193,16 +193,10 @@ class MASTER(nn.Module):
         )
 
     def forward(self, x):
-        # x is expected to be (N, T, d_feat)
-        src = x
-        # Use all features from the last time step for the gate_input
-        gate_input = x[:, -1, :]
-
-        # Apply feature gate
-        # The feature_gate now expects input of size d_feat and outputs size d_feat
-        processed_gate_output = self.feature_gate(gate_input) # Shape (N, d_feat)
-        src = src * torch.unsqueeze(processed_gate_output, dim=1) # Apply gating
-
+        src = x[:, :, :self.gate_input_start_index] # N, T, D
+        gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
+        src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
+       
         output = self.layers(src).squeeze(-1)
 
         return output
