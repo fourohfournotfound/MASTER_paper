@@ -1,146 +1,211 @@
-from master import MASTERModel
-from custom_dataset import MultiIndexTimeSeriesDataset # Added import
-import pickle
 import numpy as np
-import time
+import pandas as pd
+import copy
 
-# Please install qlib first before load the data. # This comment might be outdated
+from torch.utils.data import DataLoader
+from torch.utils.data import Sampler
+import torch
+import torch.optim as optim
 
-# Remove or comment out the existing code block that loads dl_train, dl_valid, and dl_test from pickle files.
-# universe = 'csi300' # ['csi300','csi800']
-# prefix = 'opensource' # ['original','opensource'], which training data are you using
-# train_data_dir = f'data'
-# with open(f'{train_data_dir}\{prefix}\{universe}_dl_train.pkl', 'rb') as f:
-#     dl_train = pickle.load(f)
+def calc_ic(pred, label):
+    df = pd.DataFrame({'pred':pred, 'label':label})
+    ic = df['pred'].corr(df['label'])
+    ric = df['pred'].corr(df['label'], method='spearman')
+    return ic, ric
 
-# predict_data_dir = f'data\opensource'
-# with open(f'{predict_data_dir}\{universe}_dl_valid.pkl', 'rb') as f:
-#     dl_valid = pickle.load(f)
-# with open(f'{predict_data_dir}\{universe}_dl_test.pkl', 'rb') as f:
-#     dl_test = pickle.load(f)
+def zscore(x):
+    return (x - x.mean()).div(x.std())
 
-# print("Data Loaded.")
+def drop_extreme(x):
+    sorted_tensor, indices = x.sort()
+    N = x.shape[0]
+    percent_2_5 = int(0.025*N)  
+    # Exclude top 2.5% and bottom 2.5% values
+    filtered_indices = indices[percent_2_5:-percent_2_5]
+    mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
+    mask[filtered_indices] = True
+    return mask, x[mask]
 
-csv_path = 'data/user_stock_data.csv'
-lookback_window = 8
+def drop_na(x):
+    N = x.shape[0]
+    mask = ~x.isnan()
+    return mask, x[mask]
 
-print("Loading data from CSV...")
-# For now, use the same dataset for train, valid, and test to check pipeline integrity
-# Proper data splitting (e.g., by time) should be implemented later.
-dataset = MultiIndexTimeSeriesDataset(csv_path_or_buffer=csv_path, lookback_window=lookback_window) # Use csv_path_or_buffer
-dl_train = dataset
-dl_valid = dataset
-dl_test = dataset
-print(f"Data loaded. Number of sequences: {len(dataset)}")
-if len(dataset) == 0:
-    print("ERROR: No sequences were generated. Check CSV data and lookback window.")
-    # Exit or raise an error if no data, as the model cannot run.
-    raise SystemExit("Exiting due to no data.")
+class DailyBatchSamplerRandom(Sampler):
+    def __init__(self, data_source, shuffle=False):
+        self.data_source = data_source
+        self.shuffle = shuffle
+        # calculate number of samples in each batch
+        self.daily_count = pd.Series(index=self.data_source.get_index()).groupby("datetime").size().values
+        self.daily_index = np.roll(np.cumsum(self.daily_count), 1)  # calculate begin index of each batch
+        self.daily_index[0] = 0
 
+    def __iter__(self):
+        if self.shuffle:
+            index = np.arange(len(self.daily_count))
+            np.random.shuffle(index)
+            for i in index:
+                yield np.arange(self.daily_index[i], self.daily_index[i] + self.daily_count[i])
+        else:
+            for idx, count in zip(self.daily_index, self.daily_count):
+                yield np.arange(idx, idx + count)
 
-# d_feat is the number of features in each time step of a sequence
-# Our dataset.__getitem__ returns (feature_sequence, label)
-# feature_sequence is (lookback_window, num_actual_features)
-# num_actual_features was 8 in the test of custom_dataset.py
-if len(dataset.features) > 0:
-    d_feat = dataset.features[0].shape[1]
-else:
-    # This case should be caught by the len(dataset) == 0 check above
-    print("ERROR: Dataset is empty, cannot determine d_feat.")
-    raise SystemExit("Exiting due to empty dataset.")
-print(f"d_feat set to: {d_feat}")
-
-d_model = 256
-t_nhead = 4
-s_nhead = 2
-dropout = 0.5
-# Set gate_input_start_index = 0 and gate_input_end_index = d_feat
-gate_input_start_index = 0
-gate_input_end_index = d_feat 
+    def __len__(self):
+        return len(self.data_source)
 
 
-# if universe == 'csi300': # beta can be set to a default or determined differently if universe is removed
-#     beta = 5
-# elif universe == 'csi800':
-#     beta = 2
-beta = 5 # Default beta, or adjust as needed
+class SequenceModel():
+    def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= ''):
+        self.n_epochs = n_epochs
+        self.lr = lr
+        self.device = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
+        self.seed = seed
+        self.train_stop_loss_thred = train_stop_loss_thred
 
-n_epoch = 1
-lr = 1e-5
-GPU = 0
-train_stop_loss_thred = 0.95
+        if self.seed is not None:
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            torch.cuda.manual_seed_all(self.seed)
+            torch.backends.cudnn.deterministic = True
+        self.fitted = -1
+
+        self.model = None
+        self.train_optimizer = None
+
+        self.save_path = save_path
+        self.save_prefix = save_prefix
 
 
-ic = []
-icir = []
-ric = []
-ricir = []
+    def init_model(self):
+        if self.model is None:
+            raise ValueError("model has not been initialized")
 
-# Training
-######################################################################################
-# Keep training loop commented out for now as per original, or enable one run
-# For enabling one run for testing:
-for seed in [0]: #  Run for one seed to test the pipeline
-    model = MASTERModel(
-        d_feat = d_feat, d_model = d_model, t_nhead = t_nhead, s_nhead = s_nhead, T_dropout_rate=dropout, S_dropout_rate=dropout,
-        beta=beta, gate_input_end_index=gate_input_end_index, gate_input_start_index=gate_input_start_index,
-        n_epochs=n_epoch, lr = lr, GPU = GPU, seed = seed, train_stop_loss_thred = train_stop_loss_thred,
-        save_path='model', save_prefix=f'user_data_model' # Adjusted save_prefix
-    )
+        self.train_optimizer = optim.Adam(self.model.parameters(), self.lr)
+        self.model.to(self.device)
 
-    start = time.time()
-    # Train
-    model.fit(dl_train, dl_valid)
+    def loss_fn(self, pred, label):
+        mask = ~torch.isnan(label)
+        loss = (pred[mask]-label[mask])**2
+        return torch.mean(loss)
 
-    print("Model Trained.")
+    def train_epoch(self, data_loader):
+        self.model.train()
+        losses = []
 
-    # Test
-    predictions, metrics = model.predict(dl_test)
-    
-    running_time = time.time()-start
-    
-    print('Seed: {:d} time cost : {:.2f} sec'.format(seed, running_time))
-    print(metrics)
+        for data in data_loader:
+            data = torch.squeeze(data, dim=0)
+            '''
+            data.shape: (N, T, F)
+            N - number of stocks
+            T - length of lookback_window, 8
+            F - 158 factors + 63 market information + 1 label           
+            '''
+            feature = data[:, :, 0:-1].to(self.device)
+            label = data[:, -1, -1].to(self.device)
 
-    ic.append(metrics['IC'])
-    icir.append(metrics['ICIR'])
-    ric.append(metrics['RIC'])
-    ricir.append(metrics['RICIR'])
-# End of the enabled training loop for one seed
-######################################################################################
+            
+            # Additional process on labels
+            # If you use original data to train, you won't need the following lines because we already drop extreme when we dumped the data.
+            # If you use the opensource data to train, use the following lines to drop extreme labels.
+            #########################
+            mask, label = drop_extreme(label)
+            feature = feature[mask, :, :]
+            label = zscore(label) # CSZscoreNorm
+            #########################
 
-# Load and Test section - This section might fail if a pre-trained model for 'user_data_model_0.pkl' doesn't exist.
-# For now, let's comment it out to focus on the data loading and training pipeline.
-# If you want to test loading the model just trained, ensure save_prefix and param_path match.
-######################################################################################
-# for seed in [0]:
-#     param_path = f'model/user_data_model_{seed}.pkl' # Adjusted path
+            pred = self.model(feature.float())
+            loss = self.loss_fn(pred, label)
+            losses.append(loss.item())
 
-#     print(f'Model Loaded from {param_path}')
-#     model = MASTERModel(
-#             d_feat = d_feat, d_model = d_model, t_nhead = t_nhead, s_nhead = s_nhead, T_dropout_rate=dropout, S_dropout_rate=dropout,
-#             beta=beta, gate_input_end_index=gate_input_end_index, gate_input_start_index=gate_input_start_index,
-#             n_epochs=n_epoch, lr = lr, GPU = GPU, seed = seed, train_stop_loss_thred = train_stop_loss_thred,
-#             save_path='model/', save_prefix='user_data_model' # Adjusted save_prefix
-#         )
-#     try:
-#         model.load_param(param_path)
-#         predictions, metrics = model.predict(dl_test)
-#         print(metrics)
+            self.train_optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
+            self.train_optimizer.step()
 
-#         ic.append(metrics['IC'])
-#         icir.append(metrics['ICIR'])
-#         ric.append(metrics['RIC'])
-#         ricir.append(metrics['RICIR'])
-#     except FileNotFoundError:
-#         print(f"Model file {param_path} not found. Skipping load and test for this seed.")
-    
-######################################################################################
+        return float(np.mean(losses))
 
-if ic: # Only print metrics if the ic list is not empty (i.e., training/testing was run)
-    print("IC: {:.4f} pm {:.4f}".format(np.mean(ic), np.std(ic)))
-    print("ICIR: {:.4f} pm {:.4f}".format(np.mean(icir), np.std(icir)))
-    print("RIC: {:.4f} pm {:.4f}".format(np.mean(ric), np.std(ric)))
-    print("RICIR: {:.4f} pm {:.4f}".format(np.mean(ricir), np.std(ricir)))
-else:
-    print("No metrics to report as training/testing was not fully completed or skipped.")
+    def test_epoch(self, data_loader):
+        self.model.eval()
+        losses = []
+
+        for data in data_loader:
+            data = torch.squeeze(data, dim=0)
+            feature = data[:, :, 0:-1].to(self.device)
+            label = data[:, -1, -1].to(self.device)
+
+            # You cannot drop extreme labels for test. 
+            label = zscore(label)
+                        
+            pred = self.model(feature.float())
+            loss = self.loss_fn(pred, label)
+            losses.append(loss.item())
+
+        return float(np.mean(losses))
+
+    def _init_data_loader(self, data, shuffle=True, drop_last=True):
+        sampler = DailyBatchSamplerRandom(data, shuffle)
+        data_loader = DataLoader(data, sampler=sampler, drop_last=drop_last)
+        return data_loader
+
+    def load_param(self, param_path):
+        self.model.load_state_dict(torch.load(param_path, map_location=self.device))
+        self.fitted = 'Previously trained.'
+
+    def fit(self, dl_train, dl_valid=None):
+        train_loader = self._init_data_loader(dl_train, shuffle=True, drop_last=True)
+        best_param = None
+        for step in range(self.n_epochs):
+            train_loss = self.train_epoch(train_loader)
+            self.fitted = step
+            if dl_valid:
+                predictions, metrics = self.predict(dl_valid)
+                print("Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f." % (step, train_loss, metrics['IC'],  metrics['ICIR'],  metrics['RIC'],  metrics['RICIR']))
+            else: print("Epoch %d, train_loss %.6f" % (step, train_loss))
+        
+            if train_loss <= self.train_stop_loss_thred:
+                best_param = copy.deepcopy(self.model.state_dict())
+                torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}.pkl')
+                break
+        
+
+        
+
+    def predict(self, dl_test):
+        if self.fitted<0:
+            raise ValueError("model is not fitted yet!")
+        else:
+            print('Epoch:', self.fitted)
+
+        test_loader = self._init_data_loader(dl_test, shuffle=False, drop_last=False)
+
+        preds = []
+        ic = []
+        ric = []
+
+        self.model.eval()
+        for data in test_loader:
+            data = torch.squeeze(data, dim=0)
+            feature = data[:, :, 0:-1].to(self.device)
+            label = data[:, -1, -1]
+            
+            # nan label will be automatically ignored when compute metrics.
+            # zscorenorm will not affect the results of ranking-based metrics.
+
+            with torch.no_grad():
+                pred = self.model(feature.float()).detach().cpu().numpy()
+            preds.append(pred.ravel())
+
+            daily_ic, daily_ric = calc_ic(pred, label.detach().numpy())
+            ic.append(daily_ic)
+            ric.append(daily_ric)
+
+        predictions = pd.Series(np.concatenate(preds), index=dl_test.get_index())
+
+        metrics = {
+            'IC': np.mean(ic),
+            'ICIR': np.mean(ic)/np.std(ic),
+            'RIC': np.mean(ric),
+            'RICIR': np.mean(ric)/np.std(ric)
+        }
+
+        return predictions, metrics
