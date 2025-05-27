@@ -192,11 +192,29 @@ class MASTER(nn.Module):
             nn.Linear(d_model, 1)
         )
 
-    def forward(self, x):
-        src = x[:, :, :self.gate_input_start_index] # N, T, D
-        gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
-        src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
-       
+    def forward(self, x): # x shape: N, T, D_total_features
+        # Current configuration from main_multi_index.py:
+        # self.gate_input_start_index = 0
+        # self.gate_input_end_index = D_total_features (passed as d_feat to __init__)
+        # self.d_gate_input = D_total_features
+        # self.feature_gate is Gate(D_total_features, D_total_features, beta)
+
+        if self.d_gate_input > 0:
+            # Use features from the last time step of the sequence for gate decision
+            # The slice x[:, -1, self.gate_input_start_index:self.gate_input_end_index] becomes x[:, -1, :]
+            # when gate_input_start_index=0 and gate_input_end_index=D_total_features.
+            gate_decision_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
+
+            gate_output_values = self.feature_gate(gate_decision_input) # Shape: N, D_total_features (as d_output of Gate is D_total_features)
+
+            # Apply gate output element-wise to all features across all time steps
+            # The original `src` was x[:, :, :self.gate_input_start_index].
+            # If gate_input_start_index is 0, this would be empty.
+            # We intend for `x` itself to be the base for features, modified by the gate.
+            src = x * torch.unsqueeze(gate_output_values, dim=1) #unsqueeze adds time dim for broadcasting
+        else: # No gating configured (e.g., if d_gate_input was 0)
+            src = x
+
         output = self.layers(src).squeeze(-1)
 
         return output
