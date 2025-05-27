@@ -92,18 +92,17 @@ class SequenceModel():
         self.model.train()
         losses = []
 
-        for data in data_loader:
-            data = torch.squeeze(data, dim=0)
-            '''
-            data.shape: (N, T, F)
-            N - number of stocks
-            T - length of lookback_window, 8
-            F - 158 factors + 63 market information + 1 label           
-            '''
-            feature = data[:, :, 0:-1].to(self.device)
-            label = data[:, -1, -1].to(self.device)
-
+        for data_batch in data_loader: # data_loader now yields (feature_tensor, label_tensor)
+            feature_tensor, label_tensor = data_batch
             
+            # feature_tensor shape: (N, T, d_feat), N is num_stocks for the day
+            # label_tensor shape: (N)
+            
+            feature = feature_tensor.to(self.device).float() 
+            label = label_tensor.to(self.device).float()
+            
+            # The rest of the label processing (drop_extreme, zscore) and model training logic
+            # should apply to these new 'feature' and 'label' variables.
             # Additional process on labels
             # If you use original data to train, you won't need the following lines because we already drop extreme when we dumped the data.
             # If you use the opensource data to train, use the following lines to drop extreme labels.
@@ -113,7 +112,7 @@ class SequenceModel():
             label = zscore(label) # CSZscoreNorm
             #########################
 
-            pred = self.model(feature.float())
+            pred = self.model(feature) # feature is already .float()
             loss = self.loss_fn(pred, label)
             losses.append(loss.item())
 
@@ -128,15 +127,17 @@ class SequenceModel():
         self.model.eval()
         losses = []
 
-        for data in data_loader:
-            data = torch.squeeze(data, dim=0)
-            feature = data[:, :, 0:-1].to(self.device)
-            label = data[:, -1, -1].to(self.device)
-
+        for data_batch in data_loader: # data_loader now yields (feature_tensor, label_tensor)
+            feature_tensor, label_tensor = data_batch
+            
+            feature = feature_tensor.to(self.device).float()
+            label = label_tensor.to(self.device).float() # ensure float, even if not always modified by zscore etc.
+            
+            # The rest of the logic for zscore, prediction, and loss calculation should use these.
             # You cannot drop extreme labels for test. 
             label = zscore(label)
                         
-            pred = self.model(feature.float())
+            pred = self.model(feature) # feature is already .float()
             loss = self.loss_fn(pred, label)
             losses.append(loss.item())
 
@@ -183,19 +184,20 @@ class SequenceModel():
         ric = []
 
         self.model.eval()
-        for data in test_loader:
-            data = torch.squeeze(data, dim=0)
-            feature = data[:, :, 0:-1].to(self.device)
-            label = data[:, -1, -1]
+        for data_batch in test_loader: # data_loader now yields (feature_tensor, label_tensor)
+            feature_tensor, label_tensor = data_batch
+            
+            feature = feature_tensor.to(self.device).float()
+            label = label_tensor.cpu().float() # Keep label on CPU for calc_ic, ensure it's float
             
             # nan label will be automatically ignored when compute metrics.
             # zscorenorm will not affect the results of ranking-based metrics.
 
             with torch.no_grad():
-                pred = self.model(feature.float()).detach().cpu().numpy()
+                pred = self.model(feature).detach().cpu().numpy() # feature is already .float()
             preds.append(pred.ravel())
 
-            daily_ic, daily_ric = calc_ic(pred, label.detach().numpy())
+            daily_ic, daily_ric = calc_ic(pred, label.numpy()) # label is already on CPU and detached
             ic.append(daily_ic)
             ric.append(daily_ric)
 
