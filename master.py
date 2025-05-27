@@ -197,7 +197,7 @@ class MASTER(nn.Module):
         gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
         src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
        
-        output = self.layers(src).squeeze(-1)
+        output = self.layers(src)
 
         return output
 
