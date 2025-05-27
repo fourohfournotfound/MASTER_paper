@@ -4,7 +4,7 @@ import copy
 
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset # Changed Sampler to Dataset for TensorDataset
+from torch.utils.data import DataLoader, Dataset, Sampler # Changed Sampler to Dataset for TensorDataset
 
 def calc_ic(pred, label):
     # Ensure inputs are numpy arrays
@@ -65,8 +65,33 @@ def drop_extreme(x: torch.Tensor):
     return mask, x_1d[mask]
 
 
-# Removed DailyBatchSamplerRandom as we'll use standard DataLoader with TensorDataset
-# class DailyBatchSamplerRandom(Sampler): ...
+class DailyBatchSamplerRandom(Sampler):
+    def __init__(self, data_source, shuffle=False):
+        super().__init__(data_source) # Added: Call to superclass constructor
+        self.data_source = data_source
+        self.shuffle = shuffle
+        # calculate number of samples in each batch
+        # Assuming data_source has a get_index() method that returns a pandas MultiIndex like StockDataset
+        idx = self.data_source.get_index()
+        self.daily_count = pd.Series(index=idx).groupby(idx.get_level_values('datetime')).size().values
+        self.daily_index = np.roll(np.cumsum(self.daily_count), 1)  # calculate begin index of each batch
+        self.daily_index[0] = 0
+
+    def __iter__(self):
+        if self.shuffle:
+            # Shuffle the order of days, not samples within a day for typical financial TS
+            day_indices = np.arange(len(self.daily_count))
+            np.random.shuffle(day_indices)
+            for i in day_indices:
+                yield np.arange(self.daily_index[i], self.daily_index[i] + self.daily_count[i])
+        else:
+            for idx_start, count in zip(self.daily_index, self.daily_count):
+                yield np.arange(idx_start, idx_start + count)
+
+    def __len__(self):
+        # This should return the number of batches (days), not total samples
+        return len(self.daily_count)
+
 
 class SequenceModel():
     def __init__(self, n_epochs, lr, batch_size=64, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= ''):
