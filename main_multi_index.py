@@ -186,11 +186,7 @@ class DailyGroupedTimeSeriesDataset(Dataset):
 def preprocess_data(df, features_list, label_column, lookback_window, scaler=None, fit_scaler=False):
     """
     Main preprocessing function.
-    Handles NaN imputation, feature scaling, and sequence creation.
-    
-    Args:
-        scaler: If provided, use this fitted scaler. If None and fit_scaler=True, fit a new one.
-        fit_scaler: Whether to fit the scaler on this data (should only be True for training data)
+    Now expects features to already be cleaned and scaler to be pre-fitted.
     """
     print("[main_multi_index.py] Starting preprocess_data.") # DIAGNOSTIC PRINT
     
@@ -202,23 +198,8 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
         )
         print("[main_multi_index.py] Converted date index to datetime.")
 
-    # 1. Handle NaNs/Infs in features following proper time series practices
-    print("[main_multi_index.py] Preprocessing data split: Handling NaNs/Infs in features (replace inf, ffill only, fill remaining with 0).")
-    
-    if features_list and not df.empty:
-        # Step 1: Replace Infs with NaNs for all feature columns
-        df.loc[:, features_list] = df[features_list].replace([np.inf, -np.inf], np.nan)
-
-        # Step 2: Forward fill only (no backward fill to avoid lookahead bias)
-        df.loc[:, features_list] = df.groupby(level='ticker', group_keys=False)[features_list].ffill()
-        
-        # Step 3: Fill any remaining NaNs with 0 (e.g., if a ticker's series started with NaN)
-        df.loc[:, features_list] = df[features_list].fillna(0)
-        print(f"[main_multi_index.py] Feature NaN/Inf handling complete for this split. Features processed: {len(features_list)}")
-    elif df.empty:
-        print("[main_multi_index.py] DataFrame is empty, skipping NaN/Inf handling for features.")
-    elif not features_list:
-        print("[main_multi_index.py] features_list is empty, skipping NaN/Inf handling for features.")
+    # Features should already be cleaned by load_and_prepare_data
+    print("[main_multi_index.py] Features assumed to be pre-cleaned (NaN/Inf handled).")
 
     # Handle NaNs in the label column (dropna) - this is crucial for target variables
     initial_rows_before_label_dropna = len(df)
@@ -226,41 +207,21 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
     rows_dropped_for_label = initial_rows_before_label_dropna - len(df)
     if rows_dropped_for_label > 0:
         print(f"[main_multi_index.py] Dropped {rows_dropped_for_label} rows due to NaNs in label column '{label_column}'.")
+
+    # Apply scaling using the pre-fitted scaler
+    if scaler is not None and features_list and not df.empty:
+        cols_to_scale = [col for col in features_list if col in df.columns]
+        if cols_to_scale:
+            df.loc[:, cols_to_scale] = scaler.transform(df[cols_to_scale])
+            print(f"[main_multi_index.py] Applied pre-fitted scaler to features: {len(cols_to_scale)} columns.")
+        else:
+            print("[main_multi_index.py] No features to scale with provided scaler.")
+    elif scaler is None:
+        print("[main_multi_index.py] No scaler provided - features not scaled.")
     
-    print(f"[main_multi_index.py] NaN handling for this data split complete. Rows remaining: {len(df)}")
+    print(f"[main_multi_index.py] Preprocessing complete. Rows remaining: {len(df)}")
 
-    # 2. Feature Scaling
-    print("[main_multi_index.py] Scaling features...")
-    if fit_scaler:
-        if not features_list:
-            print("[main_multi_index.py] No features to scale (features_list is empty). Scaler will not be fitted.")
-            # scaler remains as passed (e.g. None) or previous state
-        elif df[features_list].empty:
-             print("[main_multi_index.py] Data for scaling is empty. Scaler will not be fitted.")
-        else:
-            scaler = StandardScaler()
-            df.loc[:, features_list] = scaler.fit_transform(df[features_list])
-            print("[main_multi_index.py] Fitted new scaler and transformed features.")
-    elif scaler is not None:
-        if not features_list:
-            print("[main_multi_index.py] No features to scale (features_list is empty).")
-        elif df[features_list].empty:
-            print("[main_multi_index.py] Data for scaling is empty, skipping transformation.")
-        else:
-            # Ensure only existing columns in df[features_list] are transformed
-            # This can happen if scaler was fit on more features than currently available in a split
-            # However, the global pruning should make features_list consistent.
-            cols_to_scale = [col for col in features_list if col in df.columns]
-            if cols_to_scale:
-                 df.loc[:, cols_to_scale] = scaler.transform(df[cols_to_scale])
-                 print(f"[main_multi_index.py] Transformed features using provided scaler for columns: {cols_to_scale}.")
-            else:
-                print("[main_multi_index.py] No common features to scale with provided scaler or features_list is out of sync.")
-    else:
-        print("[main_multi_index.py] No scaling applied.")
-        # scaler remains None if it was passed as None and fit_scaler is False
-
-    # 3. Create sequences
+    # Create sequences
     if not features_list:
         print("[main_multi_index.py] ERROR: features_list is empty before creating sequences in preprocess_data.")
         return None, None, None, scaler
@@ -269,7 +230,7 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
 
     if X.shape[0] == 0:
         print("[main_multi_index.py] ERROR: No data after sequencing in preprocess_data.")
-        return None, None, None, scaler # Return scaler here
+        return None, None, None, scaler
 
     print(f"[main_multi_index.py] preprocess_data completed. X shape: {X.shape}, y shape: {y.shape}")
     return X, y, seq_index, scaler
@@ -419,8 +380,35 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
         return (None,) * 11
     # --- End of Gate Index Detection ---
 
-    X_train, y_train, train_idx, scaler = preprocess_data(
-        train_df, feature_columns, label_column, lookback, scaler=None, fit_scaler=True
+    # First, handle NaN/Inf replacement and ffill for all splits before scaling
+    def _preprocess_features_no_scaling(df_slice, feature_cols):
+        """Handle NaN/Inf replacement and ffill without scaling"""
+        if feature_cols and not df_slice.empty:
+            # Step 1: Replace Infs with NaNs
+            df_slice.loc[:, feature_cols] = df_slice[feature_cols].replace([np.inf, -np.inf], np.nan)
+            # Step 2: Forward fill only (no backward fill)
+            df_slice.loc[:, feature_cols] = df_slice.groupby(level='ticker', group_keys=False)[feature_cols].ffill()
+            # Step 3: Fill remaining NaNs with 0
+            df_slice.loc[:, feature_cols] = df_slice[feature_cols].fillna(0)
+        return df_slice
+
+    # Apply preprocessing to all splits
+    train_df = _preprocess_features_no_scaling(train_df, feature_columns)
+    valid_df = _preprocess_features_no_scaling(valid_df, feature_columns) if not valid_df.empty else valid_df
+    test_df = _preprocess_features_no_scaling(test_df, feature_columns) if not test_df.empty else test_df
+
+    # Fit scaler ONLY on training data
+    scaler = StandardScaler()
+    if feature_columns and not train_df.empty:
+        scaler.fit(train_df[feature_columns])
+        logger.info("Fitted StandardScaler on training data only.")
+    else:
+        logger.warning("No features to fit scaler on training data.")
+        scaler = None
+
+    # Update preprocess_data calls to use the pre-fitted scaler
+    X_train, y_train, train_idx, _ = preprocess_data(
+        train_df, feature_columns, label_column, lookback, scaler=scaler, fit_scaler=False
     )
     X_valid, y_valid, valid_idx, _ = preprocess_data(
         valid_df, feature_columns, label_column, lookback, scaler=scaler, fit_scaler=False
