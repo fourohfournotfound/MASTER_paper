@@ -45,8 +45,8 @@ class SAttention(nn.Module):
         attn_dropout_layer = []
         if dropout > 0 and nhead > 0:
             for _ in range(nhead): # Changed i to _
-                attn_dropout_layer.append(Dropout(p=dropout))
-            self.attn_dropout = nn.ModuleList(attn_dropout_layer)
+                attn_dropout_layer.append(Dropout(p=dropout)) # Indented under for
+            self.attn_dropout = nn.ModuleList(attn_dropout_layer) # Indented under if
         else:
             self.attn_dropout = None
         
@@ -202,85 +202,57 @@ class RegRankLoss(nn.Module):
     def __init__(self, beta=1.0):
         super().__init__()
         self.beta = beta
+        self.softplus = nn.Softplus()
 
     def forward(self, pred, target):
-        # pred and target are expected to be 1D tensors of shape (N_stocks_in_day,)
         if pred.dim() > 1: pred = pred.squeeze()
         if target.dim() > 1: target = target.squeeze()
-        
-        # Ensure they have the same number of elements
-        if pred.shape[0] != target.shape[0] or pred.shape[0] < 2 : # Need at least 2 for pairwise comparison
-            # Return a simple MSE or zero loss if not enough elements for ranking
-            # This might happen if a day has only 1 stock after filtering.
-            # Or, if shapes mismatch, it's an error.
-            # For simplicity, using MSE if not enough elements for ranking.
-            # Consider if this day should be skipped or handled differently during training.
-            if pred.shape[0] != target.shape[0]:
-                # This is more serious, indicates a bug or data issue
-                logger.error(f"Shape mismatch in RegRankLoss: pred {pred.shape}, target {target.shape}")
-                return torch.tensor(0.0, device=pred.device, requires_grad=True) # Or raise error
 
-            # If only 0 or 1 stock, ranking loss is not well-defined.
-            # Return 0 loss or handle as per paper's implementation for such cases.
-            # For now, if less than 2 stocks, let's return 0.
+        if pred.shape[0] != target.shape[0]:
+            logger.error(f"Shape mismatch in RegRankLoss: pred {pred.shape}, target {target.shape}. Returning 0 loss.")
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        if pred.shape[0] < 2: # Need at least 2 stocks for pairwise comparison
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
 
-
-        # Create pairwise differences for predictions and targets
-        pred_diff = pred.unsqueeze(1) - pred.unsqueeze(0) # Shape (N, N)
+        # Create pairwise differences
+        # pred_ij = pred_i - pred_j
+        # target_ij = target_i - target_j
+        pred_diff = pred.unsqueeze(1) - pred.unsqueeze(0)  # Shape (N, N)
         target_diff = target.unsqueeze(1) - target.unsqueeze(0) # Shape (N, N)
 
-        # Mask for valid pairs (upper triangle, i < j)
+        # Create a mask for upper triangle (i < j) to consider each pair once
+        # and also where target_i != target_j (actual rank difference exists)
         mask = torch.triu(torch.ones_like(pred_diff, dtype=torch.bool), diagonal=1)
-
-        # Select only the valid pairs
-        pred_diff_pairs = pred_diff[mask]
-        target_diff_pairs = target_diff[mask]
-
-        # Loss calculation: sum of logistic losses for misordered pairs
-        # A pair is misordered if target_diff > 0 (target_i > target_j) but pred_diff < 0 (pred_i < pred_j)
-        # or target_diff < 0 (target_i < target_j) but pred_diff > 0 (pred_i > pred_j)
-        # This is equivalent to - sign(target_diff) * pred_diff
+        target_rank_diff_mask = (target_diff != 0)
+        final_mask = mask & target_rank_diff_mask
         
-        # We want to penalize when sign(pred_diff) != sign(target_diff)
-        # Loss = log(1 + exp(-beta * pred_diff_pairs * sign(target_diff_pairs)))
-        # Handle target_diff_pairs == 0 case (no preference) - these pairs should have 0 loss contribution.
-        # For numerical stability and to avoid issues with sign(0), let's filter them.
-        
-        valid_target_mask = target_diff_pairs != 0
-        if not valid_target_mask.any(): # No pairs with rank difference
+        if not final_mask.any(): # No valid pairs with rank difference
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
 
-        pred_diff_valid = pred_diff_pairs[valid_target_mask]
-        target_diff_valid = target_diff_pairs[valid_target_mask]
+        # Select valid pairs
+        valid_pred_diff = pred_diff[final_mask]
+        valid_target_diff = target_diff[final_mask]
+
+        # Loss for each pair: softplus(-beta * sign(target_ij) * pred_ij)
+        # sign(target_ij) * pred_ij should be positive if ranks agree, negative if disagree.
+        # We want to penalize if sign(target_ij) * pred_ij is negative or small positive.
+        # loss_terms = self.softplus(-self.beta * torch.sign(valid_target_diff) * valid_pred_diff)
         
-        # loss_pairs = torch.log(1 + torch.exp(-self.beta * pred_diff_valid * torch.sign(target_diff_valid)))
-        # Simpler form if target_diff_valid only contains ranking (e.g. 1 if i > j, -1 if i < j)
-        # More general: -log(sigmoid(beta * pred_diff * sign(target_diff))) is common
-        # Using the formulation: sum over (i,j) where target_i > target_j of log(1 + exp(-beta * (pred_i - pred_j)))
+        # Alternative formulation often used: log(1 + exp(-sigma * (s_i - s_j))) where target_i > target_j
+        # Let's stick to a common pairwise logistic loss formulation:
+        # For a pair (i, j), if target_i > target_j, loss_ij = log(1 + exp(-beta * (pred_i - pred_j)))
+        # This is equivalent to softplus(-beta * (pred_i - pred_j)) when target_i > target_j.
+        # And softplus(-beta * (pred_j - pred_i)) when target_j > target_i.
+        # General form: softplus(-beta * sign(target_i - target_j) * (pred_i - pred_j))
         
-        # Let's use the pairwise logistic loss formulation:
-        # For each pair (i, j), if target_i > target_j, we want pred_i > pred_j. Loss is log(1 + exp(-beta * (pred_i - pred_j)))
-        # If target_i < target_j, we want pred_i < pred_j. Loss is log(1 + exp(-beta * (pred_j - pred_i)))
-        # This can be simplified: sum_{i,j s.t. target_i > target_j} log(1 + exp(-beta * (pred_i - pred_j)))
+        loss_terms = self.softplus(-self.beta * torch.sign(valid_target_diff) * valid_pred_diff)
         
-        loss = 0.0
-        num_pairs = 0
-        
-        # Iterate through unique pairs (i, j) where i < j
-        for i in range(pred.shape[0]):
-            for j in range(i + 1, pred.shape[0]):
-                p_i, p_j = pred[i], pred[j]
-                t_i, t_j = target[i], target[j]
-                
-                if t_i > t_j: # If stock i should rank higher than stock j
-                    loss += torch.log(1 + torch.exp(-self.beta * (p_i - p_j)))
-                    num_pairs += 1
-                elif t_j > t_i: # If stock j should rank higher than stock i
-                    loss += torch.log(1 + torch.exp(-self.beta * (p_j - p_i)))
-                    num_pairs += 1
-        
-        return loss / num_pairs if num_pairs > 0 else torch.tensor(0.0, device=pred.device, requires_grad=True)
+        num_pairs = loss_terms.numel()
+        if num_pairs == 0: # Should be caught by final_mask.any() but as a safeguard
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+            
+        return loss_terms.sum() / num_pairs
 
 
 # This class implements the architecture from the paper's `MASTER` class
