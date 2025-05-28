@@ -143,35 +143,106 @@ def create_sequences_multi_index(data_multi_index, features_list, target_list, l
     return np.array(all_X), np.array(all_y), all_indices
 
 class DailyGroupedTimeSeriesDataset(Dataset):
-    def __init__(self, X_sequences, y_targets, multi_index):
+    def __init__(self, X_sequences, y_targets, multi_index, device=None, pin_memory=False, preprocess_labels=True):
         """
         Dataset that groups data by unique dates from the multi_index.
         X_sequences: Numpy array of shape (num_sequences, lookback_window, num_features)
         y_targets: Numpy array of shape (num_sequences,)
         multi_index: Pandas MultiIndex with levels ('ticker', 'date'), aligned with X_sequences and y_targets.
                      The 'date' in the multi_index corresponds to the date of the label y_target.
+        device: torch.device to preload tensors to (None for CPU)
+        pin_memory: bool, whether to pin memory for faster GPU transfers
+        preprocess_labels: bool, whether to precompute drop_extreme and zscore for labels
         """
         print(f"[DailyGroupedTimeSeriesDataset] Initializing with X shape: {X_sequences.shape}, y shape: {y_targets.shape}, index length: {len(multi_index)}")
-        self.X_sequences = X_sequences
-        self.y_targets = y_targets
-        self.multi_index = multi_index
-
+        print(f"[DailyGroupedTimeSeriesDataset] Optimization settings: device={device}, pin_memory={pin_memory}, preprocess_labels={preprocess_labels}")
+        
         if not isinstance(multi_index, pd.MultiIndex):
             raise ValueError("multi_index must be a Pandas MultiIndex.")
         if not ('date' in multi_index.names and 'ticker' in multi_index.names):
             raise ValueError("multi_index must have 'ticker' and 'date' as level names.")
 
+        self.multi_index = multi_index
+        self.device = device
+        self.pin_memory = pin_memory
+        self.preprocess_labels = preprocess_labels
+        
         self.unique_dates = sorted(self.multi_index.get_level_values('date').unique())
         self.data_by_date = {}
 
-        # Pre-group data by date for faster __getitem__
+        print(f"[DailyGroupedTimeSeriesDataset] Pre-converting data to tensors for {len(self.unique_dates)} unique dates...")
+        
+        # Pre-group data by date and convert to tensors immediately
         for date_val in self.unique_dates:
             date_mask = self.multi_index.get_level_values('date') == date_val
-            self.data_by_date[date_val] = {
-                'X': self.X_sequences[date_mask],
-                'y': self.y_targets[date_mask]
+            X_day = X_sequences[date_mask]
+            y_day = y_targets[date_mask]
+            
+            # Convert to tensors immediately
+            X_tensor = torch.tensor(X_day, dtype=torch.float32)
+            y_tensor = torch.tensor(y_day, dtype=torch.float32)
+            
+            # Pin memory if requested (faster CPU-GPU transfers)
+            if self.pin_memory and not self.device:
+                X_tensor = X_tensor.pin_memory()
+                y_tensor = y_tensor.pin_memory()
+            
+            # Move to device if specified
+            if self.device is not None:
+                X_tensor = X_tensor.to(self.device, non_blocking=True)
+                y_tensor = y_tensor.to(self.device, non_blocking=True)
+            
+            day_data = {
+                'X': X_tensor,
+                'y_original': y_tensor
             }
-        print(f"[DailyGroupedTimeSeriesDataset] Initialized for {len(self.unique_dates)} unique dates.")
+            
+            # Pre-process labels if requested
+            if self.preprocess_labels and y_tensor.numel() > 0:
+                # Import drop_extreme and zscore functions
+                try:
+                    from base_model import drop_extreme, zscore
+                    
+                    # Pre-compute label processing for training efficiency
+                    if y_tensor.shape[0] >= 10:  # Same logic as training loop
+                        with torch.no_grad():
+                            y_tensor_for_processing = y_tensor.clone()
+                            if self.device is None:  # Move to device temporarily for processing
+                                y_tensor_for_processing = y_tensor_for_processing.cuda() if torch.cuda.is_available() else y_tensor_for_processing
+                            
+                            label_mask, y_dropped_extreme = drop_extreme(y_tensor_for_processing)
+                            
+                            # Fix shape issue: label_mask might be [N, 1] but we need [N] for indexing
+                            if label_mask.dim() > 1:
+                                label_mask = label_mask.squeeze(-1)
+                            
+                            y_processed = zscore(y_dropped_extreme)
+                            
+                            # Move back to original device/location
+                            if self.device is None and torch.cuda.is_available():
+                                label_mask = label_mask.cpu()
+                                y_processed = y_processed.cpu()
+                            
+                            day_data['label_mask'] = label_mask
+                            day_data['y_processed'] = y_processed
+                    else:
+                        # For small batches, use all samples (no drop_extreme)
+                        label_mask = torch.ones(y_tensor.shape[0], dtype=torch.bool, device=y_tensor.device)
+                        y_processed = zscore(y_tensor.clone())
+                        day_data['label_mask'] = label_mask  
+                        day_data['y_processed'] = y_processed
+                        
+                except ImportError:
+                    print("[DailyGroupedTimeSeriesDataset] Warning: Could not import drop_extreme/zscore, skipping label preprocessing")
+                    day_data['label_mask'] = None
+                    day_data['y_processed'] = None
+            else:
+                day_data['label_mask'] = None
+                day_data['y_processed'] = None
+            
+            self.data_by_date[date_val] = day_data
+            
+        print(f"[DailyGroupedTimeSeriesDataset] Tensor pre-conversion completed for {len(self.unique_dates)} unique dates.")
 
     def __len__(self):
         """Returns the number of unique days in the dataset."""
@@ -185,14 +256,19 @@ class DailyGroupedTimeSeriesDataset(Dataset):
         selected_date = self.unique_dates[idx]
         day_data = self.data_by_date[selected_date]
         
-        # Convert to tensors
-        # X shape for a day: (num_stocks_on_this_day, lookback_window, num_features)
-        # y shape for a day: (num_stocks_on_this_day,)
-        features_tensor = torch.tensor(day_data['X'], dtype=torch.float32)
-        labels_tensor = torch.tensor(day_data['y'], dtype=torch.float32)
+        # Data is already converted to tensors and potentially on GPU
+        features_tensor = day_data['X']
+        labels_tensor = day_data['y_original']
         
-        # print(f"[DailyGroupedTimeSeriesDataset] __getitem__({idx}) -> Date: {selected_date}, X_shape: {features_tensor.shape}, y_shape: {labels_tensor.shape}")
-        return features_tensor, labels_tensor
+        # Return pre-processed labels if available
+        processed_data = {
+            'X': features_tensor,
+            'y_original': labels_tensor,
+            'label_mask': day_data.get('label_mask'),
+            'y_processed': day_data.get('y_processed')
+        }
+        
+        return processed_data
 
     def get_index(self):
         """Returns the original multi_index, useful for aligning predictions."""
@@ -885,16 +961,16 @@ def main():
     valid_idx_multiindex = convert_to_multiindex(valid_idx) if valid_idx else pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
     test_idx_multiindex = convert_to_multiindex(test_idx) if test_idx else pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
 
-    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx_multiindex)
+    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx_multiindex, device, False, True)
     valid_dataset = None
     if X_valid is not None and X_valid.shape[0] > 0:
-        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx_multiindex)
+        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx_multiindex, device, False, True)
     else:
         logger.warning("No validation data. Early stopping and LR scheduling on validation loss will not be active.")
     
     test_dataset = None
     if X_test is not None and X_test.shape[0] > 0:
-        test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx_multiindex)
+        test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx_multiindex, device, False, True)
 
     logger.info(f"Train samples: {len(X_train)}, Valid samples: {len(X_valid) if X_valid is not None else 0}, Test samples: {len(X_test) if X_test is not None else 0}")
     logger.info(f"Train unique days: {len(train_dataset)}, Valid unique days: {len(valid_dataset) if valid_dataset else 0}, Test unique days: {len(test_dataset) if test_dataset else 0}")
@@ -930,93 +1006,179 @@ def main():
         early_stopping = EarlyStopping(patience=10, verbose=True, path=str(best_model_path), trace_func=logger.info)
 
     logger.info("Starting training loop with paper's label processing...")
+    
+    # Create DataLoaders for optimized training
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=1,  # Keep batch_size=1 since each item is one day
+        shuffle=False,  # Don't shuffle to maintain temporal order for time series
+        num_workers=4,  # Enable parallel data loading
+        pin_memory=True if device.type == 'cuda' else False,  # Faster GPU transfers
+        persistent_workers=True  # Keep workers alive between epochs
+    )
+    
+    valid_loader = None
+    if valid_dataset:
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=2,  # Fewer workers for validation
+            pin_memory=True if device.type == 'cuda' else False,
+            persistent_workers=True
+        )
+    
+    logger.info(f"Created DataLoaders with {4 if device.type == 'cuda' else 0} workers for training, {2 if valid_dataset and device.type == 'cuda' else 0} for validation")
+    
+    # Gradient accumulation for larger effective batch size
+    accumulation_steps = 4  # Accumulate gradients over 4 days before updating
+    logger.info(f"Using gradient accumulation with {accumulation_steps} steps for effective batch size of {accumulation_steps} days")
+    
     for epoch in range(args.epochs):
         epoch_train_loss = 0
         pytorch_model.train()
         processed_batches_train = 0
-        for i in range(len(train_dataset)): 
-            X_day, y_day_original = train_dataset[i]
-            X_day, y_day_original = X_day.to(device), y_day_original.to(device)
-
-            if y_day_original.numel() == 0 : # Skip if no labels for the day
-                continue
-
-            # Apply label processing as per paper for training
-            # drop_extreme and zscore expect torch tensors
-            num_original = y_day_original.shape[0]
+        accumulated_loss = 0
+        
+        # Use DataLoader for optimized iteration
+        for batch_idx, batch_data in enumerate(train_loader):
+            # Extract data from the batch - DataLoader returns dict with batch dimension
+            # Since batch_size=1, we squeeze out the batch dimension
+            X_day = batch_data['X'].squeeze(0)  # Remove batch dimension
+            y_day_original = batch_data['y_original'].squeeze(0)
             
-            # Smart drop_extreme: only apply when we have enough samples
-            # With small batches (< 10 samples), drop_extreme becomes counterproductive
-            if num_original >= 10:
-                label_mask, y_day_dropped_extreme = drop_extreme(y_day_original.clone()) 
-                
-                # Fix shape issue: label_mask might be [N, 1] but we need [N] for indexing
-                if label_mask.dim() > 1:
-                    label_mask = label_mask.squeeze(-1)  # Convert [N, 1] to [N]
+            # Handle optional tensors that might be None
+            label_mask = batch_data.get('label_mask')
+            if label_mask is not None and label_mask[0] is not None:
+                label_mask = label_mask.squeeze(0)
             else:
-                # For small batches, use all samples (no drop_extreme)
-                label_mask = torch.ones(num_original, dtype=torch.bool, device=y_day_original.device)
-                y_day_dropped_extreme = y_day_original.clone()
-            
-            # Debug logging for training loss issue
-            num_after_drop = torch.sum(label_mask).item()
-            
-            if not torch.any(label_mask): # if all labels were dropped
-                logger.debug(f"Epoch {epoch+1}, Day {i}: All labels dropped by drop_extreme. Original: {num_original}, After: {num_after_drop}")
-                continue
-            
-            y_day_processed_for_loss = zscore(y_day_dropped_extreme) # CSZscoreNorm
-            
-            # Filter X_day based on the mask from drop_extreme
-            X_day_filtered = X_day[label_mask]
-
-            if X_day_filtered.shape[0] == 0: # If all corresponding features are gone
-                logger.debug(f"Epoch {epoch+1}, Day {i}: All features dropped after label mask. Skipping batch.")
-                continue
+                label_mask = None
                 
-            optimizer.zero_grad()
-            preds_day_all = pytorch_model(X_day) # Get predictions for ALL X_day items
-            preds_day_filtered_for_loss = preds_day_all[label_mask] # Filter predictions
+            y_day_processed = batch_data.get('y_processed') 
+            if y_day_processed is not None and y_day_processed[0] is not None:
+                y_day_processed = y_day_processed.squeeze(0)
+            else:
+                y_day_processed = None
+
+            # Move to device if not already there
+            if X_day.device != device:
+                X_day = X_day.to(device, non_blocking=True)
+            if y_day_original.device != device:
+                y_day_original = y_day_original.to(device, non_blocking=True)
+
+            if y_day_original.numel() == 0:  # Skip if no labels for the day
+                continue
+
+            # Use pre-processed labels if available, otherwise compute on-the-fly
+            if label_mask is not None and y_day_processed is not None:
+                # Use pre-computed label processing
+                if label_mask.device != device:
+                    label_mask = label_mask.to(device, non_blocking=True)
+                if y_day_processed.device != device:
+                    y_day_processed = y_day_processed.to(device, non_blocking=True)
+                
+                # Check if any valid labels exist after drop_extreme
+                if not torch.any(label_mask):
+                    logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}: All labels dropped by pre-computed drop_extreme. Skipping.")
+                    continue
+                    
+                # Use pre-processed labels and mask
+                X_day_filtered = X_day[label_mask]
+                y_day_processed_for_loss = y_day_processed
+                
+            else:
+                # Fallback to original CPU-intensive processing
+                num_original = y_day_original.shape[0]
+                
+                # Smart drop_extreme: only apply when we have enough samples
+                if num_original >= 10:
+                    label_mask, y_day_dropped_extreme = drop_extreme(y_day_original.clone()) 
+                    
+                    # Fix shape issue: label_mask might be [N, 1] but we need [N] for indexing
+                    if label_mask.dim() > 1:
+                        label_mask = label_mask.squeeze(-1)
+                else:
+                    # For small batches, use all samples (no drop_extreme)
+                    label_mask = torch.ones(num_original, dtype=torch.bool, device=y_day_original.device)
+                    y_day_dropped_extreme = y_day_original.clone()
+                
+                num_after_drop = torch.sum(label_mask).item()
+                
+                if not torch.any(label_mask):  # if all labels were dropped
+                    logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}: All labels dropped by drop_extreme. Original: {num_original}, After: {num_after_drop}")
+                    continue
+                
+                y_day_processed_for_loss = zscore(y_day_dropped_extreme)  # CSZscoreNorm
+                
+                # Filter X_day based on the mask from drop_extreme
+                X_day_filtered = X_day[label_mask]
+
+            if X_day_filtered.shape[0] == 0:  # If all corresponding features are gone
+                logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}: All features dropped after label mask. Skipping batch.")
+                continue
+
+            # Only zero gradients at the start of accumulation cycle
+            if batch_idx % accumulation_steps == 0:
+                optimizer.zero_grad()
+                
+            preds_day_all = pytorch_model(X_day)  # Get predictions for ALL X_day items
+            preds_day_filtered_for_loss = preds_day_all[label_mask]  # Filter predictions
 
             if preds_day_filtered_for_loss.shape[0] != y_day_processed_for_loss.shape[0]:
-                logger.error(f"Epoch {epoch+1}, Day {i}: Mismatch after filtering. Preds: {preds_day_filtered_for_loss.shape}, Labels: {y_day_processed_for_loss.shape}. Skipping.")
+                logger.error(f"Epoch {epoch+1}, Batch {batch_idx}: Mismatch after filtering. Preds: {preds_day_filtered_for_loss.shape}, Labels: {y_day_processed_for_loss.shape}. Skipping.")
                 continue
-            if preds_day_filtered_for_loss.numel() == 0: # If no elements left to calculate loss
-                logger.debug(f"Epoch {epoch+1}, Day {i}: No elements left for loss calculation.")
+            if preds_day_filtered_for_loss.numel() == 0:  # If no elements left to calculate loss
+                logger.debug(f"Epoch {epoch+1}, Batch {batch_idx}: No elements left for loss calculation.")
                 continue
 
             loss = criterion(preds_day_filtered_for_loss.squeeze(), y_day_processed_for_loss.squeeze()) 
             
-            # Debug: Log actual loss values
-            if i % 100 == 0:  # Log every 100th batch
-                logger.info(f"Epoch {epoch+1}, Day {i}: Original samples: {num_original}, After drop_extreme: {num_after_drop}, Loss: {loss.item():.6f}")
+            # Scale loss by accumulation steps for proper averaging
+            loss = loss / accumulation_steps
+            
+            # Debug: Log actual loss values less frequently to reduce overhead
+            if batch_idx % 500 == 0:  # Log every 500th batch instead of 100th
+                num_original = y_day_original.shape[0]
+                num_after_drop = torch.sum(label_mask).item()
+                logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Original samples: {num_original}, After drop_extreme: {num_after_drop}, Loss: {(loss.item() * accumulation_steps):.6f}")
             
             if torch.isnan(loss) or torch.isinf(loss):
-                logger.warning(f"Epoch {epoch+1}, Day {i}: NaN or Inf loss detected. Skipping update. Preds: {preds_day_filtered_for_loss}, Labels: {y_day_processed_for_loss}")
+                logger.warning(f"Epoch {epoch+1}, Batch {batch_idx}: NaN or Inf loss detected. Skipping update.")
                 continue
 
             loss.backward()
             
-            # Only clip gradients if they exist
-            has_grads = any(param.grad is not None for param in pytorch_model.parameters())
-            if has_grads:
-                torch.nn.utils.clip_grad_value_(pytorch_model.parameters(), 3.0) # As per paper's base_model
+            # Only step optimizer and clip gradients at the end of accumulation cycle
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                # Only clip gradients if they exist
+                has_grads = any(param.grad is not None for param in pytorch_model.parameters())
+                if has_grads:
+                    torch.nn.utils.clip_grad_value_(pytorch_model.parameters(), 3.0)  # As per paper's base_model
+                
+                optimizer.step()
             
-            optimizer.step()
-            epoch_train_loss += loss.item()
+            epoch_train_loss += loss.item() * accumulation_steps  # Scale back for logging
             processed_batches_train += 1
+            accumulated_loss += loss.item() * accumulation_steps
         
         avg_epoch_train_loss = epoch_train_loss / processed_batches_train if processed_batches_train > 0 else 0
         logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_epoch_train_loss:.6f}")
 
-        if valid_dataset:
+        if valid_loader:
             epoch_val_loss = 0
             pytorch_model.eval()
             processed_batches_valid = 0
             with torch.no_grad():
-                for i in range(len(valid_dataset)):
-                    X_day_val, y_day_val_original = valid_dataset[i]
-                    X_day_val, y_day_val_original = X_day_val.to(device), y_day_val_original.to(device)
+                for batch_idx, batch_data in enumerate(valid_loader):
+                    # Extract data from the batch - DataLoader returns dict with batch dimension
+                    X_day_val = batch_data['X'].squeeze(0)  # Remove batch dimension
+                    y_day_val_original = batch_data['y_original'].squeeze(0)
+
+                    # Move to device if not already there
+                    if X_day_val.device != device:
+                        X_day_val = X_day_val.to(device, non_blocking=True)
+                    if y_day_val_original.device != device:
+                        y_day_val_original = y_day_val_original.to(device, non_blocking=True)
 
                     if y_day_val_original.numel() == 0:
                         continue
@@ -1027,28 +1189,26 @@ def main():
                     preds_day_val = pytorch_model(X_day_val)
 
                     if preds_day_val.shape[0] != y_day_val_processed.shape[0]:
-                        logger.error(f"Epoch {epoch+1}, Valid Day {i}: Mismatch shapes. Preds: {preds_day_val.shape}, Labels: {y_day_val_processed.shape}. Skipping.")
+                        logger.error(f"Epoch {epoch+1}, Valid Batch {batch_idx}: Mismatch shapes. Preds: {preds_day_val.shape}, Labels: {y_day_val_processed.shape}. Skipping.")
                         continue
                     if preds_day_val.numel() == 0:
                          continue
-
 
                     val_loss_item = criterion(preds_day_val.squeeze(), y_day_val_processed.squeeze())
                     
                     if not (torch.isnan(val_loss_item) or torch.isinf(val_loss_item)):
                         epoch_val_loss += val_loss_item.item()
-                        processed_batches_valid +=1
+                        processed_batches_valid += 1
                     else:
-                        logger.warning(f"Epoch {epoch+1}, Valid Day {i}: NaN or Inf validation loss detected. Preds: {preds_day_val}, Labels: {y_day_val_processed}")
-
+                        logger.warning(f"Epoch {epoch+1}, Valid Batch {batch_idx}: NaN or Inf validation loss detected.")
 
             avg_epoch_val_loss = epoch_val_loss / processed_batches_valid if processed_batches_valid > 0 else 0
             logger.info(f"Epoch {epoch+1}/{args.epochs} - Validation Loss: {avg_epoch_val_loss:.6f}")
 
             if scheduler:
                 scheduler.step(avg_epoch_val_loss)
-            if early_stopping: # early_stopping expects a loss (lower is better)
-                if processed_batches_valid > 0: # Only step if val loss was computed
+            if early_stopping:  # early_stopping expects a loss (lower is better)
+                if processed_batches_valid > 0:  # Only step if val loss was computed
                     early_stopping(avg_epoch_val_loss, pytorch_model) 
                     if early_stopping.early_stop:
                         logger.info("Early stopping triggered.")
@@ -1075,17 +1235,33 @@ def main():
     predictions_df = pd.DataFrame(columns=['date', 'ticker', 'prediction', 'actual_return'])
     if test_dataset:
         logger.info("Generating predictions on the test set...")
+        
+        # Create DataLoader for test set as well
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True if device.type == 'cuda' else False,
+            persistent_workers=True
+        )
+        
         pytorch_model.eval()
         all_predictions_list = []
         with torch.no_grad():
-            for i in range(len(test_dataset)):
-                X_day_test, y_day_test_actuals = test_dataset[i]
+            for batch_idx, batch_data in enumerate(test_loader):
+                # Extract data from the batch - DataLoader returns dict with batch dimension
+                X_day_test = batch_data['X'].squeeze(0)  # Remove batch dimension
+                y_day_test_actuals = batch_data['y_original'].squeeze(0)
                 
-                current_date_for_day = test_dataset.unique_dates[i]
+                current_date_for_day = test_dataset.unique_dates[batch_idx]
                 day_specific_mask = test_dataset.multi_index.get_level_values('date') == current_date_for_day
                 tickers_for_day = test_dataset.multi_index[day_specific_mask].get_level_values('ticker')
 
-                X_day_test = X_day_test.to(device)
+                # Move to device if not already there
+                if X_day_test.device != device:
+                    X_day_test = X_day_test.to(device, non_blocking=True)
+                
                 preds_day_test = pytorch_model(X_day_test).squeeze().cpu().numpy()
                 actuals_day_test = y_day_test_actuals.cpu().numpy()
 
