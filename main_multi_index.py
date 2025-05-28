@@ -439,7 +439,12 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
             df['label'] = df.groupby(level='ticker')['returns'].shift(-1)
 
             # Drop last row per ticker (it will have NaN label after shift)
-            df = df.groupby(level='ticker').apply(lambda x: x.iloc[:-1])
+            # group_keys=False keeps the original (ticker, date) index so we
+            # don't end up with two levels named 'ticker'.
+            df = (
+                df.groupby(level='ticker', group_keys=False)
+                  .apply(lambda x: x.iloc[:-1])
+            )
             print(f"[OPTIMIZED] Labels generated efficiently. Shape: {df.shape}")
         else:
             print("[OPTIMIZED] ERROR: Cannot generate labels")
