@@ -1,571 +1,669 @@
-import torch
-from torch import nn
-from torch.nn.modules.linear import Linear
-from torch.nn.modules.dropout import Dropout
-from torch.nn.modules.normalization import LayerNorm
-import math
-import pandas as pd
 import numpy as np
+import pandas as pd
+import copy
 import logging
-from torch.utils.data import DataLoader
-import torch.optim as optim
+import sys
 from pathlib import Path
+import time
+import psutil
 
-from base_model import calc_ic, zscore, drop_extreme  # Only import what we need
+from torch.utils.data import DataLoader
+from torch.utils.data import Sampler
+import torch
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+import torch.nn as nn
 
-# Setup logger for this module
+# Setup basic logging for this module if not already configured globally
 logger = logging.getLogger(__name__)
+# Ensure a handler is configured for the logger if running this module standalone or if not configured by the main script.
+if not logger.handlers:
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+def calc_ic(pred, label):
+    df = pd.DataFrame({'pred':pred, 'label':label})
+    ic = df['pred'].corr(df['label'])
+    ric = df['pred'].corr(df['label'], method='spearman')
+    return ic, ric
+
+def zscore(x, epsilon=1e-8):
+    # Ensure x is a float tensor for std calculation
+    if not x.is_floating_point():
+        x = x.float()
+
+    if x.numel() == 0:
+        return x # Return empty tensor as is
+
+    std_dev = x.std()
+
+    # Check if std_dev is problematic (zero, very small, NaN, or Inf)
+    if std_dev < epsilon or torch.isnan(std_dev) or torch.isinf(std_dev):
+        # If no variance (e.g., all elements are the same, or only one element),
+        # z-scores can be considered 0.
+        return torch.zeros_like(x)
+
+    return (x - x.mean()).div(std_dev + epsilon) # Add epsilon for numerical stability
+
+def drop_extreme(x):
+    if x.numel() == 0:
+        return torch.zeros_like(x, dtype=torch.bool), x
+
+    # Optional: Add a log if NaNs/Infs are detected, but proceed.
+    # if torch.isnan(x).any() or torch.isinf(x).any():
+    #     print(f"Warning: NaN or Inf detected in input to drop_extreme. Shape: {x.shape}")
+
+    sorted_tensor, indices = x.sort() # NaNs are typically put at the end by sort.
+    N = x.shape[0]
+
+    percent_2_5 = int(0.025 * N)
+
+    start_idx = percent_2_5
+    end_idx = N - percent_2_5
+
+    filtered_indices = indices[start_idx:end_idx]
+
+    mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
+    if filtered_indices.numel() > 0: # Ensure indices are not empty before trying to mask
+        mask[filtered_indices] = True
+
+    return mask, x[mask]
+
+def drop_na(x):
+    N = x.shape[0]
+    mask = ~x.isnan()
+    return mask, x[mask]
+
+class DailyBatchSamplerRandom(Sampler):
+    def __init__(self, data_source, shuffle=False):
+        self.data_source = data_source
+        self.shuffle = shuffle
+        # calculate number of samples in each batch
+        self.daily_count = pd.Series(index=self.data_source.get_index()).groupby("datetime").size().values
+        self.daily_index = np.roll(np.cumsum(self.daily_count), 1)  # calculate begin index of each batch
+        self.daily_index[0] = 0
+
+    def __iter__(self):
+        if self.shuffle:
+            index = np.arange(len(self.daily_count))
+            np.random.shuffle(index)
+            for i in index:
+                yield np.arange(self.daily_index[i], self.daily_index[i] + self.daily_count[i])
+        else:
+            for idx, count in zip(self.daily_index, self.daily_count):
+                yield np.arange(idx, idx + count)
+
+    def __len__(self):
+        return len(self.data_source)
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=100):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
+class DaySampler(Sampler):
+    def __init__(self, data_source, shuffle=False):
+        self.data_source = data_source # data_source is DailyGroupedTimeSeriesDataset
+        self.shuffle = shuffle
+        self.num_days = len(data_source)
 
-    def forward(self, x):
-        return x + self.pe[:x.shape[1], :]
+    def __iter__(self):
+        indices = np.arange(self.num_days)
+        if self.shuffle:
+            np.random.shuffle(indices)
+        yield from indices
+
+    def __len__(self):
+        return self.num_days
 
 
-# Official SAttention structure (processes N, T, D_model)
-class SAttention(nn.Module):
-    def __init__(self, d_model, nhead, dropout):
-        super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        self.temperature = math.sqrt(self.d_model / nhead) if nhead > 0 else math.sqrt(d_model)
-
-        self.qtrans = nn.Linear(d_model, d_model, bias=False)
-        self.ktrans = nn.Linear(d_model, d_model, bias=False)
-        self.vtrans = nn.Linear(d_model, d_model, bias=False)
-
-        # OPTIMIZED: Use single dropout instead of per-head dropout
-        self.attn_dropout = nn.Dropout(p=dropout) if dropout > 0 and nhead > 0 else None
+class MultiDayBatchSampler(Sampler):
+    def __init__(self, data_source, days_per_batch=4, shuffle=False):
+        self.data_source = data_source
+        self.days_per_batch = days_per_batch
+        self.shuffle = shuffle
+        self.num_days = len(data_source)
         
-        self.norm1 = LayerNorm(d_model, eps=1e-5)
-        self.norm2 = LayerNorm(d_model, eps=1e-5)
-        self.ffn = nn.Sequential(
-            Linear(d_model, d_model),
-            nn.ReLU(),
-            Dropout(p=dropout),
-            Linear(d_model, d_model),
-            Dropout(p=dropout)
-        )
-
-    def forward(self, x): # x shape: (N_stocks, T_lookback, d_model)
-        x_norm = self.norm1(x)
+    def __iter__(self):
+        indices = np.arange(self.num_days)
+        if self.shuffle:
+            np.random.shuffle(indices)
         
-        # q, k, v shape: (T_lookback, N_stocks, d_model) after transpose
-        q = self.qtrans(x_norm).transpose(0, 1)
-        k = self.ktrans(x_norm).transpose(0, 1)
-        v = self.vtrans(x_norm).transpose(0, 1)
+        # Group days into batches
+        for i in range(0, len(indices), self.days_per_batch):
+            yield indices[i:i + self.days_per_batch]
+    
+    def __len__(self):
+        return (self.num_days + self.days_per_batch - 1) // self.days_per_batch
 
-        # Effective dimension per head, handles non-divisible d_model/nhead for slicing
-        head_dim_base = self.d_model // self.nhead
-        att_output_per_head = []
-        current_dim_offset = 0
-        for i in range(self.nhead):
-            # Determine actual head_dim for this head
-            if i < self.nhead - 1:
-                current_head_actual_dim = head_dim_base
-            else: # Last head takes the remainder
-                current_head_actual_dim = self.d_model - current_dim_offset
-            
-            # Slice for current head -> qh, kh, vh shape: (T_lookback, N_stocks, current_head_actual_dim)
-            q_h = q[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
-            k_h = k[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
-            v_h = v[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
-            current_dim_offset += current_head_actual_dim
-            
-            # Attention scores for current head: (T_lookback, N_stocks, N_stocks)
-            # (T, N, h_dim) @ (T, h_dim, N) -> (T, N, N)
-            attn_scores_h = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.temperature
-            attn_probs_h = torch.softmax(attn_scores_h, dim=-1)
 
-            # OPTIMIZED: Use single dropout for all heads
-            if self.attn_dropout:
-                attn_probs_h = self.attn_dropout(attn_probs_h)
-            
-            # Weighted sum for current head: (T_lookback, N_stocks, current_head_actual_dim)
-            # (T, N, N) @ (T, N, h_dim) -> (T, N, h_dim)
-            weighted_values_h = torch.matmul(attn_probs_h, v_h)
-            att_output_per_head.append(weighted_values_h.transpose(0,1)) # Transpose back to (N_stocks, T_lookback, current_head_actual_dim)
-
-        # Concatenate heads: (N_stocks, T_lookback, d_model)
-        att_output_concat = torch.cat(att_output_per_head, dim=-1)
+class TemporallyAwareBatchSampler(Sampler):
+    def __init__(self, data_source, days_per_batch=4, shuffle=False):
+        self.data_source = data_source
+        self.days_per_batch = days_per_batch
+        self.shuffle = shuffle
+        self.num_days = len(data_source)
         
-        # First residual connection & FFN
-        xt = x + att_output_concat # x is (N_stocks, T_lookback, d_model)
-        xt_norm2 = self.norm2(xt)
-        ffn_output = self.ffn(xt_norm2)
-        output = xt + ffn_output # Second residual
-        return output
-
-
-class TAttention(nn.Module):  # Temporal Self-Attention
-    def __init__(self, d_model, nhead, dropout=0.1):
-        super(TAttention, self).__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
+    def __iter__(self):
+        # Create consecutive day groups to maintain temporal order
+        batch_starts = list(range(0, self.num_days, self.days_per_batch))
         
-        self.qtrans = nn.Linear(d_model, d_model, bias=False)
-        self.ktrans = nn.Linear(d_model, d_model, bias=False)
-        self.vtrans = nn.Linear(d_model, d_model, bias=False)
-
-        # OPTIMIZED: Use single dropout instead of per-head dropout
-        self.attn_dropout = nn.Dropout(p=dropout) if dropout > 0 and nhead > 0 else None
-
-        self.norm1 = LayerNorm(d_model, eps=1e-5)
-        self.norm2 = LayerNorm(d_model, eps=1e-5)
-        self.ffn = nn.Sequential(
-            Linear(d_model, d_model),
-            nn.ReLU(),
-            Dropout(p=dropout),
-            Linear(d_model, d_model),
-            Dropout(p=dropout),
-        )
-        self.temperature = math.sqrt(d_model / nhead) if nhead > 0 else math.sqrt(d_model)
-
-    def forward(self, x_input):  # x_input shape: (N_stocks, T_lookback, d_model)
-        x_norm = self.norm1(x_input)
-        q = self.qtrans(x_norm)  # (N, T, D)
-        k = self.ktrans(x_norm)  # (N, T, D)
-        v = self.vtrans(x_norm)  # (N, T, D)
-
-        batch_size, seq_len, _ = q.shape
-        att_output_list = []
-        current_dim_offset = 0
+        if self.shuffle:
+            # Shuffle the starting points of batches, not individual days
+            np.random.shuffle(batch_starts)
         
-        # FIXED: Create causal mask to prevent lookahead bias
-        # Each timestep can only attend to past and current timesteps
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=x_input.device), diagonal=1)
-        causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))
-        
-        for i in range(self.nhead):
-            if i < self.nhead - 1:
-                current_head_actual_dim = self.head_dim
-            else:
-                current_head_actual_dim = self.d_model - current_dim_offset
-
-            q_h = q[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
-            k_h = k[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
-            v_h = v[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
-            current_dim_offset += current_head_actual_dim
-
-            attn_scores_h = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.temperature
-            # FIXED: Apply causal mask to prevent attending to future timesteps
-            attn_scores_h = attn_scores_h + causal_mask.unsqueeze(0)  # Broadcast across batch dimension
-            atten_ave_matrixh = torch.softmax(attn_scores_h, dim=-1)
-
-            # OPTIMIZED: Use single dropout for all heads
-            if self.attn_dropout:
-                atten_ave_matrixh = self.attn_dropout(atten_ave_matrixh)
-
-            weighted_values_h = torch.matmul(atten_ave_matrixh, v_h)
-            att_output_list.append(weighted_values_h)
-
-        att_output_concat = torch.cat(att_output_list, dim=-1)
-        xt = x_input + att_output_concat
-        xt_norm2 = self.norm2(xt)
-        ffn_output = self.ffn(xt_norm2)
-        output = xt + ffn_output
-        return output
+        for start_idx in batch_starts:
+            end_idx = min(start_idx + self.days_per_batch, self.num_days)
+            # Yield consecutive day indices to maintain temporal order within batch
+            consecutive_indices = list(range(start_idx, end_idx))
+            yield consecutive_indices
+    
+    def __len__(self):
+        return (self.num_days + self.days_per_batch - 1) // self.days_per_batch
 
 
-class Gate(nn.Module):
-    def __init__(self, d_gate_input_dim, beta: float = 1.0):
-        super(Gate, self).__init__()
-        self.d_gate_input_dim = d_gate_input_dim
-        self.d_gate_output_dim = d_gate_input_dim
-        self.trans = nn.Linear(d_gate_input_dim, d_gate_input_dim)
-        self.t = beta
-
-    def forward(self, x):
-        return torch.softmax(self.trans(x) / self.t, dim=-1)
-
-
-# This is the paper's "final" TemporalAttention that aggregates T dimension
-class FinalTemporalAttention(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        self.trans = nn.Linear(d_model, d_model, bias=False) # Paper uses d_model here
-
-    def forward(self, z): # z shape: (N_stocks, T_lookback, d_model)
-        h = self.trans(z) # (N_stocks, T_lookback, d_model)
-        query = h[:, -1, :].unsqueeze(-1) # Query from last time step: (N_stocks, d_model, 1)
-        
-        # lam shape: (N_stocks, T_lookback)
-        lam = torch.matmul(h, query).squeeze(-1) # (N, T, D) @ (N, D, 1) -> (N, T, 1) -> (N,T)
-        lam = torch.softmax(lam, dim=1).unsqueeze(1) # (N_stocks, 1, T_lookback) - attention weights over time
-        
-        # output shape: (N_stocks, d_model)
-        output = torch.matmul(lam, z).squeeze(1) # (N,1,T) @ (N,T,D) -> (N,1,D) -> (N,D)
-        return output
-
-
-class RegRankLoss(nn.Module):
-    def __init__(self, beta=1.0):
-        super().__init__()
-        self.beta = beta
-        self.softplus = nn.Softplus()
-
-    def forward(self, pred, target):
-        if pred.dim() > 1: pred = pred.squeeze()
-        if target.dim() > 1: target = target.squeeze()
-
-        # Handle scalar tensors (0-dimensional)
-        if pred.dim() == 0 or target.dim() == 0:
-            return torch.tensor(0.0, device=pred.device, requires_grad=True)
-        
-        if pred.shape[0] != target.shape[0]:
-            logger.error(f"Shape mismatch in RegRankLoss: pred {pred.shape}, target {target.shape}. Returning 0 loss.")
-            return torch.tensor(0.0, device=pred.device, requires_grad=True)
-        
-        if pred.shape[0] < 2: # Need at least 2 stocks for pairwise comparison
-            return torch.tensor(0.0, device=pred.device, requires_grad=True)
-
-        # Create pairwise differences
-        # pred_ij = pred_i - pred_j
-        # target_ij = target_i - target_j
-        pred_diff = pred.unsqueeze(1) - pred.unsqueeze(0)  # Shape (N, N)
-        target_diff = target.unsqueeze(1) - target.unsqueeze(0) # Shape (N, N)
-
-        # Create a mask for upper triangle (i < j) to consider each pair once
-        # and also where target_i != target_j (actual rank difference exists)
-        mask = torch.triu(torch.ones_like(pred_diff, dtype=torch.bool), diagonal=1)
-        target_rank_diff_mask = (target_diff != 0)
-        final_mask = mask & target_rank_diff_mask
-        
-        if not final_mask.any(): # No valid pairs with rank difference
-            return torch.tensor(0.0, device=pred.device, requires_grad=True)
-
-        # Select valid pairs
-        valid_pred_diff = pred_diff[final_mask]
-        valid_target_diff = target_diff[final_mask]
-
-        # Loss for each pair: softplus(-beta * sign(target_ij) * pred_ij)
-        # sign(target_ij) * pred_ij should be positive if ranks agree, negative if disagree.
-        # We want to penalize if sign(target_ij) * pred_ij is negative or small positive.
-        # loss_terms = self.softplus(-self.beta * torch.sign(valid_target_diff) * valid_pred_diff)
-        
-        # Alternative formulation often used: log(1 + exp(-sigma * (s_i - s_j))) where target_i > target_j
-        # Let's stick to a common pairwise logistic loss formulation:
-        # For a pair (i, j), if target_i > target_j, loss_ij = log(1 + exp(-beta * (pred_i - pred_j)))
-        # This is equivalent to softplus(-beta * (pred_i - pred_j)) when target_i > target_j.
-        # And softplus(-beta * (pred_j - pred_i)) when target_j > target_i.
-        # General form: softplus(-beta * sign(target_i - target_j) * (pred_i - pred_j))
-        
-        loss_terms = self.softplus(-self.beta * torch.sign(valid_target_diff) * valid_pred_diff)
-        
-        num_pairs = loss_terms.numel()
-        if num_pairs == 0: # Should be caught by final_mask.any() but as a safeguard
-            return torch.tensor(0.0, device=pred.device, requires_grad=True)
-            
-        return loss_terms.sum() / num_pairs
-
-
-# This class implements the architecture from the paper's `MASTER` class
-class PaperMASTERArchitecture(nn.Module):
+class SequenceModel():
     """
-    Exact replica of the MASTER paper's encoder–decoder stack
-    ---------------------------------------------------------
-    •  A feature–selection Gate driven by market features
-    •  Linear → PositionalEncoding → Temporal (causal) Attention
-      → Spatial Attention → Final Temporal Attention → Linear decoder
+    Base class for sequence models.
+    Handles training, prediction, saving and loading of the model.
     """
-
-    def __init__(
-        self,
-        d_feat_input_total: int,
-        d_model: int,
-        t_nhead: int,
-        s_nhead: int,
-        T_dropout_rate: float,
-        S_dropout_rate: float,
-        gate_input_start_index: int,
-        gate_input_end_index: int,
-        beta: float,
-    ):
-        super().__init__()
-
-        # ---------------------------------------------------------------
-        # Feature split
-        # ---------------------------------------------------------------
-        self.gate_input_start_index = gate_input_start_index
-        self.gate_input_end_index = gate_input_end_index
-
-        num_market_features = self.gate_input_end_index - self.gate_input_start_index
-        self.d_feat_stock_specific = d_feat_input_total - num_market_features
-
-        if num_market_features <= 0:
-            raise ValueError(
-                f"gate indices ({gate_input_start_index}, {gate_input_end_index}) "
-                "imply zero market features"
-            )
-        if self.d_feat_stock_specific <= 0:
-            raise ValueError(f"d_feat_stock_specific ({self.d_feat_stock_specific}) must be positive. Check feature splitting and gate indices. Total features: {d_feat_input_total}, Market features: {num_market_features}")
-
-        # ---------------------------------------------------------------
-        # Modules - OPTIMIZED: Create modules directly without Sequential wrapper overhead
-        # ---------------------------------------------------------------
-        self.feature_gate = Gate(
-            d_gate_input_dim=num_market_features,
-            beta=beta
-        )
-
-        self.feature_gate.trans = nn.Linear(num_market_features, self.d_feat_stock_specific)
-        self.feature_gate.d_gate_output_dim = self.d_feat_stock_specific
-
-        # OPTIMIZED: Create individual modules instead of Sequential for faster init
-        self.input_linear = nn.Linear(self.d_feat_stock_specific, d_model)
-        self.pos_encoding = PositionalEncoding(d_model)
-        self.temporal_attention = TAttention(
-            d_model=d_model,
-            nhead=t_nhead,
-            dropout=T_dropout_rate,
-        )
-        self.spatial_attention = SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate)
-        self.final_temporal_attention = FinalTemporalAttention(d_model=d_model)
-        self.output_linear = nn.Linear(d_model, 1)
-
-    # -------------------------------------------------------------------
-    # Forward
-    # -------------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def __init__(self, n_epochs=100, lr=0.001, GPU=None, seed=None, 
+                 train_stop_loss_thred=None, save_path="model/", save_prefix="model",
+                 metric="loss", early_stop=20, patience=10, decay_rate=0.9, min_lr=1e-05,
+                 max_iters_epoch=None, train_noise=0.0, validation_freq=1, use_amp=True,
+                 accumulation_steps=4, max_batch_size=4096):  # Add max batch size for pre-allocation
         """
-        Args:
-            x (torch.Tensor): Input tensor of shape (N_stocks, T_lookback, d_feat_input_total)
-                              where N_stocks is batch size (number of stocks for this daily batch),
-                              T_lookback is the sequence length,
-                              d_feat_input_total is the total number of raw input features.
+        Initialize the SequenceModel.
 
-        Returns:
-            torch.Tensor: Output tensor of shape (N_stocks, 1) representing predicted scores/ranks.
+        Parameters:
+        - n_epochs (int): Number of training epochs.
+        - lr (float): Learning rate.
+        - GPU (int or None): GPU ID to use. If None, use CPU.
+        - seed (int or None): Random seed for reproducibility.
+        - train_stop_loss_thred (float or None): Threshold for early stopping based on training loss.
+        - save_path (str): Directory to save the trained model.
+        - save_prefix (str): Prefix for the saved model filename.
+        - metric (str): Metric to monitor for early stopping (e.g., "loss", "ic").
+        - early_stop (int): Number of epochs for early stopping if no improvement.
+        - patience (int): Number of epochs to wait before decaying learning rate.
+        - decay_rate (float): Factor by which to decay learning rate.
+        - min_lr (float): Minimum learning rate.
+        - max_iters_epoch (int or None): Maximum number of iterations (batches) per epoch.
+        - train_noise (float): Standard deviation of Gaussian noise to add to inputs during training.
+        - validation_freq (int): Frequency of validation (in epochs).
+        - use_amp (bool): Whether to use mixed precision training.
+        - accumulation_steps (int): Number of steps to accumulate gradients before updating optimizer.
+        - max_batch_size (int): Maximum batch size for pre-allocation of tensors.
         """
-        # ---------------------------------------------------------------
-        # Split input into stock-specific features and market info
-        # ---------------------------------------------------------------
-        # x_stock_specific: (N, T, d_feat_stock_specific)
-        # x_market_info:    (N, T, num_market_features)
-        
-        # Create masks for slicing
-        stock_specific_indices = list(range(self.gate_input_start_index)) + \
-                                 list(range(self.gate_input_end_index, x.shape[2]))
-        market_info_indices = list(range(self.gate_input_start_index, self.gate_input_end_index))
-
-        x_stock_specific = x[:, :, stock_specific_indices]
-        x_market_info = x[:, :, market_info_indices]
-
-        if x_market_info.shape[2] != (self.gate_input_end_index - self.gate_input_start_index):
-             raise ValueError(f"Market info features dimension mismatch. Expected {self.gate_input_end_index - self.gate_input_start_index}, got {x_market_info.shape[2]}")
-        if x_stock_specific.shape[2] != self.d_feat_stock_specific:
-            raise ValueError(f"Stock specific features dimension mismatch. Expected {self.d_feat_stock_specific}, got {x_stock_specific.shape[2]}")
-
-
-        # ---------------------------------------------------------------
-        # Gating
-        # ---------------------------------------------------------------
-        # --- paper behaviour: use market info from the **last** frame ---
-        gate_vals = self.feature_gate(x_market_info[:, -1, :])           # (N, num_market_features), but gate output is (N, d_feat_stock_specific)
-        # The gate's output dimension must match d_feat_stock_specific for element-wise product.
-        # This implies the Gate module's internal Linear layer should map num_market_features -> d_feat_stock_specific.
-        # Let's re-check Gate __init__ and forward. The current Gate maps d_gate_input_dim -> d_gate_input_dim.
-        # For the paper's logic, Gate should transform market features into a gating signal for stock-specific features.
-        # The paper states: "The feature gate g_t is a linear layer with softmax activation that takes r_M,t as input."
-        # "The output of g_t is a vector of weights w_t of the same dimension as r_S,t."
-        # So, Gate's Linear layer should be from num_market_features to d_feat_stock_specific.
-        # This will be addressed in a subsequent change if Gate's definition needs update.
-        # For now, assuming gate_vals has shape (N, d_feat_stock_specific)
-        
-        # The original paper description for gating: w_t = softmax(Linear(r_M,t)). r_S,t_gated = r_S,t * w_t
-        # If gate_vals is (N, d_feat_stock_specific) and x_stock_specific is (N, T, d_feat_stock_specific)
-        # We need to unsqueeze gate_vals to (N, 1, d_feat_stock_specific) to broadcast over T
-        gated_stock_features = x_stock_specific * gate_vals.unsqueeze(1)  # broadcast to all T
-
-        # ---------------------------------------------------------------
-        # Main MASTER layers - OPTIMIZED: Direct module calls instead of Sequential
-        # ---------------------------------------------------------------
-        # Pass the gated stock-specific features through the model layers
-        x = self.input_linear(gated_stock_features)  # (N, T, d_model)
-        x = self.pos_encoding(x)  # (N, T, d_model)
-        x = self.temporal_attention(x)  # (N, T, d_model)
-        x = self.spatial_attention(x)  # (N, T, d_model)
-        x = self.final_temporal_attention(x)  # (N, d_model)
-        final_scores = self.output_linear(x)  # (N, 1)
-        
-        return final_scores
-
-class MASTERModel():  # Remove SequenceModel inheritance
-    def __init__(self, d_feat, d_model=256, t_nhead=4, s_nhead=2, T_dropout_rate=0.5, S_dropout_rate=0.5, 
-                 beta=5.0, gate_input_start_index=0, gate_input_end_index=1, n_epochs=100, lr=0.001, 
-                 GPU=None, seed=None, save_path=None, save_prefix="master_model"):
-
-        # OPTIMIZED: Minimal initialization to avoid expensive base class setup
         self.n_epochs = n_epochs
         self.lr = lr
         self.device = torch.device(f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available() else "cpu")
         self.seed = seed
-        self.save_path = Path(save_path) if save_path else Path("model_output")
+        self.train_stop_loss_thred = train_stop_loss_thred
+        self.save_path = Path(save_path)
         self.save_prefix = save_prefix
         
-        # FAST setup - only essential attributes without heavy operations
-        self.early_stop = 20
-        self.patience = 10
-        self.decay_rate = 0.9
-        self.min_lr = 1e-05
-        self.metric = "loss"
-        
-        # Only set seed if needed - skip complex setup
+        self.metric = metric
+        self.early_stop = early_stop
+        self.patience = patience
+        self.decay_rate = decay_rate
+        self.min_lr = min_lr
+        self.max_iters_epoch = max_iters_epoch
+        self.train_noise = train_noise
+        self.validation_freq = validation_freq  # Only validate every N epochs
+        self.use_amp = use_amp and torch.cuda.is_available()
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
+        self.accumulation_steps = accumulation_steps
+        self.max_batch_size = max_batch_size
+        self.pre_allocated_tensors = {}  # Cache for reusable tensors
+
+        self.model = None  # This will be set by subclasses (e.g., GRU, LSTM specific models)
+        self.optimizer = None
+        self.criterion = nn.MSELoss() # Default loss, can be overridden
+        self.scheduler = None
+
+
         if self.seed is not None:
+            np.random.seed(self.seed)
             torch.manual_seed(self.seed)
             if self.device.type == 'cuda':
                 torch.cuda.manual_seed_all(self.seed)
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
         
-        # Create save directory efficiently
         self.save_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"SequenceModel initialized. Device: {self.device}, Save Path: {self.save_path}")
+
+    def init_model(self):
+        """
+        Initializes the optimizer and learning rate scheduler.
+        This method should be called after self.model is defined by a subclass.
+        """
+        if self.model is None:
+            raise ValueError("self.model must be defined before calling init_model().")
         
-        # Model parameters
-        self.d_feat_input_total = d_feat 
-        self.d_model = d_model
-        self.t_nhead = t_nhead
-        self.s_nhead = s_nhead
-        self.T_dropout_rate = T_dropout_rate
-        self.S_dropout_rate = S_dropout_rate
-        self.beta = beta 
-        self.gate_input_start_index = gate_input_start_index
-        self.gate_input_end_index = gate_input_end_index
-        
-        # FAST model creation - no heavy .to() operations until needed
-        self.model = PaperMASTERArchitecture(
-            d_feat_input_total=self.d_feat_input_total,
-            d_model=self.d_model,
-            t_nhead=self.t_nhead,
-            s_nhead=self.s_nhead,
-            T_dropout_rate=self.T_dropout_rate,
-            S_dropout_rate=self.S_dropout_rate,
-            gate_input_start_index=self.gate_input_start_index,
-            gate_input_end_index=self.gate_input_end_index,
-            beta=self.beta 
-        )
-        
-        # Lazy initialization - only move to device when needed for first training
-        self._device_moved = False
-        
-        # FAST optimizer setup
+        self.model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        
-        # FAST loss function setup
-        self.loss_fn = RegRankLoss(beta=self.beta)
-        
-        logger.info("MASTERModel (Fast Init) initialized.")
-    
-    def _ensure_device(self):
-        """Lazy device transfer - only when actually needed"""
-        if not self._device_moved:
-            self.model = self.model.to(self.device)
-            if self.device.type == 'cuda':
-                self.loss_fn = self.loss_fn.to(self.device)
-            self._device_moved = True
-
-
-class GRUModel(nn.Module):
-    def __init__(self, d_feat, hidden_size, num_layers, dropout):
-        super().__init__()
-        self.rnn = nn.GRU(
-            input_size=d_feat,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0 # Dropout only if num_layers > 1
+        self.scheduler = lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min' if 'loss' in self.metric else 'max', # Adjust mode based on metric
+            factor=self.decay_rate, patience=self.patience, min_lr=self.min_lr, verbose=True
         )
-        self.fc = nn.Linear(hidden_size, 1)
+        logger.info("Optimizer and LR Scheduler initialized.")
 
-    def forward(self, x):
-        # x shape: (batch_size, seq_len, d_feat)
-        out, _ = self.rnn(x) # out shape: (batch_size, seq_len, hidden_size)
-        # We want the output from the last time step
-        return self.fc(out[:, -1, :]).squeeze() # (batch_size,)
+    def loss_fn(self, pred, label):
+        mask = ~torch.isnan(label)
+        loss = (pred[mask]-label[mask])**2
+        return torch.mean(loss)
 
-
-class LSTMModel(nn.Module):
-    def __init__(self, d_feat, hidden_size, num_layers, dropout):
-        super().__init__()
-        self.rnn = nn.LSTM(
-            input_size=d_feat,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
-        )
-        self.fc = nn.Linear(hidden_size, 1)
-
-    def forward(self, x):
-        out, _ = self.rnn(x)
-        return self.fc(out[:, -1, :]).squeeze()
-
-
-class ALSTMModel(LSTMModel):
-    def __init__(self, d_feat, hidden_size, num_layers, dropout):
-        super().__init__(d_feat, hidden_size, num_layers, dropout)
-        # Add attention mechanism components if needed
-        print("ALSTMModel initialized (currently same as LSTM). Define attention if needed.")
-
-
-class MASTERNet(nn.Module):
-    def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, 
-                 gate_input_start_index, gate_input_end_index):
-        super(MASTERNet, self).__init__()
-        self.d_feat = d_feat
-        self.d_model = d_model
-        self.gate_input_start_index = gate_input_start_index
-        self.gate_input_end_index = gate_input_end_index
+    def train_epoch(self, data_loader):
+        self.model.train()
+        losses = []
+        accumulated_loss = 0.0
         
-        # Calculate dimensions
-        gate_dim = gate_input_end_index - gate_input_start_index
-        factor_dim = gate_input_start_index  # Only pre-market factors as per paper
-        
-        # Initialize components
-        self.gate = Gate(gate_dim)
-        self.linear_in = nn.Linear(factor_dim + gate_dim, d_model)
-        self.pos_encoding = PositionalEncoding(d_model)
-        self.temporal_attention = TAttention(d_model, t_nhead, T_dropout_rate)
-        self.spatial_attention = SAttention(d_model, s_nhead, S_dropout_rate)
-        self.final_temporal_attention = FinalTemporalAttention(d_model)
-        self.linear_out = nn.Linear(d_model, 1)
+        # Accumulate multiple days worth of data before processing
+        accumulated_features = []
+        accumulated_labels = []
+        current_accumulation = 0
 
-    def forward(self, x):
-        # x shape: (N, T, d_feat)
-        N, T, d_feat = x.shape
-        
-        # Split features as per paper: only keep factors BEFORE market info
-        factor_features = x[:, :, :self.gate_input_start_index]  # Only pre-market factors
-        market_features = x[:, :, self.gate_input_start_index:self.gate_input_end_index]
-        
-        # Apply Gate per timestep to avoid lookahead bias
-        gated_features_list = []
-        for t in range(T):
-            gate_weights_t = self.gate(market_features[:, t, :])  # (N, gate_dim)
-            if factor_features.shape[2] > 0:
-                # Apply gate to factor features at timestep t
-                gated_factors_t = factor_features[:, t, :] * gate_weights_t
-                combined_t = torch.cat([gated_factors_t, market_features[:, t, :]], dim=1)
+        for i, data in enumerate(data_loader):
+            feature_data = data[0]
+            label_data = data[1]
+            
+            # Accumulate data from multiple days
+            accumulated_features.append(feature_data)
+            accumulated_labels.append(label_data)
+            current_accumulation += 1
+            
+            # Process when we have enough accumulated data or at end
+            if current_accumulation >= self.accumulation_steps or i == len(data_loader) - 1:
+                # Concatenate all accumulated data
+                batch_features = torch.cat(accumulated_features, dim=0).to(self.device, non_blocking=True)
+                batch_labels = torch.cat(accumulated_labels, dim=0).to(self.device, non_blocking=True)
+                
+                # Add noise if specified
+                if self.train_noise > 0:
+                    noise = torch.randn_like(batch_features) * self.train_noise
+                    batch_features = batch_features + noise
+
+                # Process the entire large batch
+                mask, processed_labels = drop_extreme(batch_labels)
+                processed_features = batch_features[mask, :, :]
+                processed_labels = zscore(processed_labels)
+                
+                # Split into chunks if too large for GPU memory
+                chunk_size = min(len(processed_features), 2048)  # Larger chunks
+                total_loss = 0.0
+                num_chunks = 0
+                
+                for chunk_start in range(0, len(processed_features), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(processed_features))
+                    chunk_features = processed_features[chunk_start:chunk_end]
+                    chunk_labels = processed_labels[chunk_start:chunk_end]
+                    
+                    if len(chunk_features) == 0:
+                        continue
+                    
+                    if self.use_amp:
+                        with torch.cuda.amp.autocast():
+                            pred = self.model(chunk_features.float())
+                            loss = self.loss_fn(pred, chunk_labels)
+                    else:
+                        pred = self.model(chunk_features.float())
+                        loss = self.loss_fn(pred, chunk_labels)
+                    
+                    # Scale loss by number of chunks and accumulation steps
+                    loss = loss / (current_accumulation * max(1, len(processed_features) // chunk_size))
+                    total_loss += loss.item()
+                    num_chunks += 1
+                    
+                    if self.use_amp:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                
+                # Update optimizer
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
+                    self.optimizer.step()
+                
+                self.optimizer.zero_grad()
+                
+                if num_chunks > 0:
+                    losses.append(total_loss)
+                
+                # Reset accumulation
+                accumulated_features = []
+                accumulated_labels = []
+                current_accumulation = 0
+
+        return float(np.mean(losses))
+
+    def test_epoch(self, data_loader):
+        self.model.eval()
+        losses = []
+
+        for data in data_loader:
+            # data = torch.squeeze(data, dim=0) # Original line commented out
+            # data is a tuple: (features_for_day_tensor, labels_for_day_tensor)
+            feature_data = data[0].to(self.device) # N, T, F
+            label_data = data[1].to(self.device)   # N
+
+            # feature = data[:, :, 0:-1].to(self.device) # Original line commented out
+            # label = data[:, -1, -1].to(self.device) # Original line commented out
+
+            # You cannot drop extreme labels for test.
+            # Apply zscore to the original label_data for test loss calculation
+
+            current_labels_processed = zscore(label_data)
+
+            # Use full feature_data for prediction as no drop_extreme is applied
+            pred = self.model(feature_data.float())
+            loss = self.loss_fn(pred, current_labels_processed)
+            losses.append(loss.item())
+
+        return float(np.mean(losses))
+
+    def _init_data_loader(self, data, shuffle=True, drop_last=True, days_per_batch=1):
+        if data is None or len(data) == 0:
+            raise ValueError("Input data for DataLoader cannot be None or empty.")
+
+        day_sampler = DaySampler(data, shuffle)
+
+        def safe_collate(batch_data_tuple):
+            if isinstance(batch_data_tuple, tuple) and len(batch_data_tuple) == 2:
+                features, labels = batch_data_tuple
+                return (features, labels)
             else:
-                combined_t = market_features[:, t, :] * gate_weights_t
-            gated_features_list.append(combined_t.unsqueeze(1))
+                raise ValueError(f"Unexpected batch_data_tuple structure: {type(batch_data_tuple)}")
+
+        # Add workers and prefetching for better CPU-GPU overlap
+        data_loader = DataLoader(
+            data, 
+            sampler=day_sampler, 
+            batch_size=None, 
+            collate_fn=safe_collate,
+            num_workers=4,  # Use multiple processes for data loading
+            pin_memory=True,  # Faster GPU transfer
+            prefetch_factor=2,  # Pre-load next batches
+            persistent_workers=True  # Keep workers alive between epochs
+        )
+        return data_loader
+
+    def load_param(self, param_path):
+        self.model.load_state_dict(torch.load(param_path, map_location=self.device))
+        self.fitted = 'Previously trained.'
+
+    def fit(self, dl_train, dl_valid=None):
+        print(f"[SequenceModel] Starting fit method. n_epochs: {self.n_epochs}")
         
-        combined_features = torch.cat(gated_features_list, dim=1)  # (N, T, combined_dim)
+        # Monitor GPU usage
+        if torch.cuda.is_available():
+            print(f"GPU Memory before training: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+            print(f"GPU Memory cached: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
         
-        # Apply the attention layers
-        x = self.linear_in(combined_features)  # (N, T, d_model)
-        x = self.pos_encoding(x)
-        x = self.temporal_attention(x)
-        x = self.spatial_attention(x)
-        x = self.final_temporal_attention(x)  # (N, d_model)
-        x = self.linear_out(x)  # (N, 1)
+        if dl_train is None or len(dl_train) == 0 :
+            print("[SequenceModel] ERROR: Training data (dl_train) is None or empty in fit method. Cannot proceed.")
+            return
+
+        print("[SequenceModel] Initializing training DataLoader...")
+        train_loader = self._init_data_loader(dl_train, shuffle=True, drop_last=True)
         
-        return x.squeeze(-1)  # (N,)
+        valid_loader = None
+        if dl_valid is not None and len(dl_valid) > 0: # Check if dl_valid has data
+            print("[SequenceModel] Initializing validation DataLoader...")
+            valid_loader = self._init_data_loader(dl_valid, shuffle=False, drop_last=False) # No shuffle for validation
+
+        if train_loader is None : 
+             print("[SequenceModel] ERROR: train_loader is None after _init_data_loader. Cannot proceed with training.")
+             return
+
+        best_param = None
+        best_valid_metric_val = -np.inf if 'ic' in self.metric.lower() else np.inf
+        epochs_no_improve = 0
+
+        print("[SequenceModel] Starting training loop...")
+        for step in range(self.n_epochs):
+            epoch_log_msg_parts = []
+            epoch_log_msg_parts.append(f"[SequenceModel] Epoch {step + 1}/{self.n_epochs}")
+            
+            print(f"{epoch_log_msg_parts[0]} - Starting train_epoch...")
+            train_loss = self.train_epoch(train_loader)
+            self.fitted = step # Mark as fitted at least one epoch
+            epoch_log_msg_parts.append(f"train_loss: {train_loss:.6f}")
+
+            current_lr = self.optimizer.param_groups[0]['lr']
+            epoch_log_msg_parts.append(f"lr: {current_lr:.6e}")
+
+            # Only validate every validation_freq epochs (default 1 = every epoch)
+            if valid_loader and (step + 1) % self.validation_freq == 0:
+                print(f"{epoch_log_msg_parts[0]} - Performing validation...")
+                # Calculate validation loss
+                valid_loss = self.test_epoch(valid_loader) # Ensure test_epoch returns average loss
+                epoch_log_msg_parts.append(f"valid_loss: {valid_loss:.6f}")
+                
+                # Calculate IC metrics for validation
+                # self.predict (which will be MASTER.predict if self is MASTER instance)
+                # returns a DataFrame: ['date', 'ticker', 'prediction', 'actual_return']
+                # The original SequenceModel.predict returned (predictions_series, metrics_dict)
+                
+                # For validation within SequenceModel.fit, we need ICs.
+                # If self.predict is MASTER.predict, it returns a DataFrame.
+                # If self.predict is the original SequenceModel.predict, it returns (Series, dict).
+                
+                # Let's assume for now that if dl_valid is a DailyGroupedTimeSeriesDataset,
+                # self.predict will be MASTER.predict and return a DataFrame.
+                # We need a consistent way to get metrics.
+                
+                valid_ic = np.nan
+                valid_ric = np.nan
+
+                # Check if self.predict is the one from MASTER that returns a DataFrame
+                # This is a bit fragile; ideally, a more robust interface would be used.
+                # For now, we try to adapt.
+                
+                # The self.predict method in the context of MASTER will be MASTER.predict
+                # which expects a DailyGroupedTimeSeriesDataset and returns a DataFrame
+                validation_output = self.predict(dl_valid) # dl_valid is the Dataset object
+
+                if isinstance(validation_output, pd.DataFrame) and not validation_output.empty:
+                    # This is likely the output from MASTER.predict
+                    # Calculate daily ICs and then average
+                    daily_metrics_val = validation_output.groupby('date').apply(
+                        lambda x: pd.Series({
+                            'ic': calc_ic(x['prediction'], x['actual_return'])[0],
+                            'rank_ic': calc_ic(x['prediction'], x['actual_return'])[1]
+                        })
+                    ).reset_index()
+                    valid_ic = daily_metrics_val['ic'].mean()
+                    valid_ric = daily_metrics_val['rank_ic'].mean()
+                    logger.info(f"Validation ICs calculated from MASTER.predict DataFrame: IC={valid_ic:.4f}, RankIC={valid_ric:.4f}")
+                elif isinstance(validation_output, tuple) and len(validation_output) == 2:
+                    # This is likely the output from a base SequenceModel.predict (if it were called)
+                    # predictions_series, metrics_dict = validation_output
+                    # valid_ic = metrics_dict.get('IC', np.nan)
+                    # valid_ric = metrics_dict.get('RIC', np.nan)
+                    # logger.info(f"Validation ICs from SequenceModel.predict tuple: IC={valid_ic:.4f}, RankIC={valid_ric:.4f}")
+                    # This branch is less likely to be hit if MASTER always overrides predict.
+                    # For safety, let's assume MASTER.predict is what we are dealing with.
+                    pass # Keep ICs as NaN if we don't get the DataFrame from MASTER.predict
+                else:
+                    logger.warning(f"Unexpected output type from self.predict during validation: {type(validation_output)}. Cannot calculate ICs.")
+
+
+                epoch_log_msg_parts.append(f"valid_ic: {valid_ic:.4f}")
+                epoch_log_msg_parts.append(f"valid_rank_ic: {valid_ric:.4f}")
+                
+                # Determine metric for scheduler and early stopping
+                metric_for_scheduler = valid_loss # Default to validation loss
+                if self.metric == 'ic':
+                    metric_for_scheduler = valid_ic
+                elif self.metric == 'ric':
+                    metric_for_scheduler = valid_ric
+                
+                self.scheduler.step(metric_for_scheduler)
+
+                # Early stopping logic
+                improved = False
+                if 'ic' in self.metric.lower(): # Higher is better for IC
+                    if metric_for_scheduler > best_valid_metric_val:
+                        best_valid_metric_val = metric_for_scheduler
+                        improved = True
+                else: # Lower is better for loss
+                    if metric_for_scheduler < best_valid_metric_val:
+                        best_valid_metric_val = metric_for_scheduler
+                        improved = True
+                
+                if improved:
+                    epochs_no_improve = 0
+                    # Use state_dict() copy instead of deepcopy for efficiency
+                    best_param = {k: v.clone() for k, v in self.model.state_dict().items()}
+                    
+                    # Save asynchronously or less frequently
+                    if (step + 1) % 5 == 0 or step == self.n_epochs - 1:  # Save every 5 epochs
+                        torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}_best.pkl')
+                else:
+                    epochs_no_improve += 1
+                
+                if epochs_no_improve >= self.early_stop:
+                    logger.info(f"Early stopping triggered after {epochs_no_improve} epochs with no improvement on validation {self.metric}.")
+                    if best_param is not None:
+                        logger.info("Loading best model parameters.")
+                        self.model.load_state_dict(best_param) # Load best model
+                    break
+            else:
+                # Use training loss for scheduler when not validating
+                self.scheduler.step(train_loss)
+            
+            print(" - ".join(epoch_log_msg_parts))
+
+            if self.train_stop_loss_thred is not None and train_loss <= self.train_stop_loss_thred:
+                logger.info(f"Training stop threshold based on train_loss met. train_loss: {train_loss:.6f} <= {self.train_stop_loss_thred}")
+                if best_param is None : 
+                    best_param = copy.deepcopy(self.model.state_dict())
+                    torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}_best.pkl')
+                    logger.info(f"Model saved to {self.save_path}/{self.save_prefix}_{self.seed}_best.pkl based on train_stop_loss_thred.")
+                break
+
+            # Monitor GPU usage during training
+            if torch.cuda.is_available() and step % 10 == 0:
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"Epoch {step}: GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
+        
+        if not (epochs_no_improve >= self.early_stop): # If not early stopped
+            if best_param is None and self.n_epochs > 0 : 
+                 final_model_state = copy.deepcopy(self.model.state_dict())
+                 torch.save(final_model_state, f'{self.save_path}/{self.save_prefix}_{self.seed}_final.pkl')
+                 logger.info(f"Training finished. Final model saved to {self.save_path}/{self.save_prefix}_{self.seed}_final.pkl")
+            elif best_param is not None and not Path(f'{self.save_path}/{self.save_prefix}_{self.seed}_final.pkl').exists():
+                 # If best model was saved due to validation, but training completed all epochs
+                 # and we want to ensure the 'best' model is what's considered final if not overwritten
+                 logger.info(f"Training finished. Best model (from validation) at {self.save_path}/{self.save_prefix}_{self.seed}_best.pkl is considered the final state for this run if no explicit final save.")
+
+
+        print("[SequenceModel] Fit method completed.")
+
+    def predict(self, dl_test):
+        if self.fitted<0:
+            raise ValueError("model is not fitted yet!")
+        else:
+            print('Epoch:', self.fitted)
+
+        test_loader = self._init_data_loader(dl_test, shuffle=False, drop_last=False)
+
+        preds = []
+        ic = []
+        ric = []
+
+        self.model.eval()
+        for data in test_loader:
+            # data = torch.squeeze(data, dim=0) # Original line commented out
+            # data is a tuple: (features_for_day_tensor, labels_for_day_tensor)
+            feature_data = data[0].to(self.device) # N, T, F
+            # For calc_ic, label_data is used as numpy, so get it before moving to device or after .cpu()
+            label_data_numpy = data[1].numpy() # N
+
+            # feature = data[:, :, 0:-1].to(self.device) # Original line commented out
+            # label = data[:, -1, -1] # Original line, label was not moved to device here
+
+            # nan label will be automatically ignored when compute metrics.
+            # zscorenorm will not affect the results of ranking-based metrics.
+
+            with torch.no_grad():
+                pred = self.model(feature_data.float()).detach().cpu().numpy()
+                preds.append(pred.ravel())
+
+                daily_ic, daily_ric = calc_ic(pred, label_data_numpy)
+                ic.append(daily_ic)
+                ric.append(daily_ric)
+
+        predictions = pd.Series(np.concatenate(preds), index=dl_test.get_index())
+
+        metrics = {
+            'IC': np.mean(ic),
+            'ICIR': np.mean(ic)/np.std(ic),
+            'RIC': np.mean(ric),
+            'RICIR': np.mean(ric)/np.std(ric)
+        }
+
+        return predictions, metrics
+
+    def _get_or_create_tensor(self, key, shape, dtype=torch.float32):
+        """Get a pre-allocated tensor or create new one if needed"""
+        if key not in self.pre_allocated_tensors or self.pre_allocated_tensors[key].shape[0] < shape[0]:
+            self.pre_allocated_tensors[key] = torch.empty(
+                shape, dtype=dtype, device=self.device
+            )
+        return self.pre_allocated_tensors[key][:shape[0]]
+
+    def diagnose_performance(self, dl_train):
+        """Diagnostic function to identify performance bottlenecks"""
+        print("=== Performance Diagnosis ===")
+        
+        train_loader = self._init_data_loader(dl_train, shuffle=False, drop_last=False)
+        
+        # Test data loading speed
+        print("Testing data loading speed...")
+        start_time = time.time()
+        batch_sizes = []
+        
+        for i, data in enumerate(train_loader):
+            if i >= 10:  # Test first 10 batches
+                break
+            batch_sizes.append(len(data[1]))  # Label batch size
+        
+        load_time = time.time() - start_time
+        avg_batch_size = sum(batch_sizes) / len(batch_sizes)
+        
+        print(f"Data loading: {load_time:.2f}s for 10 batches")
+        print(f"Average batch size: {avg_batch_size:.1f} samples")
+        print(f"Batch sizes: {batch_sizes}")
+        
+        # Test GPU utilization with dummy forward pass
+        if hasattr(self, 'model') and self.model is not None:
+            print("\nTesting model forward pass...")
+            self.model.eval()
+            
+            # Create dummy batch of different sizes
+            for batch_size in [50, 200, 500, 1000, 2000]:
+                if hasattr(train_loader.dataset, 'feature_dim') and hasattr(train_loader.dataset, 'sequence_length'):
+                    dummy_input = torch.randn(
+                        batch_size, 
+                        train_loader.dataset.sequence_length, 
+                        train_loader.dataset.feature_dim
+                    ).to(self.device)
+                else:
+                    # Assume common dimensions
+                    dummy_input = torch.randn(batch_size, 8, 158).to(self.device)
+                
+                start_time = time.time()
+                with torch.no_grad():
+                    _ = self.model(dummy_input)
+                forward_time = time.time() - start_time
+                
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    memory_used = torch.cuda.memory_allocated() / 1024**3
+                    print(f"Batch size {batch_size}: {forward_time*1000:.2f}ms, GPU mem: {memory_used:.3f}GB")
