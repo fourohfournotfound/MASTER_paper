@@ -686,11 +686,21 @@ def main():
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = torch.device(f"cuda:{args.gpu}" if args.gpu is not None and torch.cuda.is_available() else "cpu")
-    if device.type == 'cuda':
+    
+    if args.gpu is not None and torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.gpu}")
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        logger.info(f"CUDA selected. Using GPU: {args.gpu}")
+    else:
+        device = torch.device("cpu")
+        logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        logger.warning("!! CUDA NOT AVAILABLE OR NOT SELECTED. RUNNING ON CPU.        !!")
+        logger.warning("!! THIS WILL BE VERY SLOW. Ensure PyTorch CUDA is installed, !!")
+        logger.warning("!! a GPU is available, and use --gpu <ID> argument.         !!")
+        logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    
     print(f"[main_multi_index.py] Seed: {args.seed}. Device: {device}")
 
     X_train, y_train, train_idx, \
