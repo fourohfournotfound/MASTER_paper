@@ -109,11 +109,13 @@ class SAttention(nn.Module):
         return output
 
 
-class TAttention(nn.Module): # Assuming this is the paper's causal TAttention
+class TAttention(nn.Module):  # Temporal Self-Attention
     def __init__(self, d_model, nhead, dropout):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
+        self.causal = True          # Hardcoded to True
+
         self.qtrans = nn.Linear(d_model, d_model, bias=False)
         self.ktrans = nn.Linear(d_model, d_model, bias=False)
         self.vtrans = nn.Linear(d_model, d_model, bias=False)
@@ -133,46 +135,56 @@ class TAttention(nn.Module): # Assuming this is the paper's causal TAttention
             nn.ReLU(),
             Dropout(p=dropout),
             Linear(d_model, d_model),
-            Dropout(p=dropout)
+            Dropout(p=dropout),
         )
         self.temperature = math.sqrt(d_model / nhead) if nhead > 0 else math.sqrt(d_model)
 
-    def forward(self, x_input): # x_input shape: (N_stocks, T_lookback, d_model)
+    def forward(self, x_input):  # x_input shape: (N_stocks, T_lookback, d_model)
         x_norm = self.norm1(x_input)
-        q = self.qtrans(x_norm) # (N, T, D)
-        k = self.ktrans(x_norm) # (N, T, D)
-        v = self.vtrans(x_norm) # (N, T, D)
+        q = self.qtrans(x_norm)  # (N, T, D)
+        k = self.ktrans(x_norm)  # (N, T, D)
+        v = self.vtrans(x_norm)  # (N, T, D)
 
-        batch_size, seq_len, _ = q.shape 
-        causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=q.device, dtype=q.dtype), diagonal=1)
-        
+        batch_size, seq_len, _ = q.shape
+        causal_mask = None
+        if self.causal: # This will always be true now
+            causal_mask = torch.triu(
+                torch.full(
+                    (seq_len, seq_len),
+                    float("-inf"),
+                    device=q.device,
+                    dtype=q.dtype,
+                ),
+                diagonal=1,
+            )
+
         # Effective dimension per head, handles non-divisible d_model/nhead for slicing
         head_dim_base = self.d_model // self.nhead
         att_output_list = []
         current_dim_offset = 0
         for i in range(self.nhead):
-            # Determine actual head_dim for this head
             if i < self.nhead - 1:
                 current_head_actual_dim = head_dim_base
-            else: # Last head takes the remainder
+            else:
                 current_head_actual_dim = self.d_model - current_dim_offset
 
-            q_h = q[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim] # (N, T, current_head_actual_dim)
-            k_h = k[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim] # (N, T, current_head_actual_dim)
-            v_h = v[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim] # (N, T, current_head_actual_dim)
+            q_h = q[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
+            k_h = k[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
+            v_h = v[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
             current_dim_offset += current_head_actual_dim
-            
-            attn_scores_h = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.temperature # (N, T, T)
-            attn_scores_h = attn_scores_h + causal_mask # Apply causal mask
+
+            attn_scores_h = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.temperature
+            if causal_mask is not None:
+                attn_scores_h = attn_scores_h + causal_mask
             atten_ave_matrixh = torch.softmax(attn_scores_h, dim=-1)
 
             if self.attn_dropout_modules and self.attn_dropout_modules[i]:
                 atten_ave_matrixh = self.attn_dropout_modules[i](atten_ave_matrixh)
-            
-            weighted_values_h = torch.matmul(atten_ave_matrixh, v_h) # (N, T, h_dim)
+
+            weighted_values_h = torch.matmul(atten_ave_matrixh, v_h)
             att_output_list.append(weighted_values_h)
-        
-        att_output_concat = torch.cat(att_output_list, dim=-1) # (N, T, D)
+
+        att_output_concat = torch.cat(att_output_list, dim=-1)
         xt = x_input + att_output_concat
         xt_norm2 = self.norm2(xt)
         ffn_output = self.ffn(xt_norm2)
@@ -275,87 +287,108 @@ class RegRankLoss(nn.Module):
 
 # This class implements the architecture from the paper's `MASTER` class
 class PaperMASTERArchitecture(nn.Module):
-    def __init__(self, d_feat_input_total, d_model, t_nhead, s_nhead, 
-                 T_dropout_rate, S_dropout_rate, 
-                 gate_input_start_index, gate_input_end_index, beta):
+    """
+    Exact replica of the MASTER paper's encoder–decoder stack
+    ---------------------------------------------------------
+    •  A feature–selection Gate driven by market features
+    •  Linear → PositionalEncoding → Temporal (causal) Attention
+      → Spatial Attention → Final Temporal Attention → Linear decoder
+    """
+
+    def __init__(
+        self,
+        d_feat_input_total: int,
+        d_model: int,
+        t_nhead: int,
+        s_nhead: int,
+        T_dropout_rate: float,
+        S_dropout_rate: float,
+        gate_input_start_index: int,
+        gate_input_end_index: int,
+        beta: float,
+    ):
         super().__init__()
-        
+
+        # ---------------------------------------------------------------
+        # Feature split
+        # ---------------------------------------------------------------
         self.gate_input_start_index = gate_input_start_index
         self.gate_input_end_index = gate_input_end_index
-        
+
         num_market_features = self.gate_input_end_index - self.gate_input_start_index
-        # d_feat_stock_specific is the number of features that are NOT the market feature(s)
         self.d_feat_stock_specific = d_feat_input_total - num_market_features
 
-        if not (0 <= self.gate_input_start_index < d_feat_input_total and 
-                self.gate_input_start_index < self.gate_input_end_index <= d_feat_input_total):
-            raise ValueError(f"Gate indices [{self.gate_input_start_index},{self.gate_input_end_index}) "
-                             f"are out of bounds for d_feat_input_total={d_feat_input_total}")
         if num_market_features <= 0:
-             raise ValueError(f"Number of market features (determined by gate indices) must be positive, got {num_market_features}")
-        if self.d_feat_stock_specific <=0:
-            raise ValueError(f"Number of stock specific features (d_feat_input_total - num_market_features) is {self.d_feat_stock_specific}, must be positive.")
+            raise ValueError(
+                f"gate indices ({gate_input_start_index}, {gate_input_end_index}) "
+                "imply zero market features"
+            )
+        if self.d_feat_stock_specific <= 0:
+            raise ValueError("d_feat_stock_specific must be positive")
 
-        # Gate takes market features as input and outputs a modulation vector of size d_feat_stock_specific
-        self.feature_gate = Gate(num_market_features, self.d_feat_stock_specific, beta=beta)
+        # ---------------------------------------------------------------
+        # Modules
+        # ---------------------------------------------------------------
+        self.feature_gate = Gate(
+            d_input=num_market_features,
+            d_output=self.d_feat_stock_specific,
+            beta=beta,
+        )
 
         self.layers = nn.Sequential(
-            nn.Linear(self.d_feat_stock_specific, d_model), # Operates on stock-specific features
+            nn.Linear(self.d_feat_stock_specific, d_model),
             PositionalEncoding(d_model),
-            TAttention(d_model=d_model, nhead=t_nhead, dropout=T_dropout_rate),
-            SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate), 
-            FinalTemporalAttention(d_model=d_model), 
-            nn.Linear(d_model, 1)
+            TAttention(
+                d_model=d_model,
+                nhead=t_nhead,
+                dropout=T_dropout_rate,
+            ),
+            SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate),
+            FinalTemporalAttention(d_model=d_model),
+            nn.Linear(d_model, 1),
         )
-        logger.info(f"PaperMASTERArchitecture: Input d_feat_total={d_feat_input_total}, "
-                    f"d_feat_stock_specific={self.d_feat_stock_specific}, "
-                    f"num_market_features_for_gate={num_market_features}, d_model={d_model}")
 
-    def forward(self, x): # x shape: (N_stocks, T_lookback, d_feat_input_total)
-        
-        # Correctly split stock-specific features and the single market feature
-        # Assuming the market feature is at gate_input_start_index (and is the only one)
-        
-        # Create a mask for stock-specific features
-        all_indices = torch.arange(x.size(2), device=x.device)
-        market_feature_indices = torch.arange(self.gate_input_start_index, self.gate_input_end_index, device=x.device)
-        
-        # Identify stock-specific feature indices by excluding market feature indices
-        # This is more robust if market features aren't strictly at the end or start.
-        # However, load_and_prepare_data currently appends the market feature as the LAST column.
-        # So, gate_input_start_index points to it, and gate_input_end_index is gate_input_start_index + 1.
-        
-        # Stock specific features are all columns EXCEPT the market feature column(s)
-        if self.gate_input_start_index == 0: # Market feature is the first
-            x_stock_specific = x[:, :, self.gate_input_end_index:]
-        elif self.gate_input_end_index == x.size(2): # Market feature is the last (our current case)
-            x_stock_specific = x[:, :, :self.gate_input_start_index]
-        else: # Market feature is in the middle
-            x_stock_specific_part1 = x[:, :, :self.gate_input_start_index]
-            x_stock_specific_part2 = x[:, :, self.gate_input_end_index:]
-            x_stock_specific = torch.cat((x_stock_specific_part1, x_stock_specific_part2), dim=2)
-            
-        # Market features from the last time step for the gate
-        # x_market_info shape: (N_stocks, num_market_features)
-        x_market_info = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
+    # -------------------------------------------------------------------
+    # Forward
+    # -------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : Tensor
+            Shape (N_stocks, T_lookback, d_feat_input_total)
 
-        if x_stock_specific.size(2) != self.d_feat_stock_specific:
-            raise RuntimeError(f"Mismatch in expected stock_specific features. Expected {self.d_feat_stock_specific}, got {x_stock_specific.size(2)}")
-        if x_market_info.size(1) != (self.gate_input_end_index - self.gate_input_start_index):
-             raise RuntimeError(f"Mismatch in market_info features. Expected {self.gate_input_end_index - self.gate_input_start_index}, got {x_market_info.size(1)}")
+        Returns
+        -------
+        Tensor
+            Shape (N_stocks,) — prediction per stock for the current day
+        """
+        # 1) Split features ----------------------------------------------------
+        if self.gate_input_start_index == 0:                     # market first
+            x_stock_specific = x[:, :, self.gate_input_end_index :]
+        elif self.gate_input_end_index == x.size(2):             # market last
+            x_stock_specific = x[:, :, : self.gate_input_start_index]
+        else:                                                    # market mid
+            x_stock_specific = torch.cat(
+                (
+                    x[:, :, : self.gate_input_start_index],
+                    x[:, :, self.gate_input_end_index :],
+                ),
+                dim=2,
+            )
 
+        x_market_info = x[
+            :, -1, self.gate_input_start_index : self.gate_input_end_index
+        ]  # (N_stocks, num_market_features)
 
-        # Apply gate to stock-specific features
-        # gate_values shape: (N_stocks, d_feat_stock_specific)
-        gate_values = self.feature_gate(x_market_info)
-        
-        # Multiply gate_values with x_stock_specific, broadcasting gate_values across T_lookback
-        # gated_stock_features shape: (N_stocks, T_lookback, d_feat_stock_specific)
+        # 2) Gate modulation ---------------------------------------------------
+        gate_values = self.feature_gate(x_market_info)                # (N, D_s)
         gated_stock_features = x_stock_specific * gate_values.unsqueeze(1)
-        
-        output = self.layers(gated_stock_features).squeeze(-1) 
-        return output
 
+        # 3) Encoder–decoder stack --------------------------------------------
+        output = self.layers(gated_stock_features).squeeze(-1)        # (N,)
+
+        return output
 
 class MASTERModel(SequenceModel):
     def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, 
