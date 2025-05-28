@@ -44,9 +44,9 @@ class SAttention(nn.Module):
 
         attn_dropout_layer = []
         if dropout > 0 and nhead > 0:
-            for _ in range(nhead): # Changed i to _
-                attn_dropout_layer.append(Dropout(p=dropout)) # Indented under for
-            self.attn_dropout = nn.ModuleList(attn_dropout_layer) # Indented under if
+            for _ in range(nhead): 
+                attn_dropout_layer.append(Dropout(p=dropout)) 
+            self.attn_dropout = nn.ModuleList(attn_dropout_layer) 
         else:
             self.attn_dropout = None
         
@@ -68,13 +68,22 @@ class SAttention(nn.Module):
         k = self.ktrans(x_norm).transpose(0, 1)
         v = self.vtrans(x_norm).transpose(0, 1)
 
-        head_dim = self.d_model // self.nhead
+        # Effective dimension per head, handles non-divisible d_model/nhead for slicing
+        head_dim_base = self.d_model // self.nhead
         att_output_per_head = []
+        current_dim_offset = 0
         for i in range(self.nhead):
-            # Slice for current head -> qh, kh, vh shape: (T_lookback, N_stocks, head_dim)
-            q_h = q[:, :, i * head_dim: (i + 1) * head_dim]
-            k_h = k[:, :, i * head_dim: (i + 1) * head_dim]
-            v_h = v[:, :, i * head_dim: (i + 1) * head_dim]
+            # Determine actual head_dim for this head
+            if i < self.nhead - 1:
+                current_head_actual_dim = head_dim_base
+            else: # Last head takes the remainder
+                current_head_actual_dim = self.d_model - current_dim_offset
+            
+            # Slice for current head -> qh, kh, vh shape: (T_lookback, N_stocks, current_head_actual_dim)
+            q_h = q[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
+            k_h = k[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
+            v_h = v[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim]
+            current_dim_offset += current_head_actual_dim
             
             # Attention scores for current head: (T_lookback, N_stocks, N_stocks)
             # (T, N, h_dim) @ (T, h_dim, N) -> (T, N, N)
@@ -84,10 +93,10 @@ class SAttention(nn.Module):
             if self.attn_dropout and self.attn_dropout[i]:
                 attn_probs_h = self.attn_dropout[i](attn_probs_h)
             
-            # Weighted sum for current head: (T_lookback, N_stocks, head_dim)
+            # Weighted sum for current head: (T_lookback, N_stocks, current_head_actual_dim)
             # (T, N, N) @ (T, N, h_dim) -> (T, N, h_dim)
             weighted_values_h = torch.matmul(attn_probs_h, v_h)
-            att_output_per_head.append(weighted_values_h.transpose(0,1)) # Transpose back to (N_stocks, T_lookback, head_dim)
+            att_output_per_head.append(weighted_values_h.transpose(0,1)) # Transpose back to (N_stocks, T_lookback, current_head_actual_dim)
 
         # Concatenate heads: (N_stocks, T_lookback, d_model)
         att_output_concat = torch.cat(att_output_per_head, dim=-1)
@@ -137,12 +146,21 @@ class TAttention(nn.Module): # Assuming this is the paper's causal TAttention
         batch_size, seq_len, _ = q.shape 
         causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=q.device, dtype=q.dtype), diagonal=1)
         
-        head_dim = self.d_model // self.nhead
+        # Effective dimension per head, handles non-divisible d_model/nhead for slicing
+        head_dim_base = self.d_model // self.nhead
         att_output_list = []
+        current_dim_offset = 0
         for i in range(self.nhead):
-            q_h = q[:, :, i * head_dim: (i+1) * head_dim] # (N, T, h_dim)
-            k_h = k[:, :, i * head_dim: (i+1) * head_dim] # (N, T, h_dim)
-            v_h = v[:, :, i * head_dim: (i+1) * head_dim] # (N, T, h_dim)
+            # Determine actual head_dim for this head
+            if i < self.nhead - 1:
+                current_head_actual_dim = head_dim_base
+            else: # Last head takes the remainder
+                current_head_actual_dim = self.d_model - current_dim_offset
+
+            q_h = q[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim] # (N, T, current_head_actual_dim)
+            k_h = k[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim] # (N, T, current_head_actual_dim)
+            v_h = v[:, :, current_dim_offset : current_dim_offset + current_head_actual_dim] # (N, T, current_head_actual_dim)
+            current_dim_offset += current_head_actual_dim
             
             attn_scores_h = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.temperature # (N, T, T)
             attn_scores_h = attn_scores_h + causal_mask # Apply causal mask
@@ -166,16 +184,16 @@ class Gate(nn.Module):
     def __init__(self, d_input, d_output, beta=1.0): # d_output here is d_feat_stock_specific
         super().__init__()
         self.trans = nn.Linear(d_input, d_output)
-        self.d_gate_output_dim = d_output # This is d_feat_stock_specific
+        self.d_gate_output_dim = d_output # This is d_feat_stock_specific / num_stock_features
         self.t = beta # Temperature for softmax
 
     def forward(self, gate_input_market_features): # gate_input shape (N_stocks, d_market_features)
         output = self.trans(gate_input_market_features) # (N_stocks, d_feat_stock_specific)
         output = torch.softmax(output / self.t, dim=-1)
-        # As per paper's MASTER.forward: src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
-        # This means the Gate output should directly be the multiplicative factors.
-        # The d_output * output scaling is not in the paper's MASTER class forward pass for the gate.
-        # The scaling is by d_feat_stock_specific, which is implicitly handled if trans outputs that dim.
+        # To strictly match the paper's Gate snippet:
+        # output = output * self.d_gate_output_dim 
+        # However, as noted in your comments, this is an unusual scaling.
+        # Your current implementation (without this scaling) is more standard.
         return output # Output shape (N_stocks, d_feat_stock_specific)
 
 
