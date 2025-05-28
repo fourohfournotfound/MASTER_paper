@@ -100,11 +100,13 @@ class TAttention(nn.Module):
         self.ktrans = nn.Linear(d_model, d_model, bias=False)
         self.vtrans = nn.Linear(d_model, d_model, bias=False)
 
-        self.attn_dropout = []
+        self.attn_dropout_modules = []
         if dropout > 0:
-            for i in range(nhead):
-                self.attn_dropout.append(Dropout(p=dropout))
-            self.attn_dropout = nn.ModuleList(self.attn_dropout)
+            for _ in range(nhead):
+                self.attn_dropout_modules.append(Dropout(p=dropout))
+            self.attn_dropout_modules = nn.ModuleList(self.attn_dropout_modules)
+        else:
+            self.attn_dropout_modules = None
 
         # input LayerNorm
         self.norm1 = LayerNorm(d_model, eps=1e-5)
@@ -118,15 +120,22 @@ class TAttention(nn.Module):
             Linear(d_model, d_model),
             Dropout(p=dropout)
         )
+        self.temperature = math.sqrt(d_model / nhead) if nhead > 0 else math.sqrt(d_model)
 
-    def forward(self, x):
-        x = self.norm1(x)
-        q = self.qtrans(x)
-        k = self.ktrans(x)
-        v = self.vtrans(x)
+    def forward(self, x_input):
+        x_norm = self.norm1(x_input)
+        q = self.qtrans(x_norm)
+        k = self.ktrans(x_norm)
+        v = self.vtrans(x_norm)
+
+        batch_size, seq_len, _ = q.shape 
+
+        # Generate causal mask: (seq_len, seq_len)
+        # Upper triangle (j > i) is -inf, diagonal and lower triangle is 0.
+        causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=q.device, dtype=q.dtype), diagonal=1)
 
         dim = int(self.d_model / self.nhead)
-        att_output = []
+        att_output_list = []
         for i in range(self.nhead):
             if i==self.nhead-1:
                 qh = q[:, :, i * dim:]
@@ -136,18 +145,33 @@ class TAttention(nn.Module):
                 qh = q[:, :, i * dim:(i + 1) * dim]
                 kh = k[:, :, i * dim:(i + 1) * dim]
                 vh = v[:, :, i * dim:(i + 1) * dim]
-            atten_ave_matrixh = torch.softmax(torch.matmul(qh, kh.transpose(1, 2)), dim=-1)
-            if self.attn_dropout:
-                atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
-            att_output.append(torch.matmul(atten_ave_matrixh, vh))
-        att_output = torch.concat(att_output, dim=-1)
+            
+            # Calculate scaled dot-product attention scores
+            # attn_scores_h shape: (batch_size, seq_len, seq_len)
+            attn_scores_h = torch.matmul(qh, kh.transpose(-2, -1)) / self.temperature
+            
+            # Apply causal mask
+            attn_scores_h = attn_scores_h + causal_mask
 
-        # FFN
-        xt = x + att_output
-        xt = self.norm2(xt)
-        att_output = xt + self.ffn(xt)
+            atten_ave_matrixh = torch.softmax(attn_scores_h, dim=-1)
 
-        return att_output
+            if self.attn_dropout_modules:
+                atten_ave_matrixh = self.attn_dropout_modules[i](atten_ave_matrixh)
+            
+            weighted_values_h = torch.matmul(atten_ave_matrixh, vh)
+            att_output_list.append(weighted_values_h)
+        
+        att_output_concat = torch.cat(att_output_list, dim=-1)
+
+        # First residual connection: input + Attention(Norm(input))
+        xt = x_input + att_output_concat
+        
+        # Second residual connection & FFN: xt + FFN(Norm(xt))
+        xt_norm2 = self.norm2(xt)
+        ffn_output = self.ffn(xt_norm2)
+        output = xt + ffn_output
+
+        return output
 
 
 class Gate(nn.Module):
