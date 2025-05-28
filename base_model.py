@@ -119,7 +119,7 @@ class SequenceModel():
     def __init__(self, n_epochs=100, lr=0.001, GPU=None, seed=None, 
                  train_stop_loss_thred=None, save_path="model/", save_prefix="model",
                  metric="loss", early_stop=20, patience=10, decay_rate=0.9, min_lr=1e-05,
-                 max_iters_epoch=None, train_noise=0.0): # Added missing HPs
+                 max_iters_epoch=None, train_noise=0.0, validation_freq=1, use_amp=True):  # Add mixed precision flag
         """
         Initialize the SequenceModel.
 
@@ -138,6 +138,8 @@ class SequenceModel():
         - min_lr (float): Minimum learning rate.
         - max_iters_epoch (int or None): Maximum number of iterations (batches) per epoch.
         - train_noise (float): Standard deviation of Gaussian noise to add to inputs during training.
+        - validation_freq (int): Frequency of validation (in epochs).
+        - use_amp (bool): Whether to use mixed precision training.
         """
         self.n_epochs = n_epochs
         self.lr = lr
@@ -154,6 +156,10 @@ class SequenceModel():
         self.min_lr = min_lr
         self.max_iters_epoch = max_iters_epoch
         self.train_noise = train_noise
+        self.validation_freq = validation_freq  # Only validate every N epochs
+        self.use_amp = use_amp and torch.cuda.is_available()
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
 
         self.model = None  # This will be set by subclasses (e.g., GRU, LSTM specific models)
         self.optimizer = None
@@ -198,48 +204,33 @@ class SequenceModel():
         losses = []
 
         for data in data_loader:
-            # print(f"Data batch received. data[0] shape (features): {data[0].shape}, data[1] shape (labels): {data[1].shape}")
-            # data = torch.squeeze(data, dim=0) # Original line commented out
-            # data is a tuple: (features_for_day_tensor, labels_for_day_tensor)
-            feature_data = data[0].to(self.device) # N, T, F
-            label_data = data[1].to(self.device)   # N
-            # print(f"In train_epoch: feature_data.shape: {feature_data.shape}, label_data.shape: {label_data.shape}")
-
-            # Original multiline comment for data shape (now for reference):
-            '''
-            data.shape: (N, T, F)
-            N - number of stocks
-            T - length of lookback_window, 8
-            F - 158 factors + 63 market information + 1 label
-            '''
-            # feature = data[:, :, 0:-1].to(self.device) # Original line commented out
-            # label = data[:, -1, -1].to(self.device) # Original line commented out
-
-            # Additional process on labels
-            # If you use original data to train, you won\'t need the following lines because we already drop extreme when we dumped the data.
-            # If you use the opensource data to train, use the following lines to drop extreme labels.
-            #########################
-            # print(f"Before drop_extreme: label_data.shape: {label_data.shape}")
-            # Apply to label_data
+            feature_data = data[0].to(self.device, non_blocking=True)
+            label_data = data[1].to(self.device, non_blocking=True)
 
             mask, current_labels_processed = drop_extreme(label_data)
-            # print(f"Shape of feature_data: {feature_data.shape}")
-            # print(f"Shape of mask: {mask.shape}")
-            # print(f"Number of True in mask: {mask.sum().item()}")
-            # Ensure feature_data is filtered with the same mask derived from label_data
             current_features_processed = feature_data[mask, :, :]
-
-            current_labels_processed = zscore(current_labels_processed) # CSZscoreNorm
-            #########################
-
-            pred = self.model(current_features_processed.float())
-            loss = self.loss_fn(pred, current_labels_processed)
-            losses.append(loss.item())
+            current_labels_processed = zscore(current_labels_processed)
 
             self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
-            self.optimizer.step()
+
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    pred = self.model(current_features_processed.float())
+                    loss = self.loss_fn(pred, current_labels_processed)
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                pred = self.model(current_features_processed.float())
+                loss = self.loss_fn(pred, current_labels_processed)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
+                self.optimizer.step()
+
+            losses.append(loss.item())
 
         return float(np.mean(losses))
 
@@ -269,41 +260,20 @@ class SequenceModel():
         return float(np.mean(losses))
 
     def _init_data_loader(self, data, shuffle=True, drop_last=True):
-        print("[SequenceModel] Initializing DataLoader in _init_data_loader...")
+        # Remove excessive print statements for production
         if data is None or len(data) == 0:
-            print("[SequenceModel] ERROR: Input data to _init_data_loader is None or empty.")
-            # Optionally raise an error or return an empty loader
             raise ValueError("Input data for DataLoader cannot be None or empty.")
 
         day_sampler = DaySampler(data, shuffle)
-        print(f"[SequenceModel] DaySampler initialized. Number of days/samples from sampler: {len(day_sampler)}")
 
         def custom_collate(batch_data_tuple):
-            # When batch_size=None and a sampler is used, DataLoader passes the direct output of
-            # dataset.__getitem__(idx) to the collate_fn.
-            # If dataset.__getitem__ returns (features, labels), then batch_data_tuple will be (features, labels).
-            # print(f"[Custom Collate] Received batch_data_tuple. Type: {type(batch_data_tuple)}")
-
             if isinstance(batch_data_tuple, tuple) and len(batch_data_tuple) == 2:
-                # batch_data_tuple is the (features, labels) tuple
                 features, labels = batch_data_tuple
-                # f_shape = features.shape if hasattr(features, 'shape') else type(features)
-                # l_shape = labels.shape if hasattr(labels, 'shape') else type(labels)
-                # print(f"[Custom Collate] Successfully unpacked. Features type: {type(features)}, Labels type: {type(labels)}")
                 return (features, labels)
             else:
-                error_msg = (
-                    f"[Custom Collate] ERROR: batch_data_tuple structure not as expected. "
-                    f"Expected a 2-element tuple (features, labels). Got: {type(batch_data_tuple)}"
-                    f"{', len ' + str(len(batch_data_tuple)) if isinstance(batch_data_tuple, tuple) else ''}"
-                )
-                # For debugging, print the content if it's small enough or types
-                # print(f"Content: {batch_data_tuple}") 
-                print(error_msg)
-                raise ValueError(error_msg)
+                raise ValueError(f"Unexpected batch_data_tuple structure: {type(batch_data_tuple)}")
 
         data_loader = DataLoader(data, sampler=day_sampler, batch_size=None, collate_fn=custom_collate)
-        print("[SequenceModel] DataLoader initialized successfully.")
         return data_loader
 
     def load_param(self, param_path):
@@ -329,7 +299,6 @@ class SequenceModel():
              return
 
         best_param = None
-        # Initialize based on whether higher or lower metric is better for early stopping
         best_valid_metric_val = -np.inf if 'ic' in self.metric.lower() else np.inf
         epochs_no_improve = 0
 
@@ -346,7 +315,8 @@ class SequenceModel():
             current_lr = self.optimizer.param_groups[0]['lr']
             epoch_log_msg_parts.append(f"lr: {current_lr:.6e}")
 
-            if valid_loader: # Check if valid_loader was successfully created
+            # Only validate every validation_freq epochs (default 1 = every epoch)
+            if valid_loader and (step + 1) % self.validation_freq == 0:
                 print(f"{epoch_log_msg_parts[0]} - Performing validation...")
                 # Calculate validation loss
                 valid_loss = self.test_epoch(valid_loader) # Ensure test_epoch returns average loss
@@ -426,9 +396,12 @@ class SequenceModel():
                 
                 if improved:
                     epochs_no_improve = 0
-                    best_param = copy.deepcopy(self.model.state_dict())
-                    logger.info(f"Epoch {step + 1}: New best validation {self.metric}: {best_valid_metric_val:.4f}. Saving model.")
-                    torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}_best.pkl')
+                    # Use state_dict() copy instead of deepcopy for efficiency
+                    best_param = {k: v.clone() for k, v in self.model.state_dict().items()}
+                    
+                    # Save asynchronously or less frequently
+                    if (step + 1) % 5 == 0 or step == self.n_epochs - 1:  # Save every 5 epochs
+                        torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}_best.pkl')
                 else:
                     epochs_no_improve += 1
                 
@@ -438,6 +411,9 @@ class SequenceModel():
                         logger.info("Loading best model parameters.")
                         self.model.load_state_dict(best_param) # Load best model
                     break
+            else:
+                # Use training loss for scheduler when not validating
+                self.scheduler.step(train_loss)
             
             print(" - ".join(epoch_log_msg_parts))
 
