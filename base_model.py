@@ -4,6 +4,8 @@ import copy
 import logging
 import sys
 from pathlib import Path
+import time
+import psutil
 
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
@@ -165,7 +167,7 @@ class SequenceModel():
                  train_stop_loss_thred=None, save_path="model/", save_prefix="model",
                  metric="loss", early_stop=20, patience=10, decay_rate=0.9, min_lr=1e-05,
                  max_iters_epoch=None, train_noise=0.0, validation_freq=1, use_amp=True,
-                 accumulation_steps=4):  # Add gradient accumulation
+                 accumulation_steps=4, max_batch_size=4096):  # Add max batch size for pre-allocation
         """
         Initialize the SequenceModel.
 
@@ -187,6 +189,7 @@ class SequenceModel():
         - validation_freq (int): Frequency of validation (in epochs).
         - use_amp (bool): Whether to use mixed precision training.
         - accumulation_steps (int): Number of steps to accumulate gradients before updating optimizer.
+        - max_batch_size (int): Maximum batch size for pre-allocation of tensors.
         """
         self.n_epochs = n_epochs
         self.lr = lr
@@ -208,6 +211,8 @@ class SequenceModel():
         if self.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
         self.accumulation_steps = accumulation_steps
+        self.max_batch_size = max_batch_size
+        self.pre_allocated_tensors = {}  # Cache for reusable tensors
 
         self.model = None  # This will be set by subclasses (e.g., GRU, LSTM specific models)
         self.optimizer = None
@@ -251,40 +256,69 @@ class SequenceModel():
         self.model.train()
         losses = []
         accumulated_loss = 0.0
+        
+        # Accumulate multiple days worth of data before processing
+        accumulated_features = []
+        accumulated_labels = []
+        current_accumulation = 0
 
-        # Process one day at a time (no lookahead bias) but accumulate gradients
         for i, data in enumerate(data_loader):
-            feature_data = data[0].to(self.device, non_blocking=True)
-            label_data = data[1].to(self.device, non_blocking=True)
-
-            # Add noise for regularization if specified
-            if self.train_noise > 0:
-                noise = torch.randn_like(feature_data) * self.train_noise
-                feature_data = feature_data + noise
-
-            # Standard preprocessing (maintains temporal integrity per day)
-            mask, current_labels_processed = drop_extreme(label_data)
-            current_features_processed = feature_data[mask, :, :]
-            current_labels_processed = zscore(current_labels_processed)
-
-            if self.use_amp:
-                with torch.cuda.amp.autocast():
-                    pred = self.model(current_features_processed.float())
-                    loss = self.loss_fn(pred, current_labels_processed)
-                    # Scale loss by accumulation steps for proper gradient averaging
-                    loss = loss / self.accumulation_steps
+            feature_data = data[0]
+            label_data = data[1]
+            
+            # Accumulate data from multiple days
+            accumulated_features.append(feature_data)
+            accumulated_labels.append(label_data)
+            current_accumulation += 1
+            
+            # Process when we have enough accumulated data or at end
+            if current_accumulation >= self.accumulation_steps or i == len(data_loader) - 1:
+                # Concatenate all accumulated data
+                batch_features = torch.cat(accumulated_features, dim=0).to(self.device, non_blocking=True)
+                batch_labels = torch.cat(accumulated_labels, dim=0).to(self.device, non_blocking=True)
                 
-                self.scaler.scale(loss).backward()
-                accumulated_loss += loss.item()
-            else:
-                pred = self.model(current_features_processed.float())
-                loss = self.loss_fn(pred, current_labels_processed)
-                loss = loss / self.accumulation_steps
-                loss.backward()
-                accumulated_loss += loss.item()
+                # Add noise if specified
+                if self.train_noise > 0:
+                    noise = torch.randn_like(batch_features) * self.train_noise
+                    batch_features = batch_features + noise
 
-            # Update optimizer every accumulation_steps (no temporal mixing)
-            if (i + 1) % self.accumulation_steps == 0:
+                # Process the entire large batch
+                mask, processed_labels = drop_extreme(batch_labels)
+                processed_features = batch_features[mask, :, :]
+                processed_labels = zscore(processed_labels)
+                
+                # Split into chunks if too large for GPU memory
+                chunk_size = min(len(processed_features), 2048)  # Larger chunks
+                total_loss = 0.0
+                num_chunks = 0
+                
+                for chunk_start in range(0, len(processed_features), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(processed_features))
+                    chunk_features = processed_features[chunk_start:chunk_end]
+                    chunk_labels = processed_labels[chunk_start:chunk_end]
+                    
+                    if len(chunk_features) == 0:
+                        continue
+                    
+                    if self.use_amp:
+                        with torch.cuda.amp.autocast():
+                            pred = self.model(chunk_features.float())
+                            loss = self.loss_fn(pred, chunk_labels)
+                    else:
+                        pred = self.model(chunk_features.float())
+                        loss = self.loss_fn(pred, chunk_labels)
+                    
+                    # Scale loss by number of chunks and accumulation steps
+                    loss = loss / (current_accumulation * max(1, len(processed_features) // chunk_size))
+                    total_loss += loss.item()
+                    num_chunks += 1
+                    
+                    if self.use_amp:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                
+                # Update optimizer
                 if self.use_amp:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
@@ -295,23 +329,14 @@ class SequenceModel():
                     self.optimizer.step()
                 
                 self.optimizer.zero_grad()
-                losses.append(accumulated_loss)
-                accumulated_loss = 0.0
-
-        # Handle any remaining accumulated gradients
-        if len(data_loader) % self.accumulation_steps != 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
-                self.optimizer.step()
-            
-            self.optimizer.zero_grad()
-            if accumulated_loss > 0:
-                losses.append(accumulated_loss)
+                
+                if num_chunks > 0:
+                    losses.append(total_loss)
+                
+                # Reset accumulation
+                accumulated_features = []
+                accumulated_labels = []
+                current_accumulation = 0
 
         return float(np.mean(losses))
 
@@ -341,7 +366,6 @@ class SequenceModel():
         return float(np.mean(losses))
 
     def _init_data_loader(self, data, shuffle=True, drop_last=True, days_per_batch=1):
-        # Default to single-day processing (bias-free) with gradient accumulation for efficiency
         if data is None or len(data) == 0:
             raise ValueError("Input data for DataLoader cannot be None or empty.")
 
@@ -354,7 +378,17 @@ class SequenceModel():
             else:
                 raise ValueError(f"Unexpected batch_data_tuple structure: {type(batch_data_tuple)}")
 
-        data_loader = DataLoader(data, sampler=day_sampler, batch_size=None, collate_fn=safe_collate)
+        # Add workers and prefetching for better CPU-GPU overlap
+        data_loader = DataLoader(
+            data, 
+            sampler=day_sampler, 
+            batch_size=None, 
+            collate_fn=safe_collate,
+            num_workers=4,  # Use multiple processes for data loading
+            pin_memory=True,  # Faster GPU transfer
+            prefetch_factor=2,  # Pre-load next batches
+            persistent_workers=True  # Keep workers alive between epochs
+        )
         return data_loader
 
     def load_param(self, param_path):
@@ -575,3 +609,61 @@ class SequenceModel():
         }
 
         return predictions, metrics
+
+    def _get_or_create_tensor(self, key, shape, dtype=torch.float32):
+        """Get a pre-allocated tensor or create new one if needed"""
+        if key not in self.pre_allocated_tensors or self.pre_allocated_tensors[key].shape[0] < shape[0]:
+            self.pre_allocated_tensors[key] = torch.empty(
+                shape, dtype=dtype, device=self.device
+            )
+        return self.pre_allocated_tensors[key][:shape[0]]
+
+    def diagnose_performance(self, dl_train):
+        """Diagnostic function to identify performance bottlenecks"""
+        print("=== Performance Diagnosis ===")
+        
+        train_loader = self._init_data_loader(dl_train, shuffle=False, drop_last=False)
+        
+        # Test data loading speed
+        print("Testing data loading speed...")
+        start_time = time.time()
+        batch_sizes = []
+        
+        for i, data in enumerate(train_loader):
+            if i >= 10:  # Test first 10 batches
+                break
+            batch_sizes.append(len(data[1]))  # Label batch size
+        
+        load_time = time.time() - start_time
+        avg_batch_size = sum(batch_sizes) / len(batch_sizes)
+        
+        print(f"Data loading: {load_time:.2f}s for 10 batches")
+        print(f"Average batch size: {avg_batch_size:.1f} samples")
+        print(f"Batch sizes: {batch_sizes}")
+        
+        # Test GPU utilization with dummy forward pass
+        if hasattr(self, 'model') and self.model is not None:
+            print("\nTesting model forward pass...")
+            self.model.eval()
+            
+            # Create dummy batch of different sizes
+            for batch_size in [50, 200, 500, 1000, 2000]:
+                if hasattr(train_loader.dataset, 'feature_dim') and hasattr(train_loader.dataset, 'sequence_length'):
+                    dummy_input = torch.randn(
+                        batch_size, 
+                        train_loader.dataset.sequence_length, 
+                        train_loader.dataset.feature_dim
+                    ).to(self.device)
+                else:
+                    # Assume common dimensions
+                    dummy_input = torch.randn(batch_size, 8, 158).to(self.device)
+                
+                start_time = time.time()
+                with torch.no_grad():
+                    _ = self.model(dummy_input)
+                forward_time = time.time() - start_time
+                
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    memory_used = torch.cuda.memory_allocated() / 1024**3
+                    print(f"Batch size {batch_size}: {forward_time*1000:.2f}ms, GPU mem: {memory_used:.3f}GB")
