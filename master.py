@@ -170,54 +170,107 @@ class TemporalAttention(nn.Module):
         return output
 
 
-class MASTER(nn.Module):
-    def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, gate_input_start_index, gate_input_end_index, beta):
-        super(MASTER, self).__init__()
-        # market
-        self.gate_input_start_index = gate_input_start_index
-        self.gate_input_end_index = gate_input_end_index
-        self.d_gate_input = (gate_input_end_index - gate_input_start_index) # F'
-        self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
+class MASTER(SequenceModel):
+    def __init__(self, d_feat, hidden_size, num_layers, dropout, n_epochs, lr, 
+                 model_type='GRU', GPU=None, seed=None, train_stop_loss_thred=None,
+                 save_path='model/', save_prefix='master_model'):
+        
+        # Initialize the parent SequenceModel class
+        super().__init__(n_epochs=n_epochs, lr=lr, GPU=GPU, seed=seed,
+                         train_stop_loss_thred=train_stop_loss_thred,
+                         save_path=save_path, save_prefix=save_prefix)
 
-        self.layers = nn.Sequential(
-            # feature layer
-            nn.Linear(d_feat, d_model),
-            PositionalEncoding(d_model),
-            # intra-stock aggregation
-            TAttention(d_model=d_model, nhead=t_nhead, dropout=T_dropout_rate),
-            # inter-stock aggregation
-            SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate),
-            TemporalAttention(d_model=d_model),
-            # decoder
-            nn.Linear(d_model, 1)
+        self.d_feat = d_feat
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.model_type = model_type
+
+        # Instantiate the actual PyTorch model (GRU, LSTM, etc.)
+        # This model will be assigned to self.model as expected by SequenceModel
+        self.model = self._build_model()
+        
+        # After the model is built and assigned to self.model, initialize optimizer etc.
+        self.init_model() # This method is from the parent SequenceModel
+
+    def _build_model(self):
+        if self.model_type == 'GRU':
+            print(f"Building GRUModel with d_feat={self.d_feat}, hidden_size={self.hidden_size}, num_layers={self.num_layers}, dropout={self.dropout}")
+            return GRUModel(d_feat=self.d_feat, hidden_size=self.hidden_size, num_layers=self.num_layers, dropout=self.dropout)
+        elif self.model_type == 'LSTM':
+            print(f"Building LSTMModel with d_feat={self.d_feat}, hidden_size={self.hidden_size}, num_layers={self.num_layers}, dropout={self.dropout}")
+            return LSTMModel(d_feat=self.d_feat, hidden_size=self.hidden_size, num_layers=self.num_layers, dropout=self.dropout)
+        elif self.model_type == 'ALSTM': # Assuming ALSTM is defined
+            print(f"Building ALSTMModel with d_feat={self.d_feat}, hidden_size={self.hidden_size}, num_layers={self.num_layers}, dropout={self.dropout}")
+            return ALSTMModel(d_feat=self.d_feat, hidden_size=self.hidden_size, num_layers=self.num_layers, dropout=self.dropout)
+        else:
+            raise ValueError(f"Unsupported model_type: {self.model_type}. Choose from 'GRU', 'LSTM', 'ALSTM'.")
+
+    # The fit and predict methods are inherited from SequenceModel.
+    # If MASTER needs specific logic for training or prediction beyond what SequenceModel provides,
+    # you can override those methods here. For now, we assume SequenceModel's methods are sufficient.
+
+    def train_predict(self, train_data, test_data=None):
+        """
+        A convenience method to encapsulate training and prediction.
+        train_data: DataLoader or Dataset for training.
+        test_data: DataLoader or Dataset for testing.
+        """
+        print(f"[MASTER] Starting training for {self.n_epochs} epochs.")
+        self.fit(dl_train=train_data, dl_valid=test_data) # dl_valid can be test_data for simplicity here
+        
+        predictions = None
+        metrics = None
+        if test_data:
+            print("[MASTER] Starting prediction on test data.")
+            predictions, metrics = self.predict(dl_test=test_data)
+            print(f"[MASTER] Test Metrics: {metrics}")
+        
+        print("[MASTER] train_predict finished.")
+        return predictions, metrics
+
+
+class GRUModel(nn.Module):
+    def __init__(self, d_feat, hidden_size, num_layers, dropout):
+        super().__init__()
+        self.rnn = nn.GRU(
+            input_size=d_feat,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0 # Dropout only if num_layers > 1
         )
+        self.fc = nn.Linear(hidden_size, 1)
 
-    def forward(self, x): # x shape: N, T, D_total_features
-        # Current configuration from main_multi_index.py:
-        # self.gate_input_start_index = 0
-        # self.gate_input_end_index = D_total_features (passed as d_feat to __init__)
-        # self.d_gate_input = D_total_features
-        # self.feature_gate is Gate(D_total_features, D_total_features, beta)
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, d_feat)
+        out, _ = self.rnn(x) # out shape: (batch_size, seq_len, hidden_size)
+        # We want the output from the last time step
+        return self.fc(out[:, -1, :]).squeeze() # (batch_size,)
 
-        if self.d_gate_input > 0:
-            # Use features from the last time step of the sequence for gate decision
-            # The slice x[:, -1, self.gate_input_start_index:self.gate_input_end_index] becomes x[:, -1, :]
-            # when gate_input_start_index=0 and gate_input_end_index=D_total_features.
-            gate_decision_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
 
-            gate_output_values = self.feature_gate(gate_decision_input) # Shape: N, D_total_features (as d_output of Gate is D_total_features)
+class LSTMModel(nn.Module):
+    def __init__(self, d_feat, hidden_size, num_layers, dropout):
+        super().__init__()
+        self.rnn = nn.LSTM(
+            input_size=d_feat,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        self.fc = nn.Linear(hidden_size, 1)
 
-            # Apply gate output element-wise to all features across all time steps
-            # The original `src` was x[:, :, :self.gate_input_start_index].
-            # If gate_input_start_index is 0, this would be empty.
-            # We intend for `x` itself to be the base for features, modified by the gate.
-            src = x * torch.unsqueeze(gate_output_values, dim=1) #unsqueeze adds time dim for broadcasting
-        else: # No gating configured (e.g., if d_gate_input was 0)
-            src = x
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        return self.fc(out[:, -1, :]).squeeze()
 
-        output = self.layers(src).squeeze(-1)
-
-        return output
+# Placeholder for ALSTM if you have a specific architecture
+class ALSTMModel(LSTMModel): # Example: ALSTM could inherit from LSTM and add attention
+    def __init__(self, d_feat, hidden_size, num_layers, dropout):
+        super().__init__(d_feat, hidden_size, num_layers, dropout)
+        # Add attention mechanism components if needed
+        print("ALSTMModel initialized (currently same as LSTM). Define attention if needed.")
 
 
 class MASTERModel(SequenceModel):
@@ -241,8 +294,7 @@ class MASTERModel(SequenceModel):
         self.init_model()
 
     def init_model(self):
-        self.model = MASTER(d_feat=self.d_feat, d_model=self.d_model, t_nhead=self.t_nhead, s_nhead=self.s_nhead,
-                                   T_dropout_rate=self.T_dropout_rate, S_dropout_rate=self.S_dropout_rate,
-                                   gate_input_start_index=self.gate_input_start_index,
-                                   gate_input_end_index=self.gate_input_end_index, beta=self.beta)
+        self.model = MASTER(d_feat=self.d_feat, hidden_size=self.d_model, num_layers=self.t_nhead, dropout=self.T_dropout_rate,
+                           n_epochs=self.n_epochs, lr=self.lr, model_type='GRU', GPU=self.GPU, seed=self.seed,
+                           train_stop_loss_thred=self.train_stop_loss_thred, save_path=self.save_path, save_prefix=self.save_prefix)
         super(MASTERModel, self).init_model()
