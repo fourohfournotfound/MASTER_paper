@@ -185,16 +185,15 @@ class TAttention(nn.Module):  # Temporal Self-Attention
 
 
 class Gate(nn.Module):
-    def __init__(self, d_gate_input_dim):
+    def __init__(self, d_gate_input_dim, beta: float = 1.0):
         super(Gate, self).__init__()
         self.d_gate_input_dim = d_gate_input_dim
-        self.d_gate_output_dim = d_gate_input_dim  # Store for scaling
+        self.d_gate_output_dim = d_gate_input_dim
         self.trans = nn.Linear(d_gate_input_dim, d_gate_input_dim)
-        self.t = 1.0
+        self.t = beta
 
     def forward(self, x):
-        # Apply the d_output scaling factor as per paper
-        return self.d_gate_output_dim * torch.softmax(self.trans(x) / self.t, dim=-1)
+        return torch.softmax(self.trans(x) / self.t, dim=-1)
 
 
 # This is the paper's "final" TemporalAttention that aggregates T dimension
@@ -226,6 +225,10 @@ class RegRankLoss(nn.Module):
         if pred.dim() > 1: pred = pred.squeeze()
         if target.dim() > 1: target = target.squeeze()
 
+        # Handle scalar tensors (0-dimensional)
+        if pred.dim() == 0 or target.dim() == 0:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
         if pred.shape[0] != target.shape[0]:
             logger.error(f"Shape mismatch in RegRankLoss: pred {pred.shape}, target {target.shape}. Returning 0 loss.")
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
@@ -312,14 +315,18 @@ class PaperMASTERArchitecture(nn.Module):
                 "imply zero market features"
             )
         if self.d_feat_stock_specific <= 0:
-            raise ValueError("d_feat_stock_specific must be positive")
+            raise ValueError(f"d_feat_stock_specific ({self.d_feat_stock_specific}) must be positive. Check feature splitting and gate indices. Total features: {d_feat_input_total}, Market features: {num_market_features}")
 
         # ---------------------------------------------------------------
         # Modules
         # ---------------------------------------------------------------
         self.feature_gate = Gate(
             d_gate_input_dim=num_market_features,
+            beta=beta
         )
+
+        self.feature_gate.trans = nn.Linear(num_market_features, self.d_feat_stock_specific)
+        self.feature_gate.d_gate_output_dim = self.d_feat_stock_specific
 
         self.layers = nn.Sequential(
             nn.Linear(self.d_feat_stock_specific, d_model),
@@ -339,46 +346,70 @@ class PaperMASTERArchitecture(nn.Module):
     # -------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Parameters
-        ----------
-        x : Tensor
-            Shape (N_stocks, T_lookback, d_feat_input_total)
+        Args:
+            x (torch.Tensor): Input tensor of shape (N_stocks, T_lookback, d_feat_input_total)
+                              where N_stocks is batch size (number of stocks for this daily batch),
+                              T_lookback is the sequence length,
+                              d_feat_input_total is the total number of raw input features.
 
-        Returns
-        -------
-        Tensor
-            Shape (N_stocks,) — prediction per stock for the current day
+        Returns:
+            torch.Tensor: Output tensor of shape (N_stocks, 1) representing predicted scores/ranks.
         """
-        # 1) Split features ----------------------------------------------------
-        if self.gate_input_start_index == 0:                     # market first
-            x_stock_specific = x[:, :, self.gate_input_end_index :]
-        elif self.gate_input_end_index == x.size(2):             # market last
-            x_stock_specific = x[:, :, : self.gate_input_start_index]
-        else:                                                    # market mid
-            x_stock_specific = torch.cat(
-                (
-                    x[:, :, : self.gate_input_start_index],
-                    x[:, :, self.gate_input_end_index :],
-                ),
-                dim=2,
-            )
-
-        x_market_info = x[:, :, self.gate_input_start_index : self.gate_input_end_index]  # (N, T, market_features)
-
-        # 2) Gate modulation - SAFE VERSION: Apply gate per timestep -------------------
-        # Apply gate to each timestep independently to avoid lookahead bias
-        gated_stock_features_list = []
-        for t in range(x.size(1)):  # For each timestep
-            gate_values_t = self.feature_gate(x_market_info[:, t, :])  # (N, market_features)
-            gated_features_t = x_stock_specific[:, t, :] * gate_values_t  # (N, stock_features)
-            gated_stock_features_list.append(gated_features_t.unsqueeze(1))
+        # ---------------------------------------------------------------
+        # Split input into stock-specific features and market info
+        # ---------------------------------------------------------------
+        # x_stock_specific: (N, T, d_feat_stock_specific)
+        # x_market_info:    (N, T, num_market_features)
         
-        gated_stock_features = torch.cat(gated_stock_features_list, dim=1)  # (N, T, stock_features)
+        # Create masks for slicing
+        stock_specific_indices = list(range(self.gate_input_start_index)) + \
+                                 list(range(self.gate_input_end_index, x.shape[2]))
+        market_info_indices = list(range(self.gate_input_start_index, self.gate_input_end_index))
 
-        # 3) Encoder–decoder stack --------------------------------------------
-        output = self.layers(gated_stock_features).squeeze(-1)        # (N,)
+        x_stock_specific = x[:, :, stock_specific_indices]
+        x_market_info = x[:, :, market_info_indices]
 
-        return output
+        if x_market_info.shape[2] != (self.gate_input_end_index - self.gate_input_start_index):
+             raise ValueError(f"Market info features dimension mismatch. Expected {self.gate_input_end_index - self.gate_input_start_index}, got {x_market_info.shape[2]}")
+        if x_stock_specific.shape[2] != self.d_feat_stock_specific:
+            raise ValueError(f"Stock specific features dimension mismatch. Expected {self.d_feat_stock_specific}, got {x_stock_specific.shape[2]}")
+
+
+        # ---------------------------------------------------------------
+        # Gating
+        # ---------------------------------------------------------------
+        # --- paper behaviour: use market info from the **last** frame ---
+        gate_vals = self.feature_gate(x_market_info[:, -1, :])           # (N, num_market_features), but gate output is (N, d_feat_stock_specific)
+        # The gate's output dimension must match d_feat_stock_specific for element-wise product.
+        # This implies the Gate module's internal Linear layer should map num_market_features -> d_feat_stock_specific.
+        # Let's re-check Gate __init__ and forward. The current Gate maps d_gate_input_dim -> d_gate_input_dim.
+        # For the paper's logic, Gate should transform market features into a gating signal for stock-specific features.
+        # The paper states: "The feature gate g_t is a linear layer with softmax activation that takes r_M,t as input."
+        # "The output of g_t is a vector of weights w_t of the same dimension as r_S,t."
+        # So, Gate's Linear layer should be from num_market_features to d_feat_stock_specific.
+        # This will be addressed in a subsequent change if Gate's definition needs update.
+        # For now, assuming gate_vals has shape (N, d_feat_stock_specific)
+        
+        # The original paper description for gating: w_t = softmax(Linear(r_M,t)). r_S,t_gated = r_S,t * w_t
+        # If gate_vals is (N, d_feat_stock_specific) and x_stock_specific is (N, T, d_feat_stock_specific)
+        # We need to unsqueeze gate_vals to (N, 1, d_feat_stock_specific) to broadcast over T
+        gated_stock_features = x_stock_specific * gate_vals.unsqueeze(1)  # broadcast to all T
+
+        # ---------------------------------------------------------------
+        # Main MASTER layers
+        # ---------------------------------------------------------------
+        # The `self.layers` Sequential module expects input of shape (N, T, d_model)
+        # The `gated_stock_features` are (N, T, d_feat_stock_specific)
+        # The first layer in `self.layers` is Linear(self.d_feat_stock_specific, d_model)
+        # So, this matches up.
+        
+        # Pass the gated stock-specific features through the model layers
+        # Output of self.layers is (N, 1) because the last layer is nn.Linear(d_model, 1)
+        final_scores = self.layers(gated_stock_features) # (N_stocks, 1)
+        
+        # The self.layers already includes the final linear layer that maps to 1 dimension
+        # No additional decoder needed
+        return final_scores
 
 class MASTERModel(SequenceModel):
     def __init__(self, d_feat, d_model=256, t_nhead=4, s_nhead=2, T_dropout_rate=0.5, S_dropout_rate=0.5, 
