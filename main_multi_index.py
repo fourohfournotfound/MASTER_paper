@@ -257,15 +257,11 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, train_test
         print("[main_multi_index.py] ERROR: Preprocessing returned no data.")
         return None, None, None, None, None, None, None
 
-    # Ensure seq_idx is sorted by date, then ticker for consistent prediction alignment
-    if isinstance(seq_idx, pd.MultiIndex):
-        print("[main_multi_index.py] Sorting sequence index by date, then ticker.")
-        seq_idx_df = seq_idx.to_frame()
-        seq_idx_df_sorted = seq_idx_df.sort_values(by=['date', 'ticker'])
-        seq_idx = pd.MultiIndex.from_frame(seq_idx_df_sorted)
-
 
     # Split data
+    # Ensure seq_idx is sorted if it's not already from creation
+    # seq_idx = seq_idx.sort_values() # Should be sorted by (ticker, date)
+    
     # Get the date part of the multi-index for splitting
     dates_for_splitting = seq_idx.get_level_values('date')
     
@@ -339,7 +335,7 @@ def main():
     if X_train is None or X_train.shape[0] == 0:
         print("[main_multi_index.py] ERROR: No training data available after load_and_prepare_data. Exiting.") # DIAGNOSTIC PRINT
         return
-    
+
     if X_test is None or X_test.shape[0] == 0:
         print("[main_multi_index.py] WARNING: No test data available. Proceeding with training only if this is intended.")
         # Depending on requirements, you might want to exit if test data is crucial.
