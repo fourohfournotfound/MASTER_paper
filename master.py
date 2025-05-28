@@ -148,6 +148,12 @@ class TAttention(nn.Module):  # Temporal Self-Attention
         batch_size, seq_len, _ = q.shape
         att_output_list = []
         current_dim_offset = 0
+        
+        # FIXED: Create causal mask to prevent lookahead bias
+        # Each timestep can only attend to past and current timesteps
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=x_input.device), diagonal=1)
+        causal_mask = causal_mask.masked_fill(causal_mask == 1, float('-inf'))
+        
         for i in range(self.nhead):
             if i < self.nhead - 1:
                 current_head_actual_dim = self.head_dim
@@ -160,6 +166,8 @@ class TAttention(nn.Module):  # Temporal Self-Attention
             current_dim_offset += current_head_actual_dim
 
             attn_scores_h = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.temperature
+            # FIXED: Apply causal mask to prevent attending to future timesteps
+            attn_scores_h = attn_scores_h + causal_mask.unsqueeze(0)  # Broadcast across batch dimension
             atten_ave_matrixh = torch.softmax(attn_scores_h, dim=-1)
 
             if self.attn_dropout_modules and self.attn_dropout_modules[i]:
