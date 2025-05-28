@@ -144,13 +144,13 @@ def create_sequences_multi_index(data_multi_index, features_list, target_list, l
     return np.array(all_X), np.array(all_y), all_indices
 
 class DailyGroupedTimeSeriesDataset(Dataset):
-    def __init__(self, X_sequences, y_targets, multi_index, device=None, pin_memory=False, preprocess_labels=True):
+    def __init__(self, X_sequences, y_targets, multi_index, device=None, pin_memory=False, preprocess_labels=False):
         """
         Dataset that groups data by unique dates from the multi_index.
-        Modified to keep tensors on CPU for multiprocessing compatibility.
+        Simplified to avoid shape mismatch issues with pre-processing.
         """
         print(f"[DailyGroupedTimeSeriesDataset] Initializing with X shape: {X_sequences.shape}, y shape: {y_targets.shape}, index length: {len(multi_index)}")
-        print(f"[DailyGroupedTimeSeriesDataset] Optimization settings: device={device}, pin_memory={pin_memory}, preprocess_labels={preprocess_labels}")
+        print(f"[DailyGroupedTimeSeriesDataset] Optimization settings: device={device}, pin_memory={pin_memory}")
         
         if not isinstance(multi_index, pd.MultiIndex):
             raise ValueError("multi_index must be a Pandas MultiIndex.")
@@ -158,9 +158,8 @@ class DailyGroupedTimeSeriesDataset(Dataset):
             raise ValueError("multi_index must have 'ticker' and 'date' as level names.")
 
         self.multi_index = multi_index
-        self.target_device = device  # Store target device but don't move tensors yet
+        self.target_device = device
         self.pin_memory = pin_memory
-        self.preprocess_labels = preprocess_labels
         
         self.unique_dates = sorted(self.multi_index.get_level_values('date').unique())
         self.data_by_date = {}
@@ -182,55 +181,10 @@ class DailyGroupedTimeSeriesDataset(Dataset):
                 X_tensor = X_tensor.pin_memory()
                 y_tensor = y_tensor.pin_memory()
             
-            day_data = {
+            self.data_by_date[date_val] = {
                 'X': X_tensor,
                 'y_original': y_tensor
             }
-            
-            # Pre-process labels if requested
-            if self.preprocess_labels and y_tensor.numel() > 0:
-                # Import drop_extreme and zscore functions
-                try:
-                    from base_model import drop_extreme, zscore
-                    
-                    # Pre-compute label processing for training efficiency
-                    if y_tensor.shape[0] >= 10:  # Same logic as training loop
-                        with torch.no_grad():
-                            y_tensor_for_processing = y_tensor.clone()
-                            if self.target_device is None:  # Move to device temporarily for processing
-                                y_tensor_for_processing = y_tensor_for_processing.cuda() if torch.cuda.is_available() else y_tensor_for_processing
-                            
-                            label_mask, y_dropped_extreme = drop_extreme(y_tensor_for_processing)
-                            
-                            # Fix shape issue: label_mask might be [N, 1] but we need [N] for indexing
-                            if label_mask.dim() > 1:
-                                label_mask = label_mask.squeeze(-1)
-                            
-                            y_processed = zscore(y_dropped_extreme)
-                            
-                            # Move back to original device/location
-                            if self.target_device is None and torch.cuda.is_available():
-                                label_mask = label_mask.cpu()
-                                y_processed = y_processed.cpu()
-                            
-                            day_data['label_mask'] = label_mask
-                            day_data['y_processed'] = y_processed
-                    else:
-                        # For small batches, use all samples (no drop_extreme)
-                        label_mask = torch.ones(y_tensor.shape[0], dtype=torch.bool, device=y_tensor.device)
-                        y_processed = zscore(y_tensor.clone())
-                        day_data['label_mask'] = label_mask  
-                        day_data['y_processed'] = y_processed
-                        
-                except ImportError:
-                    print("[DailyGroupedTimeSeriesDataset] Warning: Could not import drop_extreme/zscore, skipping label preprocessing")
-                    day_data['label_mask'] = None
-                    day_data['y_processed'] = None
-            else:
-                day_data['label_mask'] = None
-                day_data['y_processed'] = None
-            
-            self.data_by_date[date_val] = day_data
             
         print(f"[DailyGroupedTimeSeriesDataset] Tensor pre-conversion completed for {len(self.unique_dates)} unique dates.")
 
@@ -246,19 +200,10 @@ class DailyGroupedTimeSeriesDataset(Dataset):
         selected_date = self.unique_dates[idx]
         day_data = self.data_by_date[selected_date]
         
-        # Data is already converted to tensors and potentially on GPU
-        features_tensor = day_data['X']
-        labels_tensor = day_data['y_original']
-        
-        # Return pre-processed labels if available
-        processed_data = {
-            'X': features_tensor,
-            'y_original': labels_tensor,
-            'label_mask': day_data.get('label_mask'),
-            'y_processed': day_data.get('y_processed')
+        return {
+            'X': day_data['X'],
+            'y_original': day_data['y_original']
         }
-        
-        return processed_data
 
     def get_index(self):
         """Returns the original multi_index, useful for aligning predictions."""
@@ -958,16 +903,16 @@ def main():
     valid_idx_multiindex = convert_to_multiindex(valid_idx) if valid_idx else pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
     test_idx_multiindex = convert_to_multiindex(test_idx) if test_idx else pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
 
-    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx_multiindex, device, False, True)
+    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx_multiindex, device, False, False)
     valid_dataset = None
     if X_valid is not None and X_valid.shape[0] > 0:
-        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx_multiindex, device, False, True)
+        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx_multiindex, device, False, False)
     else:
         logger.warning("No validation data. Early stopping and LR scheduling on validation loss will not be active.")
     
     test_dataset = None
     if X_test is not None and X_test.shape[0] > 0:
-        test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx_multiindex, device, False, True)
+        test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx_multiindex, device, False, False)
 
     logger.info(f"Train samples: {len(X_train)}, Valid samples: {len(X_valid) if X_valid is not None else 0}, Test samples: {len(X_test) if X_test is not None else 0}")
     logger.info(f"Train unique days: {len(train_dataset)}, Valid unique days: {len(valid_dataset) if valid_dataset else 0}, Test unique days: {len(test_dataset) if test_dataset else 0}")
@@ -1004,6 +949,16 @@ def main():
 
     logger.info("Starting training loop with paper's label processing...")
     
+    # Add before training loop
+    torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/profiler'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    )
+    
     # Create DataLoaders with custom collate function for variable batch sizes
     train_loader = DataLoader(
         train_dataset, 
@@ -1036,7 +991,7 @@ def main():
         pytorch_model.train()
         processed_batches_train = 0
         
-        # --- OPTIMIZED TRAINING LOOP ---
+        # --- OPTIMIZED TRAINING LOOP (Fixed batch processing) ---
         for batch_idx, batch_data in enumerate(train_loader):
             optimizer.zero_grad()
             
@@ -1045,36 +1000,66 @@ def main():
             y_batch_original = batch_data['y_original'].to(device, non_blocking=True)
             attention_masks = batch_data['attention_mask'].to(device, non_blocking=True)
             
-            # Pre-processed labels (already handled in dataset)
-            label_mask_batch = batch_data['label_mask'].to(device, non_blocking=True)
-            y_processed_batch = batch_data['y_processed'].to(device, non_blocking=True)
-            
             # Reshape for batch processing: [batch_size * max_stocks, seq_len, features]
             batch_size, max_stocks, seq_len, features = X_batch.shape
             X_reshaped = X_batch.view(-1, seq_len, features)
             
-            # Create combined mask for valid stocks across all days
-            combined_mask = attention_masks.view(-1)  # [batch_size * max_stocks]
-            combined_label_mask = label_mask_batch.view(-1)  # [batch_size * max_stocks]
+            # Reshape y and masks
+            y_reshaped = y_batch_original.view(-1)  # [batch_size * max_stocks]
+            if y_reshaped.dim() > 1 and y_reshaped.shape[-1] == 1:
+                y_reshaped = y_reshaped.squeeze(-1)
             
-            # Filter to only real, valid stocks
-            final_mask = combined_mask & combined_label_mask
-            X_final = X_reshaped[final_mask]  # [num_valid_stocks, seq_len, features]
-            y_final = y_processed_batch.view(-1)[final_mask]  # [num_valid_stocks]
+            attention_mask_flat = attention_masks.view(-1)  # [batch_size * max_stocks]
             
-            if X_final.shape[0] == 0:
+            # Filter to only real stocks (not padding)
+            real_stock_mask = attention_mask_flat
+            X_real = X_reshaped[real_stock_mask]  # [num_real_stocks, seq_len, features]
+            y_real = y_reshaped[real_stock_mask]  # [num_real_stocks]
+            
+            if X_real.shape[0] == 0:
                 continue
             
+            # Apply label processing to the entire batch of real stocks
+            if y_real.shape[0] >= 10:  # Use drop_extreme for larger groups
+                try:
+                    label_mask, y_dropped_extreme = drop_extreme(y_real)
+                    if label_mask.dim() > 1:
+                        label_mask = label_mask.squeeze(-1)
+                    y_processed = zscore(y_dropped_extreme)
+                    
+                    # Apply the label mask to features and targets
+                    X_final = X_real[label_mask]
+                    y_final = y_processed
+                except Exception as e:
+                    # Fallback to zscore only if drop_extreme fails
+                    logger.warning(f"drop_extreme failed: {e}, using zscore only")
+                    X_final = X_real
+                    y_final = zscore(y_real.clone())
+            else:
+                # For smaller groups, use all stocks
+                X_final = X_real
+                y_final = zscore(y_real.clone())
+            
+            if X_final.shape[0] == 0:
+                continue  # Skip if no valid stocks after filtering
+            
+            # Single forward pass for the entire batch
             with autocast():
                 preds = pytorch_model(X_final).squeeze()
+                if preds.dim() == 0:  # Handle single prediction
+                    preds = preds.unsqueeze(0)
+                if y_final.dim() == 0:  # Handle single target
+                    y_final = y_final.unsqueeze(0)
+                
                 loss = criterion(preds, y_final)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
-            epoch_train_loss += loss.item()
-            processed_batches_train += 1
+            if not (torch.isnan(loss) or torch.isinf(loss)):
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
+                epoch_train_loss += loss.item()
+                processed_batches_train += 1
 
         avg_epoch_train_loss = epoch_train_loss / processed_batches_train if processed_batches_train > 0 else 0
         logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_epoch_train_loss:.6f}")
@@ -1250,8 +1235,6 @@ def custom_collate_fn(batch):
     padded_X = []
     padded_y_original = []
     attention_masks = []
-    label_masks = []
-    y_processed_list = []
     
     for item in batch:
         X = item['X']  # Shape: [num_stocks, seq_len, features]
@@ -1280,41 +1263,6 @@ def custom_collate_fn(batch):
         padded_X.append(X_padded)
         padded_y_original.append(y_padded)
         attention_masks.append(attention_mask)
-        
-        # Handle pre-processed labels if available
-        if 'label_mask' in item and item['label_mask'] is not None:
-            label_mask = item['label_mask']
-            y_processed = item['y_processed']
-            
-            # Pad label_mask and y_processed
-            if num_stocks < max_stocks:
-                pad_size = max_stocks - num_stocks
-                
-                # Pad label_mask (boolean tensor)
-                label_mask_pad = torch.zeros(pad_size, dtype=torch.bool)
-                label_mask_padded = torch.cat([label_mask, label_mask_pad], dim=0)
-                
-                # Pad y_processed: check if it's 1D or 2D and pad accordingly
-                if y_processed.dim() == 1:
-                    y_processed_pad = torch.zeros(pad_size, dtype=y_processed.dtype)
-                    y_processed_padded = torch.cat([y_processed, y_processed_pad], dim=0)
-                elif y_processed.dim() == 2:
-                    y_processed_pad = torch.zeros(pad_size, y_processed.shape[1], dtype=y_processed.dtype)
-                    y_processed_padded = torch.cat([y_processed, y_processed_pad], dim=0)
-                else:
-                    # Handle unexpected dimensions
-                    y_processed_pad = torch.zeros(pad_size, dtype=y_processed.dtype)
-                    y_processed_padded = torch.cat([y_processed.flatten()[:num_stocks], y_processed_pad], dim=0)
-            else:
-                label_mask_padded = label_mask
-                y_processed_padded = y_processed
-                
-            label_masks.append(label_mask_padded)
-            y_processed_list.append(y_processed_padded)
-        else:
-            # Create placeholder tensors with correct shape
-            label_masks.append(torch.zeros(max_stocks, dtype=torch.bool))
-            y_processed_list.append(torch.zeros(max_stocks, dtype=torch.float32))
     
     # Stack all tensors
     result = {
@@ -1322,10 +1270,6 @@ def custom_collate_fn(batch):
         'y_original': torch.stack(padded_y_original, dim=0),  # [batch_size, max_stocks, 1]
         'attention_mask': torch.stack(attention_masks, dim=0),  # [batch_size, max_stocks]
     }
-    
-    # Add processed labels - always include them now (even if some are placeholder)
-    result['label_mask'] = torch.stack(label_masks, dim=0)  # [batch_size, max_stocks]
-    result['y_processed'] = torch.stack(y_processed_list, dim=0)  # [batch_size, max_stocks]
     
     return result
 
