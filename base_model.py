@@ -111,6 +111,51 @@ class DaySampler(Sampler):
         return self.num_days
 
 
+class MultiDayBatchSampler(Sampler):
+    def __init__(self, data_source, days_per_batch=4, shuffle=False):
+        self.data_source = data_source
+        self.days_per_batch = days_per_batch
+        self.shuffle = shuffle
+        self.num_days = len(data_source)
+        
+    def __iter__(self):
+        indices = np.arange(self.num_days)
+        if self.shuffle:
+            np.random.shuffle(indices)
+        
+        # Group days into batches
+        for i in range(0, len(indices), self.days_per_batch):
+            yield indices[i:i + self.days_per_batch]
+    
+    def __len__(self):
+        return (self.num_days + self.days_per_batch - 1) // self.days_per_batch
+
+
+class TemporallyAwareBatchSampler(Sampler):
+    def __init__(self, data_source, days_per_batch=4, shuffle=False):
+        self.data_source = data_source
+        self.days_per_batch = days_per_batch
+        self.shuffle = shuffle
+        self.num_days = len(data_source)
+        
+    def __iter__(self):
+        # Create consecutive day groups to maintain temporal order
+        batch_starts = list(range(0, self.num_days, self.days_per_batch))
+        
+        if self.shuffle:
+            # Shuffle the starting points of batches, not individual days
+            np.random.shuffle(batch_starts)
+        
+        for start_idx in batch_starts:
+            end_idx = min(start_idx + self.days_per_batch, self.num_days)
+            # Yield consecutive day indices to maintain temporal order within batch
+            consecutive_indices = list(range(start_idx, end_idx))
+            yield consecutive_indices
+    
+    def __len__(self):
+        return (self.num_days + self.days_per_batch - 1) // self.days_per_batch
+
+
 class SequenceModel():
     """
     Base class for sequence models.
@@ -119,7 +164,8 @@ class SequenceModel():
     def __init__(self, n_epochs=100, lr=0.001, GPU=None, seed=None, 
                  train_stop_loss_thred=None, save_path="model/", save_prefix="model",
                  metric="loss", early_stop=20, patience=10, decay_rate=0.9, min_lr=1e-05,
-                 max_iters_epoch=None, train_noise=0.0, validation_freq=1, use_amp=True):  # Add mixed precision flag
+                 max_iters_epoch=None, train_noise=0.0, validation_freq=1, use_amp=True,
+                 accumulation_steps=4):  # Add gradient accumulation
         """
         Initialize the SequenceModel.
 
@@ -140,6 +186,7 @@ class SequenceModel():
         - train_noise (float): Standard deviation of Gaussian noise to add to inputs during training.
         - validation_freq (int): Frequency of validation (in epochs).
         - use_amp (bool): Whether to use mixed precision training.
+        - accumulation_steps (int): Number of steps to accumulate gradients before updating optimizer.
         """
         self.n_epochs = n_epochs
         self.lr = lr
@@ -160,6 +207,7 @@ class SequenceModel():
         self.use_amp = use_amp and torch.cuda.is_available()
         if self.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
+        self.accumulation_steps = accumulation_steps
 
         self.model = None  # This will be set by subclasses (e.g., GRU, LSTM specific models)
         self.optimizer = None
@@ -202,35 +250,68 @@ class SequenceModel():
     def train_epoch(self, data_loader):
         self.model.train()
         losses = []
+        accumulated_loss = 0.0
 
-        for data in data_loader:
+        # Process one day at a time (no lookahead bias) but accumulate gradients
+        for i, data in enumerate(data_loader):
             feature_data = data[0].to(self.device, non_blocking=True)
             label_data = data[1].to(self.device, non_blocking=True)
 
+            # Add noise for regularization if specified
+            if self.train_noise > 0:
+                noise = torch.randn_like(feature_data) * self.train_noise
+                feature_data = feature_data + noise
+
+            # Standard preprocessing (maintains temporal integrity per day)
             mask, current_labels_processed = drop_extreme(label_data)
             current_features_processed = feature_data[mask, :, :]
             current_labels_processed = zscore(current_labels_processed)
-
-            self.optimizer.zero_grad()
 
             if self.use_amp:
                 with torch.cuda.amp.autocast():
                     pred = self.model(current_features_processed.float())
                     loss = self.loss_fn(pred, current_labels_processed)
+                    # Scale loss by accumulation steps for proper gradient averaging
+                    loss = loss / self.accumulation_steps
                 
                 self.scaler.scale(loss).backward()
+                accumulated_loss += loss.item()
+            else:
+                pred = self.model(current_features_processed.float())
+                loss = self.loss_fn(pred, current_labels_processed)
+                loss = loss / self.accumulation_steps
+                loss.backward()
+                accumulated_loss += loss.item()
+
+            # Update optimizer every accumulation_steps (no temporal mixing)
+            if (i + 1) % self.accumulation_steps == 0:
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
+                    self.optimizer.step()
+                
+                self.optimizer.zero_grad()
+                losses.append(accumulated_loss)
+                accumulated_loss = 0.0
+
+        # Handle any remaining accumulated gradients
+        if len(data_loader) % self.accumulation_steps != 0:
+            if self.use_amp:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                pred = self.model(current_features_processed.float())
-                loss = self.loss_fn(pred, current_labels_processed)
-                loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
                 self.optimizer.step()
-
-            losses.append(loss.item())
+            
+            self.optimizer.zero_grad()
+            if accumulated_loss > 0:
+                losses.append(accumulated_loss)
 
         return float(np.mean(losses))
 
@@ -259,21 +340,21 @@ class SequenceModel():
 
         return float(np.mean(losses))
 
-    def _init_data_loader(self, data, shuffle=True, drop_last=True):
-        # Remove excessive print statements for production
+    def _init_data_loader(self, data, shuffle=True, drop_last=True, days_per_batch=1):
+        # Default to single-day processing (bias-free) with gradient accumulation for efficiency
         if data is None or len(data) == 0:
             raise ValueError("Input data for DataLoader cannot be None or empty.")
 
         day_sampler = DaySampler(data, shuffle)
 
-        def custom_collate(batch_data_tuple):
+        def safe_collate(batch_data_tuple):
             if isinstance(batch_data_tuple, tuple) and len(batch_data_tuple) == 2:
                 features, labels = batch_data_tuple
                 return (features, labels)
             else:
                 raise ValueError(f"Unexpected batch_data_tuple structure: {type(batch_data_tuple)}")
 
-        data_loader = DataLoader(data, sampler=day_sampler, batch_size=None, collate_fn=custom_collate)
+        data_loader = DataLoader(data, sampler=day_sampler, batch_size=None, collate_fn=safe_collate)
         return data_loader
 
     def load_param(self, param_path):
@@ -282,6 +363,12 @@ class SequenceModel():
 
     def fit(self, dl_train, dl_valid=None):
         print(f"[SequenceModel] Starting fit method. n_epochs: {self.n_epochs}")
+        
+        # Monitor GPU usage
+        if torch.cuda.is_available():
+            print(f"GPU Memory before training: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+            print(f"GPU Memory cached: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+        
         if dl_train is None or len(dl_train) == 0 :
             print("[SequenceModel] ERROR: Training data (dl_train) is None or empty in fit method. Cannot proceed.")
             return
@@ -424,6 +511,12 @@ class SequenceModel():
                     torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}_best.pkl')
                     logger.info(f"Model saved to {self.save_path}/{self.save_prefix}_{self.seed}_best.pkl based on train_stop_loss_thred.")
                 break
+
+            # Monitor GPU usage during training
+            if torch.cuda.is_available() and step % 10 == 0:
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"Epoch {step}: GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
         
         if not (epochs_no_improve >= self.early_stop): # If not early stopped
             if best_param is None and self.n_epochs > 0 : 
