@@ -15,10 +15,10 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt # Added for plotting
+from torch.optim.lr_scheduler import ReduceLROnPlateau # For LR scheduling
 
 from master import MASTERModel
 from base_model import SequenceModel, DailyBatchSamplerRandom, calc_ic, zscore, drop_extreme # Add other necessary imports from base_model
-from master import MASTER # Ensure this import is correct
 
 # Setup basic logging
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
@@ -36,6 +36,41 @@ VALIDATION_SPLIT_DATE = '2018-01-01' # Date for train/val split
 # Ensure Numba and other warnings are handled if necessary
 warnings.filterwarnings('ignore', category=FutureWarning)
 # warnings.filterwarnings('ignore', category=NumbaPerformanceWarning) # If using Numba and it's noisy
+
+# --- Helper class for Early Stopping (can be adapted from your previous base_model.py or kept simple) ---
+class EarlyStopping:
+    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt', trace_func=print):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.inf
+        self.delta = delta
+        self.path = path
+        self.trace_func = trace_func
+
+    def __call__(self, val_loss, model_to_save):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model_to_save)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model_to_save)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model_to_save):
+        if self.verbose:
+            self.trace_func(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model to {self.path} ...')
+        torch.save(model_to_save.state_dict(), self.path) # Save only the underlying nn.Module's state_dict
+        self.val_loss_min = val_loss
 
 def get_relevant_weighted_log_returns(df, date_column='date', ticker_column='ticker', price_column='adj_close', volume_column='volume', lag=1, weight_ewm_span=20):
     # ... existing code ...
@@ -244,209 +279,190 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
 
 def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, 
                           train_val_split_date_str, val_test_split_date_str):
-    print(f"[main_multi_index.py] Starting load_and_prepare_data from: {csv_path}") # DIAGNOSTIC PRINT
+    print(f"[main_multi_index.py] Starting load_and_prepare_data from: {csv_path}")
     try:
         df = pd.read_csv(csv_path)
         print(f"[main_multi_index.py] CSV loaded. Shape: {df.shape}. Columns: {df.columns.tolist()}")
     except FileNotFoundError:
         print(f"[main_multi_index.py] ERROR: CSV file not found at {csv_path}")
-        return None, None, None, None, None, None, None, None, None, None # Added scaler
+        return (None,) * 11 # Adjusted for new return values
     except Exception as e:
         print(f"[main_multi_index.py] ERROR: Could not read CSV: {e}")
-        return None, None, None, None, None, None, None, None, None, None # Added scaler
+        return (None,) * 11
 
     if 'ticker' not in df.columns or 'date' not in df.columns:
         print("[main_multi_index.py] ERROR: 'ticker' or 'date' column missing from CSV.")
-        return None, None, None, None, None, None, None, None, None, None # Added scaler
+        return (None,) * 11
         
-    # Convert date column to datetime objects
     try:
-        # Attempt to infer format first, then specify if errors or for consistency
         df['date'] = pd.to_datetime(df['date']) 
     except ValueError:
         try:
-            # Fallback if direct conversion fails, try inferring (slower)
             print("[main_multi_index.py] Initial pd.to_datetime failed, trying with infer_datetime_format=True")
             df['date'] = pd.to_datetime(df['date'], infer_datetime_format=True)
         except Exception as e_infer:
             print(f"[main_multi_index.py] ERROR: Could not parse 'date' column: {e_infer}")
-            return None, None, None, None, None, None, None, None, None, None
-    except Exception as e_other: # Catch any other pd.to_datetime errors
+            return (None,) * 11
+    except Exception as e_other:
             print(f"[main_multi_index.py] ERROR: pd.to_datetime failed with: {e_other}")
-            return None, None, None, None, None, None, None, None, None, None
-
+            return (None,) * 11
 
     df.set_index(['ticker', 'date'], inplace=True)
     df.sort_index(inplace=True)
     print(f"[main_multi_index.py] Data indexed by ticker and date. Shape: {df.shape}")
 
-    # Define features and label
+    # --- Calculate and Add Market Volatility Feature ---
+    market_feature_col_name = 'MRKT_AVG_CLOSEADJ_VOL20D'
+    if 'closeadj' in df.columns:
+        logger.info("Calculating market volatility feature based on 'closeadj'.")
+        # Calculate daily average 'closeadj'
+        daily_avg_closeadj = df.groupby(level='date')['closeadj'].mean()
+        # Calculate 20-day rolling std of these daily averages
+        market_volatility = daily_avg_closeadj.rolling(window=20, min_periods=1).std()
+        # Fill NaNs that can occur at the beginning/end of the rolling calculation
+        market_volatility = market_volatility.ffill().bfill() 
+        
+        # Join this market feature back to the main df
+        df = df.join(market_volatility.rename(market_feature_col_name), on='date')
+        logger.info(f"Added '{market_feature_col_name}' to DataFrame. Example values: {df[market_feature_col_name].head()}")
+        # Handle cases where some dates in df might not have had market_volatility (e.g., if df had dates outside daily_avg_closeadj range)
+        # This should be minimal if daily_avg_closeadj covers all df dates.
+        # The per-ticker ffill in preprocess_data will handle remaining NaNs for this new column.
+        if df[market_feature_col_name].isnull().any():
+            logger.warning(f"'{market_feature_col_name}' contains NaNs after join. These will be handled by per-ticker ffill later.")
+    else:
+        logger.error("'closeadj' column not found. Cannot calculate market volatility feature for the Gate. Exiting.")
+        return (None,) * 11
+    # --- End of Market Feature Calculation ---
+
     if 'label' not in df.columns:
-        print("[main_multi_index.py] 'label' column not found. Attempting to generate based on future returns.")
-        # Try 'closeadj' first, then 'adj_close', then 'close' as fallback for label generation
         label_source_col = None
-        if 'closeadj' in df.columns:
-            label_source_col = 'closeadj'
-        elif 'adj_close' in df.columns: # Keep for backward compatibility or other datasets
-            label_source_col = 'adj_close'
+        if 'closeadj' in df.columns: label_source_col = 'closeadj' # Primary source for label too
+        elif 'adj_close' in df.columns: label_source_col = 'adj_close'
         elif 'close' in df.columns:
             label_source_col = 'close'
-            print(f"[main_multi_index.py] WARNING: Using 'close' column to generate label as 'closeadj' or 'adj_close' not found.")
+            print(f"[main_multi_index.py] WARNING: Using 'close' for label generation as 'closeadj' not found.")
         
         if label_source_col:
-            print(f"[main_multi_index.py] Generating 'label' as next day's pct_change of '{label_source_col}'.")
-            # Ensure label generation is done per ticker to avoid leakage across tickers at boundaries
+            print(f"[main_multi_index.py] Generating 'label' from '{label_source_col}'.")
             df['label'] = df.groupby(level='ticker')[label_source_col].pct_change(1).shift(-1)
-            # It's important to drop NaNs from labels. This might remove the last day for each ticker.
-            # This dropna should happen before feature processing that might depend on alignment.
             df.dropna(subset=['label'], inplace=True) 
-            print(f"[main_multi_index.py] Dropped rows where new label is NaN. Shape after label generation: {df.shape}")
+            print(f"[main_multi_index.py] Shape after label generation: {df.shape}")
         else:
-            print("[main_multi_index.py] ERROR: 'label' column missing and suitable price column ('closeadj', 'adj_close', 'close') not available to generate it.")
-            return None, None, None, None, None, None, None, None, None, None
+            print("[main_multi_index.py] ERROR: 'label' column missing and no suitable price column ('closeadj', 'adj_close', 'close') found.")
+            return (None,) * 11
     
     label_column = 'label'
-    
-    # Identify potential feature columns: all columns that are numeric and not the label.
-    # Exclude known non-feature string columns explicitly if necessary.
+    # Now, potential_feature_cols will include our new market_feature_col_name if it's numeric
     potential_feature_cols = df.select_dtypes(include=np.number).columns.tolist()
-    
-    # Remove the label column from this list if it's present (it should be, as it's numeric)
     if label_column in potential_feature_cols:
         potential_feature_cols.remove(label_column)
     
+    # Ensure our market feature is in the list if it was added and is numeric
+    if market_feature_col_name not in potential_feature_cols and market_feature_col_name in df.columns and pd.api.types.is_numeric_dtype(df[market_feature_col_name]):
+        # This case should ideally not happen if it was added correctly and is numeric.
+        # But as a safeguard, add it if it was missed by select_dtypes for some reason.
+        potential_feature_cols.append(market_feature_col_name)
+    elif market_feature_col_name not in df.columns:
+         logger.error(f"Market feature '{market_feature_col_name}' was unexpectedly not found in DataFrame columns before creating feature_columns list.")
+         return (None,)*11
+
+
     feature_columns = potential_feature_cols
-
-    # If there are other known non-numeric columns that might have slipped through 
-    # (e.g., if they were accidentally converted to object type but should be numeric, or vice-versa),
-    # they should be handled (e.g. dropped or converted) before this step.
-    # Example: df.drop(columns=['any_other_string_column_not_for_features'], inplace=True, errors='ignore')
-
-    print(f"[main_multi_index.py] Initial feature columns identified: {feature_columns[:5] if len(feature_columns) > 5 else feature_columns}... (Total: {len(feature_columns)})")
-
-    # === Global NaN/Inf Column Pruning Step ===
-    if feature_columns: 
-        logger.info("Starting global NaN/Inf column pruning...")
-        # Replace Inf with NaN globally in feature columns for accurate NaN count for pruning
-        df.loc[:, feature_columns] = df[feature_columns].replace([np.inf, -np.inf], np.nan)
-
-        columns_to_drop_globally = []
-        for col in feature_columns:
-            if col in df.columns: # Should always be true at this point
-                nan_percentage = df[col].isnull().sum() / len(df)
-                if nan_percentage > 0.3:
-                    columns_to_drop_globally.append(col)
-                    logger.info(f"Globally identified column '{col}' for removal due to {nan_percentage*100:.2f}% NaN values (threshold 30%).")
-            # This else case should ideally not be hit if feature_columns are derived from df.columns
-            # else: 
-            #     logger.warning(f"Column '{col}' from feature_columns list not found in DataFrame during global pruning. Skipping.")
-
-        if columns_to_drop_globally:
-            df.drop(columns=columns_to_drop_globally, inplace=True)
-            # Update feature_columns list
-            feature_columns = [col for col in feature_columns if col not in columns_to_drop_globally]
-            logger.info(f"Globally dropped {len(columns_to_drop_globally)} columns: {columns_to_drop_globally}.")
-            logger.info(f"Remaining features after pruning: {len(feature_columns)}")
-            if not feature_columns: # If all feature columns were dropped
-                 logger.error("All feature columns were dropped due to high NaN content. No features remaining.")
-                 print("[main_multi_index.py] ERROR: No feature columns remaining after global NaN threshold drop. Cannot proceed.")
-                 return None, None, None, None, None, None, None, None, None, None 
-        else:
-            logger.info("No columns exceeded the 30% NaN threshold globally for pruning.")
-    else: # No initial feature columns identified
-        print("[main_multi_index.py] No numeric feature columns were identified initially. Skipping pruning.")
-        logger.warning("No numeric feature columns identified initially. Cannot proceed with feature processing.")
-        # If feature_columns is empty from the start, the previous error check for it should catch this.
-        # This path (else of `if feature_columns:`) might be redundant if the earlier check is robust.
-        # For safety, if we reach here and feature_columns is empty, it's an error.
-        if not feature_columns: # Double check, as the outer if implies it was empty
-             print("[main_multi_index.py] ERROR: No feature columns identified. Cannot proceed.")
-             return None, None, None, None, None, None, None, None, None, None
+    print(f"[main_multi_index.py] Initial feature columns identified (Total: {len(feature_columns)}). Includes market feature: {market_feature_col_name in feature_columns}")
 
 
-    if not feature_columns: # Final check after pruning
-        print("[main_multi_index.py] ERROR: No numeric feature columns identified or remaining after filtering.")
-        return None, None, None, None, None, None, None, None, None, None
-    print(f"[main_multi_index.py] Identified Label: '{label_column}'. Features after pruning: {feature_columns[:5] if len(feature_columns) > 5 else feature_columns}... (Total: {len(feature_columns)})")
+    train_val_split_dt = pd.to_datetime(train_val_split_date_str)
+    val_test_split_dt  = pd.to_datetime(val_test_split_date_str)
+    PURGE_WINDOW       = lookback - 1
 
+    train_end_excl  = train_val_split_dt - pd.Timedelta(days=PURGE_WINDOW)
+    valid_end_excl  = val_test_split_dt  - pd.Timedelta(days=PURGE_WINDOW)
 
-    # First, create sequences without scaling to properly split the data
-    # df.copy() is important here as preprocess_data modifies df inplace (e.g. label dropna)
-    # feature_columns is now the pruned list.
-    X_raw, y_raw, seq_idx, _ = preprocess_data(df.copy(), feature_columns, label_column, lookback, 
-                                                scaler=None, fit_scaler=False)
-    
-    if X_raw is None or X_raw.shape[0] == 0:
-        print("[main_multi_index.py] ERROR: Preprocessing returned no data.")
-        return None, None, None, None, None, None, None, None, None, None
+    mask_dates = df.index.get_level_values('date')
+    train_df  = df[mask_dates < train_end_excl].copy()
+    valid_df  = df[(mask_dates >= train_val_split_dt) & (mask_dates <  valid_end_excl)].copy()
+    test_df   = df[mask_dates >= val_test_split_dt].copy()
 
-    # Split data first
-    dates_for_splitting = seq_idx.get_level_values('date')
-    train_val_split_datetime = pd.to_datetime(train_val_split_date_str)
-    val_test_split_datetime = pd.to_datetime(val_test_split_date_str)
+    def _drop_nan_cols(slice_df: pd.DataFrame, cols: list, threshold: float = 0.30):
+        nan_share = slice_df[cols].replace([np.inf, -np.inf], np.nan).isna().sum() / len(slice_df)
+        cols_to_drop = nan_share[nan_share > threshold].index.tolist()
+        keep_cols    = [c for c in cols if c not in cols_to_drop]
+        return keep_cols, cols_to_drop
 
-    train_mask = dates_for_splitting < train_val_split_datetime
-    valid_mask = (dates_for_splitting >= train_val_split_datetime) & \
-                 (dates_for_splitting < val_test_split_datetime)
-    test_mask = dates_for_splitting >= val_test_split_datetime
+    feature_columns, dropped_cols = _drop_nan_cols(train_df, feature_columns)
 
-    # Now fit scaler only on training data
-    train_df = df[df.index.get_level_values('date') < train_val_split_datetime].copy()
-    valid_df = df[(df.index.get_level_values('date') >= train_val_split_datetime) & 
-                  (df.index.get_level_values('date') < val_test_split_datetime)].copy()
-    test_df = df[df.index.get_level_values('date') >= val_test_split_datetime].copy()
+    if dropped_cols:
+        logger.info(f"Dropping {len(dropped_cols)} cols (>30% NaNs) based on TRAIN slice: {dropped_cols}")
+        train_df.drop(columns=dropped_cols, inplace=True, errors='ignore')
+        valid_df.drop(columns=dropped_cols, inplace=True, errors='ignore')
+        test_df.drop(columns=dropped_cols,  inplace=True, errors='ignore')
 
-    # Process each split with appropriate scaler usage
-    X_train, y_train, train_idx, scaler = preprocess_data(train_df, feature_columns, label_column, 
-                                                          lookback, scaler=None, fit_scaler=True)
-    
-    X_valid, y_valid, valid_idx, _ = preprocess_data(valid_df, feature_columns, label_column, 
-                                                     lookback, scaler=scaler, fit_scaler=False) if not valid_df.empty else (None, None, None, None)
-    
-    X_test, y_test, test_idx, _ = preprocess_data(test_df, feature_columns, label_column, 
-                                                  lookback, scaler=scaler, fit_scaler=False) if not test_df.empty else (None, None, None, None)
+    if not feature_columns:
+        logger.error("All numeric feature candidates were dropped – aborting.")
+        return (None,) * 11
 
-    print(f"[main_multi_index.py] Data split. ") # DIAGNOSTIC PRINT
-    print(f"  Train: X{X_train.shape}, y{y_train.shape}, Idx{len(train_idx) if train_idx is not None else 0}")
-    print(f"  Valid: X{X_valid.shape}, y{y_valid.shape}, Idx{len(valid_idx) if valid_idx is not None else 0}")
-    print(f"  Test:  X{X_test.shape}, y{y_test.shape}, Idx{len(test_idx) if test_idx is not None else 0}")
-    
-    if X_train.shape[0] == 0 :
-        print("[main_multi_index.py] WARNING: Training set is empty after split. Check split dates and data range.")
-    if X_valid.shape[0] == 0 :
-        print("[main_multi_index.py] WARNING: Validation set is empty after split. No validation will be performed during training.")
-    if X_test.shape[0] == 0 :
-        print("[main_multi_index.py] WARNING: Test set is empty after split. No final test evaluation will be performed.")
-        # Decide if this is an error or acceptable
+    # --- Automatic Gate Index Determination (using the single calculated market feature) ---
+    gate_input_start_index = None
+    gate_input_end_index = None
+
+    try:
+        # The market_feature_col_name should be in the finalized feature_columns list.
+        # If it was dropped by _drop_nan_cols, this will raise ValueError.
+        gate_idx = feature_columns.index(market_feature_col_name)
+        gate_input_start_index = gate_idx
+        gate_input_end_index = gate_idx + 1 # Slice of length 1
+        logger.info(f"Successfully set Gate to use internally calculated market feature: '{market_feature_col_name}'. "
+                    f"Index in final feature list: {gate_idx}. Gate slice: [{gate_input_start_index}:{gate_input_end_index}]")
+    except ValueError:
+        logger.error(f"The internally calculated market feature '{market_feature_col_name}' was NOT FOUND in the final list of feature columns "
+                       f"(it might have been dropped due to excessive NaNs on train split). Cannot configure Gate. Exiting.")
+        return (None,) * 11
+    # --- End of Gate Index Detection ---
+
+    X_train, y_train, train_idx, scaler = preprocess_data(
+        train_df, feature_columns, label_column, lookback, scaler=None, fit_scaler=True
+    )
+    X_valid, y_valid, valid_idx, _ = preprocess_data(
+        valid_df, feature_columns, label_column, lookback, scaler=scaler, fit_scaler=False
+    ) if not valid_df.empty else (None, None, None, None)
+    X_test, y_test, test_idx, _ = preprocess_data(
+        test_df, feature_columns, label_column, lookback, scaler=scaler, fit_scaler=False
+    ) if not test_df.empty else (None, None, None, None)
+
+    logger.info(f"Data split summary → Train:{0 if X_train is None else X_train.shape[0]} "
+                f"| Valid:{0 if X_valid is None else X_valid.shape[0]} "
+                f"| Test:{0 if X_test  is None else X_test.shape[0]}")
 
     return X_train, y_train, train_idx, \
            X_valid, y_valid, valid_idx, \
-           X_test, y_test, test_idx, scaler
+           X_test, y_test, test_idx, scaler, \
+           gate_input_start_index, gate_input_end_index
 
 
 def parse_args():
-    print("[main_multi_index.py] Parsing arguments.") # DIAGNOSTIC PRINT
+    print("[main_multi_index.py] Parsing arguments.")
     parser = argparse.ArgumentParser(description="Train MASTER model on multi-index stock data.")
     parser.add_argument('--csv', type=str, required=True, help="Path to the input CSV file.")
     parser.add_argument('--epochs', type=int, default=50, help="Number of training epochs.")
     parser.add_argument('--lr', type=float, default=0.001, help="Learning rate.")
-    parser.add_argument('--d_feat', type=int, default=None, help="Dimension of features (if None, inferred from data).") # d_feat is num_features
-    parser.add_argument('--hidden_size', type=int, default=64, help="Hidden size of LSTM.")
-    parser.add_argument('--num_layers', type=int, default=2, help="Number of LSTM layers.")
-    parser.add_argument('--dropout', type=float, default=0.5, help="Dropout rate.")
-    parser.add_argument('--n_epochs_gru', type=int, default=10, help="Number of epochs for GRU base model.")
-    parser.add_argument('--lr_gru', type=float, default=0.002, help="Learning rate for GRU base model.")
-    parser.add_argument('--gpu', type=int, default=None, help="GPU ID to use (e.g., 0, 1). None for CPU.")
+    parser.add_argument('--d_feat', type=int, default=None, help="Dimension of features (if None, inferred).")
+    parser.add_argument('--dropout', type=float, default=0.5, help="Dropout rate for MASTERModel attention.")
+    
+    parser.add_argument('--d_model', type=int, default=256, help="Dimension of the model (Transformer).")
+    parser.add_argument('--t_nhead', type=int, default=4, help="Heads for Temporal Attention.")
+    parser.add_argument('--s_nhead', type=int, default=2, help="Heads for Cross-sectional Attention.")
+    parser.add_argument('--beta', type=float, default=5.0, help="Beta for Gate mechanism or RegRankLoss.")
+    
+    parser.add_argument('--gpu', type=int, default=None, help="GPU ID (e.g., 0). None for CPU.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed.")
-    parser.add_argument('--lookback', type=int, default=LOOKBACK_WINDOW, help="Lookback window for sequences.")
-    parser.add_argument('--train_val_split_date', type=str, default=VALIDATION_SPLIT_DATE, help="Date to split train into train/validation (YYYY-MM-DD).")
-    parser.add_argument('--val_test_split_date', type=str, default=TRAIN_TEST_SPLIT_DATE, help="Date to split validation and test data (YYYY-MM-DD).")
-    parser.add_argument('--save_path', type=str, default='model_output/', help="Path to save trained models and results.")
-    parser.add_argument('--model_type', type=str, default='GRU', choices=['GRU', 'LSTM', 'ALSTM'], help="Type of base model for SequenceModel.")
-
-
+    parser.add_argument('--lookback', type=int, default=LOOKBACK_WINDOW, help="Lookback window.")
+    parser.add_argument('--train_val_split_date', type=str, default=VALIDATION_SPLIT_DATE)
+    parser.add_argument('--val_test_split_date', type=str, default=TRAIN_TEST_SPLIT_DATE)
+    parser.add_argument('--save_path', type=str, default='model_output/')
+    
     args = parser.parse_args()
-    print(f"[main_multi_index.py] Arguments parsed: {args}") # DIAGNOSTIC PRINT
+    print(f"[main_multi_index.py] Arguments parsed: {args}")
     return args
 
 def calculate_sortino_ratio(daily_returns, risk_free_rate=0.0, target_return=0.0, periods_per_year=252):
@@ -660,112 +676,265 @@ def perform_backtesting(predictions_df, N_values_list, output_path, risk_free_ra
 
 
 def main():
-    print("[main_multi_index.py] main() function started.") # DIAGNOSTIC PRINT
+    print("[main_multi_index.py] main() function started.")
     args = parse_args()
 
-    # Create save_path directory if it doesn't exist
-    save_path = Path(args.save_path) # Ensure save_path is a Path object
+    save_path = Path(args.save_path) 
     save_path.mkdir(parents=True, exist_ok=True)
-    print(f"[main_multi_index.py] Save path ensured: {args.save_path}")
+    best_model_path = save_path / f"paper_master_arch_best_model.pt" 
+    print(f"[main_multi_index.py] Save path: {args.save_path}, Best model: {best_model_path}")
 
-    # Set seed for reproducibility
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if args.gpu is not None and torch.cuda.is_available():
+    device = torch.device(f"cuda:{args.gpu}" if args.gpu is not None and torch.cuda.is_available() else "cpu")
+    if device.type == 'cuda':
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False # Important for reproducibility
-    print(f"[main_multi_index.py] Random seeds set. Seed: {args.seed}")
+        torch.backends.cudnn.benchmark = False
+    print(f"[main_multi_index.py] Seed: {args.seed}. Device: {device}")
 
-
-    # Load and prepare data
-    print("[main_multi_index.py] Calling load_and_prepare_data...") # DIAGNOSTIC PRINT
     X_train, y_train, train_idx, \
     X_valid, y_valid, valid_idx, \
-    X_test, y_test, test_idx, scaler_obj = load_and_prepare_data( # Renamed _ to scaler_obj
+    X_test, y_test, test_idx, scaler_obj, \
+    gate_input_start_index, gate_input_end_index = load_and_prepare_data(
         args.csv, FEATURE_START_COL, args.lookback, 
-        args.train_val_split_date, args.val_test_split_date # Pass new args
+        args.train_val_split_date, args.val_test_split_date
     )
 
-    if X_train is None or X_train.shape[0] == 0:
-        print("[main_multi_index.py] ERROR: No training data available after load_and_prepare_data. Exiting.") # DIAGNOSTIC PRINT
+    if X_train is None or X_train.shape[0] == 0: 
+        print("[main_multi_index.py] ERROR: No training data or failed market feature/gate index setup. Exiting.")
         return
 
-    # Determine d_feat (number of features) from the data
-    if args.d_feat is None:
-        d_feat = X_train.shape[2] # N, T, F -> F is the number of features
-        print(f"[main_multi_index.py] Inferred d_feat (num_features): {d_feat}")
-    else:
-        d_feat = args.d_feat
-        print(f"[main_multi_index.py] Using provided d_feat: {d_feat}")
-        if d_feat != X_train.shape[2]:
-            print(f"[main_multi_index.py] WARNING: Provided d_feat ({d_feat}) does not match data's feature dimension ({X_train.shape[2]}). Using data's dimension.")
-            d_feat = X_train.shape[2]
-
-
-    # Create Datasets and DataLoaders
-    print("[main_multi_index.py] Creating train dataset...") # DIAGNOSTIC PRINT
-    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx)
+    d_feat_total = X_train.shape[2]
+    if args.d_feat is not None: # d_feat from args is expected to be d_feat_total
+        if args.d_feat != d_feat_total:
+            logger.warning(f"Provided d_feat ({args.d_feat}) != data's actual total feature dim ({d_feat_total}). Using data's dim.")
+        # d_feat_total = args.d_feat # No, always use from data.
     
+    print(f"[main_multi_index.py] d_feat_total (num_features including market): {d_feat_total}")
+    
+    if not (0 <= gate_input_start_index < d_feat_total and 
+            gate_input_start_index < gate_input_end_index <= d_feat_total and 
+            gate_input_end_index == gate_input_start_index + 1): # For single market feature
+        logger.error(f"Internally determined Gate indices [{gate_input_start_index}, {gate_input_end_index}) "
+                       f"are invalid for d_feat_total={d_feat_total}. Check market feature processing.")
+        sys.exit(1)
+
+    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx)
     valid_dataset = None
-    if X_valid is not None and X_valid.shape[0] > 0 and y_valid is not None and y_valid.shape[0] > 0 and valid_idx is not None and len(valid_idx) > 0:
-        print("[main_multi_index.py] Creating validation dataset...") # DIAGNOSTIC PRINT
+    if X_valid is not None and X_valid.shape[0] > 0:
         valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx)
     else:
-        print("[main_multi_index.py] Validation data is empty or incomplete. No validation dataset will be created for training.")
-        logger.warning("Validation data is empty or incomplete. No validation dataset will be created for training.")
-
-
+        logger.warning("No validation data. Early stopping and LR scheduling on validation loss will not be active.")
+    
     test_dataset = None
-    if X_test is not None and X_test.shape[0] > 0 and y_test is not None and y_test.shape[0] > 0 and test_idx is not None and len(test_idx) > 0:
-        print("[main_multi_index.py] Creating test dataset...") # DIAGNOSTIC PRINT
+    if X_test is not None and X_test.shape[0] > 0:
         test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx)
-    else:
-        print("[main_multi_index.py] Test data is empty or incomplete. No test dataset will be created.")
 
+    logger.info(f"Train samples: {len(X_train)}, Valid samples: {len(X_valid) if X_valid is not None else 0}, Test samples: {len(X_test) if X_test is not None else 0}")
+    logger.info(f"Train unique days: {len(train_dataset)}, Valid unique days: {len(valid_dataset) if valid_dataset else 0}, Test unique days: {len(test_dataset) if test_dataset else 0}")
 
-    # Initialize MASTER model
-    print("[main_multi_index.py] Initializing MASTER model...") # DIAGNOSTIC PRINT
-    master_model = MASTER(
-        d_feat=d_feat,
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        n_epochs=args.n_epochs_gru, 
-        lr=args.lr_gru, 
-        GPU=args.gpu,
+    model_wrapper = MASTERModel( 
+        d_feat=d_feat_total, # Pass total features to the wrapper
+        d_model=args.d_model,
+        t_nhead=args.t_nhead,
+        s_nhead=args.s_nhead,
+        T_dropout_rate=args.dropout, 
+        S_dropout_rate=args.dropout,
+        beta=args.beta, 
+        gate_input_start_index=gate_input_start_index, 
+        gate_input_end_index=gate_input_end_index,     
+        n_epochs=args.epochs, 
+        lr=args.lr,
+        GPU=args.gpu, 
         seed=args.seed,
-        model_type=args.model_type, 
-        save_path=str(save_path), # Pass save_path as string
-        save_prefix=f"master_model_{args.model_type}"
+        save_path=str(save_path), 
+        save_prefix=f"paper_master_arch_d{args.d_model}" 
     )
-    print("[main_multi_index.py] MASTER model initialized.") # DIAGNOSTIC PRINT
+    
+    pytorch_model = model_wrapper.model.to(device)
+    optimizer = model_wrapper.optimizer 
+    criterion = model_wrapper.loss_fn.to(device) 
+
+    scheduler = None
+    if valid_dataset:
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    
+    early_stopping = None
+    if valid_dataset:
+        early_stopping = EarlyStopping(patience=10, verbose=True, path=str(best_model_path), trace_func=logger.info)
+
+    logger.info("Starting training loop with paper's label processing...")
+    for epoch in range(args.epochs):
+        epoch_train_loss = 0
+        pytorch_model.train()
+        processed_batches_train = 0
+        for i in range(len(train_dataset)): 
+            X_day, y_day_original = train_dataset[i]
+            X_day, y_day_original = X_day.to(device), y_day_original.to(device)
+
+            if y_day_original.numel() == 0 : # Skip if no labels for the day
+                continue
+
+            # Apply label processing as per paper for training
+            # drop_extreme and zscore expect torch tensors
+            label_mask, y_day_dropped_extreme = drop_extreme(y_day_original.clone()) 
+            
+            if not torch.any(label_mask): # if all labels were dropped
+                # logger.debug(f"Epoch {epoch+1}, Day {i}: All labels dropped by drop_extreme. Skipping batch.")
+                continue
+            
+            y_day_processed_for_loss = zscore(y_day_dropped_extreme) # CSZscoreNorm
+            
+            # Filter X_day based on the mask from drop_extreme
+            X_day_filtered = X_day[label_mask]
+
+            if X_day_filtered.shape[0] == 0: # If all corresponding features are gone
+                # logger.debug(f"Epoch {epoch+1}, Day {i}: All features dropped after label mask. Skipping batch.")
+                continue
+                
+            optimizer.zero_grad()
+            preds_day_all = pytorch_model(X_day) # Get predictions for ALL X_day items
+            preds_day_filtered_for_loss = preds_day_all[label_mask] # Filter predictions
+
+            if preds_day_filtered_for_loss.shape[0] != y_day_processed_for_loss.shape[0]:
+                logger.error(f"Epoch {epoch+1}, Day {i}: Mismatch after filtering. Preds: {preds_day_filtered_for_loss.shape}, Labels: {y_day_processed_for_loss.shape}. Skipping.")
+                continue
+            if preds_day_filtered_for_loss.numel() == 0: # If no elements left to calculate loss
+                continue
 
 
-    # Train the model and get predictions
-    print("[main_multi_index.py] Starting MASTER model training/prediction...") # DIAGNOSTIC PRINT
-    predictions_df = master_model.train_predict(
-        train_data=train_dataset, 
-        valid_data=valid_dataset, # Pass validation dataset here
-        test_data=test_dataset    
-    )
-    print("[main_multi_index.py] MASTER model training/prediction finished.") # DIAGNOSTIC PRINT
+            loss = criterion(preds_day_filtered_for_loss.squeeze(), y_day_processed_for_loss.squeeze()) 
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"Epoch {epoch+1}, Day {i}: NaN or Inf loss detected. Skipping update. Preds: {preds_day_filtered_for_loss}, Labels: {y_day_processed_for_loss}")
+                continue
 
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(pytorch_model.parameters(), 3.0) # As per paper's base_model
+            optimizer.step()
+            epoch_train_loss += loss.item()
+            processed_batches_train += 1
+        
+        avg_epoch_train_loss = epoch_train_loss / processed_batches_train if processed_batches_train > 0 else 0
+        logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_epoch_train_loss:.6f}")
+
+        if valid_dataset:
+            epoch_val_loss = 0
+            pytorch_model.eval()
+            processed_batches_valid = 0
+            with torch.no_grad():
+                for i in range(len(valid_dataset)):
+                    X_day_val, y_day_val_original = valid_dataset[i]
+                    X_day_val, y_day_val_original = X_day_val.to(device), y_day_val_original.to(device)
+
+                    if y_day_val_original.numel() == 0:
+                        continue
+                    
+                    # Apply CSZscoreNorm for validation labels (NO drop_extreme)
+                    y_day_val_processed = zscore(y_day_val_original.clone())
+                    
+                    preds_day_val = pytorch_model(X_day_val)
+
+                    if preds_day_val.shape[0] != y_day_val_processed.shape[0]:
+                        logger.error(f"Epoch {epoch+1}, Valid Day {i}: Mismatch shapes. Preds: {preds_day_val.shape}, Labels: {y_day_val_processed.shape}. Skipping.")
+                        continue
+                    if preds_day_val.numel() == 0:
+                         continue
+
+
+                    val_loss_item = criterion(preds_day_val.squeeze(), y_day_val_processed.squeeze())
+                    
+                    if not (torch.isnan(val_loss_item) or torch.isinf(val_loss_item)):
+                        epoch_val_loss += val_loss_item.item()
+                        processed_batches_valid +=1
+                    else:
+                        logger.warning(f"Epoch {epoch+1}, Valid Day {i}: NaN or Inf validation loss detected. Preds: {preds_day_val}, Labels: {y_day_val_processed}")
+
+
+            avg_epoch_val_loss = epoch_val_loss / processed_batches_valid if processed_batches_valid > 0 else 0
+            logger.info(f"Epoch {epoch+1}/{args.epochs} - Validation Loss: {avg_epoch_val_loss:.6f}")
+
+            if scheduler:
+                scheduler.step(avg_epoch_val_loss)
+            if early_stopping: # early_stopping expects a loss (lower is better)
+                if processed_batches_valid > 0: # Only step if val loss was computed
+                    early_stopping(avg_epoch_val_loss, pytorch_model) 
+                    if early_stopping.early_stop:
+                        logger.info("Early stopping triggered.")
+                        break
+                else:
+                    logger.warning(f"Epoch {epoch+1}: No valid batches processed in validation, skipping early stopping/scheduler step.")
+        else: 
+            if (epoch + 1) % 10 == 0:
+                 temp_save_path = save_path / f"model_epoch_{epoch+1}.pt"
+                 torch.save(pytorch_model.state_dict(), str(temp_save_path))
+                 logger.info(f"Saved model at epoch {epoch+1} to {temp_save_path}")
+
+    if valid_dataset and early_stopping and Path(early_stopping.path).exists():
+        logger.info(f"Loading best model from: {early_stopping.path}")
+        pytorch_model.load_state_dict(torch.load(early_stopping.path, map_location=device))
+    elif not valid_dataset: # If no validation, use the model from the last epoch of training
+        logger.info("No validation set was used. Using model from the last training epoch for predictions.")
+        # (pytorch_model is already in its last state)
+    else:
+        logger.info("No best model path found or validation not used. Using model from end of training for predictions.")
+
+
+    # Generate predictions for backtesting using the (potentially best) trained model
+    predictions_df = pd.DataFrame(columns=['date', 'ticker', 'prediction', 'actual_return'])
+    if test_dataset:
+        logger.info("Generating predictions on the test set...")
+        pytorch_model.eval()
+        all_predictions_list = []
+        with torch.no_grad():
+            for i in range(len(test_dataset)):
+                X_day_test, y_day_test_actuals = test_dataset[i]
+                
+                current_date_for_day = test_dataset.unique_dates[i]
+                day_specific_mask = test_dataset.multi_index.get_level_values('date') == current_date_for_day
+                tickers_for_day = test_dataset.multi_index[day_specific_mask].get_level_values('ticker')
+
+                X_day_test = X_day_test.to(device)
+                preds_day_test = pytorch_model(X_day_test).squeeze().cpu().numpy()
+                actuals_day_test = y_day_test_actuals.cpu().numpy()
+
+                if len(tickers_for_day) != len(preds_day_test):
+                    logger.error(f"Data mismatch for date {current_date_for_day}: {len(tickers_for_day)} tickers vs {len(preds_day_test)} preds. Skipping.")
+                    continue
+                
+                for ticker_val, pred_score, actual_label in zip(tickers_for_day, preds_day_test, actuals_day_test):
+                    all_predictions_list.append({
+                        'date': current_date_for_day,
+                        'ticker': ticker_val,
+                        'prediction': pred_score,
+                        'actual_return': actual_label 
+                    })
+        
+        if all_predictions_list:
+            predictions_df = pd.DataFrame(all_predictions_list)
+            predictions_df['date'] = pd.to_datetime(predictions_df['date'])
+        else:
+            logger.warning("No predictions were generated for the test set.")
+    else:
+        logger.info("No test dataset available, skipping prediction generation for backtesting.")
+
+
+    # Perform backtesting
     if predictions_df is not None and not predictions_df.empty:
         logger.info(f"Received predictions DataFrame with shape: {predictions_df.shape}")
         perform_backtesting(
             predictions_df=predictions_df,
-            N_values_list=[1, 2, 3, 5, 10], # Configurable list of N values
-            output_path=save_path, # Use the Path object
-            risk_free_rate=0.0 # Assume 0% annual risk-free rate
+            N_values_list=[1, 2, 3, 5, 10],
+            output_path=save_path,
+            risk_free_rate=0.0 
         )
-    elif test_dataset is None:
+    elif test_dataset is None: # Redundant due to above check, but safe
         logger.info("No test dataset was available, skipping backtesting.")
-    else:
-        logger.warning("No predictions returned from model or predictions_df is empty, skipping backtesting.")
+    else: # predictions_df is empty but test_dataset existed
+        logger.warning("Predictions DataFrame is empty after test set processing, skipping backtesting.")
 
-
-    print("[main_multi_index.py] main() function completed.") # DIAGNOSTIC PRINT
+    print("[main_multi_index.py] main() function completed.")
 
 if __name__ == "__main__":
     print("[main_multi_index.py] Script execution started from __main__.") # DIAGNOSTIC PRINT
