@@ -99,12 +99,11 @@ def create_sequences_multi_index(data, features_list, label_column, lookback_win
         ticker_index_tuples = []
 
         if len(df_features) >= lookback_window:
-            for i in range(len(df_features) - lookback_window + 1):
+            for i in range(len(df_features) - lookback_window):
                 X_ticker.append(df_features.iloc[i:i + lookback_window].values)
-                y_ticker.append(df_labels.iloc[i + lookback_window - 1]) # Label corresponds to the end of the window
+                y_ticker.append(df_labels.iloc[i + lookback_window])
                 
-                # Get the date and ticker for the *end* of the window
-                current_date = group.index.get_level_values('date')[i + lookback_window - 1]
+                current_date = group.index.get_level_values('date')[i + lookback_window]
                 ticker_index_tuples.append((ticker, current_date))
 
         if X_ticker: # Only add if sequences were created for this ticker
@@ -304,7 +303,10 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
         
         if label_source_col:
             print(f"[main_multi_index.py] Generating 'label' from '{label_source_col}'.")
-            df['label'] = df.groupby(level='ticker')[label_source_col].pct_change(1).shift(-1)
+            # FIXED: Generate forward-looking returns without shift(-1) to avoid lookahead bias
+            # pct_change(1) at time t gives us the return from t-1 to t
+            # The sequence creation logic will properly align this with features from t-lookback to t-1
+            df['label'] = df.groupby(level='ticker')[label_source_col].pct_change(1)
             df.dropna(subset=['label'], inplace=True) 
             print(f"[main_multi_index.py] Shape after label generation: {df.shape}")
         else:
