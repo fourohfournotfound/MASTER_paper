@@ -110,12 +110,12 @@ class SAttention(nn.Module):
 
 
 class TAttention(nn.Module):  # Temporal Self-Attention
-    def __init__(self, d_model, nhead, dropout):
-        super().__init__()
+    def __init__(self, d_model, nhead, dropout=0.1):
+        super(TAttention, self).__init__()
         self.d_model = d_model
         self.nhead = nhead
-        self.causal = True          # Hardcoded to True
-
+        self.head_dim = d_model // nhead
+        
         self.qtrans = nn.Linear(d_model, d_model, bias=False)
         self.ktrans = nn.Linear(d_model, d_model, bias=False)
         self.vtrans = nn.Linear(d_model, d_model, bias=False)
@@ -146,25 +146,11 @@ class TAttention(nn.Module):  # Temporal Self-Attention
         v = self.vtrans(x_norm)  # (N, T, D)
 
         batch_size, seq_len, _ = q.shape
-        causal_mask = None
-        if self.causal: # This will always be true now
-            causal_mask = torch.triu(
-                torch.full(
-                    (seq_len, seq_len),
-                    float("-inf"),
-                    device=q.device,
-                    dtype=q.dtype,
-                ),
-                diagonal=1,
-            )
-
-        # Effective dimension per head, handles non-divisible d_model/nhead for slicing
-        head_dim_base = self.d_model // self.nhead
         att_output_list = []
         current_dim_offset = 0
         for i in range(self.nhead):
             if i < self.nhead - 1:
-                current_head_actual_dim = head_dim_base
+                current_head_actual_dim = self.head_dim
             else:
                 current_head_actual_dim = self.d_model - current_dim_offset
 
@@ -174,8 +160,6 @@ class TAttention(nn.Module):  # Temporal Self-Attention
             current_dim_offset += current_head_actual_dim
 
             attn_scores_h = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.temperature
-            if causal_mask is not None:
-                attn_scores_h = attn_scores_h + causal_mask
             atten_ave_matrixh = torch.softmax(attn_scores_h, dim=-1)
 
             if self.attn_dropout_modules and self.attn_dropout_modules[i]:
@@ -193,20 +177,16 @@ class TAttention(nn.Module):  # Temporal Self-Attention
 
 
 class Gate(nn.Module):
-    def __init__(self, d_input, d_output, beta=1.0): # d_output here is d_feat_stock_specific
-        super().__init__()
-        self.trans = nn.Linear(d_input, d_output)
-        self.d_gate_output_dim = d_output # This is d_feat_stock_specific / num_stock_features
-        self.t = beta # Temperature for softmax
+    def __init__(self, d_gate_input_dim):
+        super(Gate, self).__init__()
+        self.d_gate_input_dim = d_gate_input_dim
+        self.d_gate_output_dim = d_gate_input_dim  # Store for scaling
+        self.trans = nn.Linear(d_gate_input_dim, d_gate_input_dim)
+        self.t = 1.0
 
-    def forward(self, gate_input_market_features): # gate_input shape (N_stocks, d_market_features)
-        output = self.trans(gate_input_market_features) # (N_stocks, d_feat_stock_specific)
-        output = torch.softmax(output / self.t, dim=-1)
-        # To strictly match the paper's Gate snippet:
-        # output = output * self.d_gate_output_dim 
-        # However, as noted in your comments, this is an unusual scaling.
-        # Your current implementation (without this scaling) is more standard.
-        return output # Output shape (N_stocks, d_feat_stock_specific)
+    def forward(self, x):
+        # Apply the d_output scaling factor as per paper
+        return self.d_gate_output_dim * torch.softmax(self.trans(x) / self.t, dim=-1)
 
 
 # This is the paper's "final" TemporalAttention that aggregates T dimension
@@ -330,9 +310,7 @@ class PaperMASTERArchitecture(nn.Module):
         # Modules
         # ---------------------------------------------------------------
         self.feature_gate = Gate(
-            d_input=num_market_features,
-            d_output=self.d_feat_stock_specific,
-            beta=beta,
+            d_gate_input_dim=num_market_features,
         )
 
         self.layers = nn.Sequential(
@@ -377,13 +355,17 @@ class PaperMASTERArchitecture(nn.Module):
                 dim=2,
             )
 
-        x_market_info = x[
-            :, -1, self.gate_input_start_index : self.gate_input_end_index
-        ]  # (N_stocks, num_market_features)
+        x_market_info = x[:, :, self.gate_input_start_index : self.gate_input_end_index]  # (N, T, market_features)
 
-        # 2) Gate modulation ---------------------------------------------------
-        gate_values = self.feature_gate(x_market_info)                # (N, D_s)
-        gated_stock_features = x_stock_specific * gate_values.unsqueeze(1)
+        # 2) Gate modulation - SAFE VERSION: Apply gate per timestep -------------------
+        # Apply gate to each timestep independently to avoid lookahead bias
+        gated_stock_features_list = []
+        for t in range(x.size(1)):  # For each timestep
+            gate_values_t = self.feature_gate(x_market_info[:, t, :])  # (N, market_features)
+            gated_features_t = x_stock_specific[:, t, :] * gate_values_t  # (N, stock_features)
+            gated_stock_features_list.append(gated_features_t.unsqueeze(1))
+        
+        gated_stock_features = torch.cat(gated_stock_features_list, dim=1)  # (N, T, stock_features)
 
         # 3) Encoder–decoder stack --------------------------------------------
         output = self.layers(gated_stock_features).squeeze(-1)        # (N,)
@@ -391,20 +373,19 @@ class PaperMASTERArchitecture(nn.Module):
         return output
 
 class MASTERModel(SequenceModel):
-    def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, 
-                 beta, gate_input_start_index, gate_input_end_index, 
-                 n_epochs, lr, GPU, seed, save_path, save_prefix, 
-                 **kwargs):
+    def __init__(self, d_feat, d_model=256, t_nhead=4, s_nhead=2, T_dropout_rate=0.5, S_dropout_rate=0.5, 
+                 beta=5.0, gate_input_start_index=0, gate_input_end_index=1, n_epochs=100, lr=0.001, 
+                 GPU=None, seed=None, save_path=None, save_prefix="master_model"):
 
         super().__init__(n_epochs=n_epochs, lr=lr, GPU=GPU, seed=seed,
                          save_path=save_path, save_prefix=save_prefix,
-                         metric=kwargs.get('metric', "loss"), 
-                         early_stop=kwargs.get('early_stop', 20), 
-                         patience=kwargs.get('patience', 10),
-                         decay_rate=kwargs.get('decay_rate', 0.9),
-                         min_lr=kwargs.get('min_lr', 1e-05),
-                         max_iters_epoch=kwargs.get('max_iters_epoch', None),
-                         train_noise=kwargs.get('train_noise', 0.0)
+                         metric="loss", 
+                         early_stop=20, 
+                         patience=10,
+                         decay_rate=0.9,
+                         min_lr=1e-05,
+                         max_iters_epoch=None,
+                         train_noise=0.0
                          )
         # d_feat passed here is d_feat_input_total from main_multi_index.py
         self.d_feat_input_total = d_feat 
@@ -431,16 +412,10 @@ class MASTERModel(SequenceModel):
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         
-        # Defaulting to MSELoss as per paper's SequenceModel.loss_fn
-        self.loss_fn = nn.MSELoss().to(self.device)
-        logger.info("Using MSELoss for MASTERModel training.")
-        # Optional: if beta is explicitly for RegRankLoss and desired:
-        # if self.beta is not None and self.beta > 0 and kwargs.get('use_regrank_loss', False):
-        #     self.loss_fn = RegRankLoss(beta=self.beta).to(self.device)
-        #     logger.info(f"Using RegRankLoss with beta={self.beta}")
-        # else:
-        #     self.loss_fn = nn.MSELoss().to(self.device)
-        #     logger.info("Using MSELoss.")
+        # Use RegRankLoss instead of MSE as per paper
+        self.loss_fn = RegRankLoss(beta=self.beta)
+        if self.device.type == 'cuda':
+            self.loss_fn = self.loss_fn.to(self.device)
         
         logger.info("MASTERModel (Paper Architecture Replica) initialized.")
 
@@ -486,3 +461,58 @@ class ALSTMModel(LSTMModel):
         super().__init__(d_feat, hidden_size, num_layers, dropout)
         # Add attention mechanism components if needed
         print("ALSTMModel initialized (currently same as LSTM). Define attention if needed.")
+
+
+class MASTERNet(nn.Module):
+    def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, 
+                 gate_input_start_index, gate_input_end_index):
+        super(MASTERNet, self).__init__()
+        self.d_feat = d_feat
+        self.d_model = d_model
+        self.gate_input_start_index = gate_input_start_index
+        self.gate_input_end_index = gate_input_end_index
+        
+        # Calculate dimensions
+        gate_dim = gate_input_end_index - gate_input_start_index
+        factor_dim = gate_input_start_index  # Only pre-market factors as per paper
+        
+        # Initialize components
+        self.gate = Gate(gate_dim)
+        self.linear_in = nn.Linear(factor_dim + gate_dim, d_model)
+        self.pos_encoding = PositionalEncoding(d_model)
+        self.temporal_attention = TAttention(d_model, t_nhead, T_dropout_rate)
+        self.spatial_attention = SAttention(d_model, s_nhead, S_dropout_rate)
+        self.final_temporal_attention = FinalTemporalAttention(d_model)
+        self.linear_out = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        # x shape: (N, T, d_feat)
+        N, T, d_feat = x.shape
+        
+        # Split features as per paper: only keep factors BEFORE market info
+        factor_features = x[:, :, :self.gate_input_start_index]  # Only pre-market factors
+        market_features = x[:, :, self.gate_input_start_index:self.gate_input_end_index]
+        
+        # Apply Gate per timestep to avoid lookahead bias
+        gated_features_list = []
+        for t in range(T):
+            gate_weights_t = self.gate(market_features[:, t, :])  # (N, gate_dim)
+            if factor_features.shape[2] > 0:
+                # Apply gate to factor features at timestep t
+                gated_factors_t = factor_features[:, t, :] * gate_weights_t
+                combined_t = torch.cat([gated_factors_t, market_features[:, t, :]], dim=1)
+            else:
+                combined_t = market_features[:, t, :] * gate_weights_t
+            gated_features_list.append(combined_t.unsqueeze(1))
+        
+        combined_features = torch.cat(gated_features_list, dim=1)  # (N, T, combined_dim)
+        
+        # Apply the attention layers
+        x = self.linear_in(combined_features)  # (N, T, d_model)
+        x = self.pos_encoding(x)
+        x = self.temporal_attention(x)
+        x = self.spatial_attention(x)
+        x = self.final_temporal_attention(x)  # (N, d_model)
+        x = self.linear_out(x)  # (N, 1)
+        
+        return x.squeeze(-1)  # (N,)
