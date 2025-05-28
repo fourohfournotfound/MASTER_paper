@@ -335,7 +335,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
 
     train_val_split_dt = pd.to_datetime(train_val_split_date_str)
     val_test_split_dt  = pd.to_datetime(val_test_split_date_str)
-    PURGE_WINDOW       = lookback - 1
+    PURGE_WINDOW       = lookback
 
     train_end_excl  = train_val_split_dt - pd.Timedelta(days=PURGE_WINDOW)
     valid_end_excl  = val_test_split_dt  - pd.Timedelta(days=PURGE_WINDOW)
