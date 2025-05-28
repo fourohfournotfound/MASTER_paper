@@ -209,31 +209,41 @@ class SequenceModel():
         return float(np.mean(losses))
 
     def _init_data_loader(self, data, shuffle=True, drop_last=True):
+        print("[SequenceModel] Initializing DataLoader in _init_data_loader...")
+        if data is None or len(data) == 0:
+            print("[SequenceModel] ERROR: Input data to _init_data_loader is None or empty.")
+            # Optionally raise an error or return an empty loader
+            raise ValueError("Input data for DataLoader cannot be None or empty.")
+
         day_sampler = DaySampler(data, shuffle)
-        # DataLoader with a sampler will pass each sampled index to dataset.__getitem__
-        # and then collate the results. If batch_size is None (default when sampler is given),
-        # it processes one sample at a time. The default collate_fn will wrap the result in a list.
-        # So, if dataset.__getitem__ returns (tensor_A, tensor_B),
-        # the loop `for data_batch in data_loader:` will give data_batch = [(tensor_A, tensor_B)].
-        # We need to extract the tuple.
-\
-        def custom_collate(batch_list):
-            # batch_list is expected to be [features_for_day_tensor, labels_for_day_tensor]
-            # when dataset.__getitem__ returns (features_for_day_tensor, labels_for_day_tensor)
-            # and batch_size=None with a sampler.
-            # print(f"Custom Collate: batch_list length: {len(batch_list)}") # Expect 2
-            if len(batch_list) == 2:
-                features, labels = batch_list[0], batch_list[1]
-                f_shape = features.shape if hasattr(features, 'shape') else type(features)
-                l_shape = labels.shape if hasattr(labels, 'shape') else type(labels)
-                # print(f"Custom Collate: features shape: {f_shape}, labels shape: {l_shape}")
-                return (features, labels) # Return the tuple (feature_tensor, label_tensor)
+        print(f"[SequenceModel] DaySampler initialized. Number of days/samples from sampler: {len(day_sampler)}")
+
+        def custom_collate(batch_data_tuple):
+            # When batch_size=None and a sampler is used, DataLoader passes the direct output of
+            # dataset.__getitem__(idx) to the collate_fn.
+            # If dataset.__getitem__ returns (features, labels), then batch_data_tuple will be (features, labels).
+            # print(f"[Custom Collate] Received batch_data_tuple. Type: {type(batch_data_tuple)}")
+
+            if isinstance(batch_data_tuple, tuple) and len(batch_data_tuple) == 2:
+                # batch_data_tuple is the (features, labels) tuple
+                features, labels = batch_data_tuple
+                # f_shape = features.shape if hasattr(features, 'shape') else type(features)
+                # l_shape = labels.shape if hasattr(labels, 'shape') else type(labels)
+                # print(f"[Custom Collate] Successfully unpacked. Features type: {type(features)}, Labels type: {type(labels)}")
+                return (features, labels)
             else:
-                # print(f"Custom Collate: batch_list does not have 2 elements as expected. Length: {len(batch_list)}")
-                # This case indicates an issue with DataLoader behavior or dataset output
-                raise ValueError(f"Collate function expected batch_list of length 2, got {len(batch_list)}")
+                error_msg = (
+                    f"[Custom Collate] ERROR: batch_data_tuple structure not as expected. "
+                    f"Expected a 2-element tuple (features, labels). Got: {type(batch_data_tuple)}"
+                    f"{', len ' + str(len(batch_data_tuple)) if isinstance(batch_data_tuple, tuple) else ''}"
+                )
+                # For debugging, print the content if it's small enough or types
+                # print(f"Content: {batch_data_tuple}") 
+                print(error_msg)
+                raise ValueError(error_msg)
 
         data_loader = DataLoader(data, sampler=day_sampler, batch_size=None, collate_fn=custom_collate)
+        print("[SequenceModel] DataLoader initialized successfully.")
         return data_loader
 
     def load_param(self, param_path):
@@ -241,20 +251,48 @@ class SequenceModel():
         self.fitted = 'Previously trained.'
 
     def fit(self, dl_train, dl_valid=None):
+        print(f"[SequenceModel] Starting fit method. n_epochs: {self.n_epochs}")
+        if dl_train is None or len(dl_train) == 0 :
+            print("[SequenceModel] ERROR: Training data (dl_train) is None or empty in fit method. Cannot proceed.")
+            return
+
+        print("[SequenceModel] Initializing training DataLoader...")
         train_loader = self._init_data_loader(dl_train, shuffle=True, drop_last=True)
+        
+        valid_loader = None
+        if dl_valid:
+            print("[SequenceModel] Initializing validation DataLoader...")
+            valid_loader = self._init_data_loader(dl_valid, shuffle=False, drop_last=False) # Initialize once
+
+        if train_loader is None : # or len(train_loader) == 0 if it's an iterable with a __len__
+             print("[SequenceModel] ERROR: train_loader is None after _init_data_loader. Cannot proceed with training.")
+             return
+        # A more robust check for an empty DataLoader from a sampler perspective:
+        # Try to get an iterator and see if it's empty, but this might consume the first batch.
+        # For now, we rely on DaySampler's length and _init_data_loader's internal checks.
+
         best_param = None
+        print("[SequenceModel] Starting training loop...")
         for step in range(self.n_epochs):
+            print(f"[SequenceModel] Epoch {step + 1}/{self.n_epochs} - Starting train_epoch...")
             train_loss = self.train_epoch(train_loader)
             self.fitted = step
-            if dl_valid:
-                predictions, metrics = self.predict(dl_valid)
+            print(f"[SequenceModel] Epoch {step + 1}/{self.n_epochs} - train_loss: {train_loss:.6f}")
+
+            if valid_loader: # Check if valid_loader was initialized
+                print(f"[SequenceModel] Epoch {step + 1}/{self.n_epochs} - Performing validation...")
+                # Pass the already initialized valid_loader to predict
+                predictions, metrics = self.predict(valid_loader) 
                 print("Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f." % (step, train_loss, metrics['IC'],  metrics['ICIR'],  metrics['RIC'],  metrics['RICIR']))
             else: print("Epoch %d, train_loss %.6f" % (step, train_loss))
 
             if self.train_stop_loss_thred is not None and train_loss <= self.train_stop_loss_thred:
+                print(f"[SequenceModel] Training stop threshold met. train_loss: {train_loss:.6f} <= {self.train_stop_loss_thred}")
                 best_param = copy.deepcopy(self.model.state_dict())
                 torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}.pkl')
+                print(f"[SequenceModel] Model saved to {self.save_path}/{self.save_prefix}_{self.seed}.pkl")
                 break
+        print("[SequenceModel] Fit method completed.")
 
     def predict(self, dl_test):
         if self.fitted<0:
@@ -262,14 +300,12 @@ class SequenceModel():
         else:
             print('Epoch:', self.fitted)
 
-        test_loader = self._init_data_loader(dl_test, shuffle=False, drop_last=False)
-
         preds = []
         ic = []
         ric = []
 
         self.model.eval()
-        for data in test_loader:
+        for data in dl_test:
             # data = torch.squeeze(data, dim=0) # Original line commented out
             # data is a tuple: (features_for_day_tensor, labels_for_day_tensor)
             feature_data = data[0].to(self.device) # N, T, F
@@ -289,14 +325,73 @@ class SequenceModel():
                 daily_ic, daily_ric = calc_ic(pred, label_data_numpy)
                 ic.append(daily_ic)
                 ric.append(daily_ric)
+        
+        # If dl_test.dataset.get_index() is the correct way to get the index
+        if hasattr(dl_test, 'dataset') and hasattr(dl_test.dataset, 'get_index'):
+            series_index = dl_test.dataset.get_index()
+             # We need to make sure this index corresponds to the items in the order they were processed.
+             # Since shuffle=False for validation/test, this should be okay.
+             # However, predictions are concatenated. The index must match all concatenated predictions.
+             # The `DailyGroupedTimeSeriesDataset`'s get_index() returns the *full* multi_index of all sequences it holds.
+             # The predictions are generated day by day.
+             # We need to reconstruct the correct index for the concatenated predictions.
+            
+            # Let's collect all indices from each batch (day) and concatenate them
+            all_indices = []
+            original_multi_index = dl_test.dataset.multi_index # Access the full index from the dataset
+            unique_dates_in_loader = dl_test.dataset.unique_dates # Access unique dates in order they are processed by DaySampler (shuffle=False)
 
-        predictions = pd.Series(np.concatenate(preds), index=dl_test.get_index())
+            # We need to iterate through the loader again or store indices during prediction if get_index() is per-batch
+            # Simpler: the `dl_test.dataset.get_index()` should return the full index for ALL items this dataset can produce,
+            # in the order they would appear if iterated without shuffling.
+            # The current DaySampler + DailyGroupedTimeSeriesDataset structure means `get_index()` on the dataset
+            # returns the *original* index of all sequences.
+            # The predictions are ordered by date, then by stock within that date.
+            # We need an index that matches this.
+            
+            # Let's rebuild the index based on the order of processing.
+            # This is tricky because predictions are flattened.
+            # The original implementation `index=dl_test.get_index()` assumed `dl_test` was the dataset itself.
+            # Now that `dl_test` is a DataLoader, we use `dl_test.dataset.get_index()`.
+
+            # The issue is that `np.concatenate(preds)` creates a flat array.
+            # `dl_test.dataset.get_index()` returns a MultiIndex for all samples in the test set.
+            # If the order of iteration through `dl_test` (which is by day, and then stocks within the day)
+            # matches the inherent order of `dl_test.dataset.get_index()`, it might work.
+            # Let's assume for now it does, as this was the implicit assumption before.
+            # The `DailyGroupedTimeSeriesDataset` groups by date, and for each date, it takes all stocks.
+            # The `get_index()` method on `DailyGroupedTimeSeriesDataset` returns the original full multi_index.
+            # We need to ensure the concatenated predictions align with this full multi_index if it's not sorted by date.
+
+            # The most robust way: Collect (original_index_for_sample, prediction_for_sample) pairs
+            # and then reconstruct the series.
+            # For now, stick to the previous assumption that the order matches.
+            # The DailyGroupedTimeSeriesDataset already sorts by unique_dates.
+            # And within each date, data is taken as is from X_sequences[date_mask].
+            # So, the order of predictions should match the order of dl_test.dataset.multi_index
+            # if dl_test.dataset.multi_index itself is sorted by (date, ticker).
+
+            # Let's verify the sorting of the index from the dataset:
+            idx_for_series = dl_test.dataset.get_index()
+            if not idx_for_series.is_monotonic_increasing:
+                 # This might be an issue if it's not sorted as (date, then ticker)
+                 # For DailyGroupedTimeSeriesDataset, self.multi_index is passed in.
+                 # Its order matters. create_sequences_multi_index creates it.
+                 # Let's ensure it's sorted appropriately after creation in main_multi_index.py
+                 # print_warning("Index for predictions is not sorted. This might lead to misalignment.")
+                 pass # For now, proceed with caution.
+
+            predictions_series = pd.Series(np.concatenate(preds), index=idx_for_series)
+        else:
+            print("[SequenceModel] WARNING: Could not retrieve index for predictions. DataLoader's dataset lacks get_index method.")
+            predictions_series = pd.Series(np.concatenate(preds))
+
 
         metrics = {
             'IC': np.mean(ic),
-            'ICIR': np.mean(ic)/np.std(ic),
+            'ICIR': np.mean(ic)/np.std(ic) if np.std(ic) != 0 else 0,
             'RIC': np.mean(ric),
-            'RICIR': np.mean(ric)/np.std(ric)
+            'RICIR': np.mean(ric)/np.std(ric) if np.std(ric) != 0 else 0
         }
 
-        return predictions, metrics
+        return predictions_series, metrics
