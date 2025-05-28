@@ -421,18 +421,10 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     df.set_index(['ticker', 'date'], inplace=True)
     df.sort_index(inplace=True)
     
-    # --- OPTIMIZED Market Feature Calculation ---
+    # --- MARKET FEATURE NAME DEFINITION ---
+    # Note: Market features will be calculated AFTER data splitting to prevent look-ahead bias
     market_feature_col_name = 'MRKT_AVG_CLOSEADJ_VOL20D'
-    if 'closeadj' in df.columns:
-        # Vectorized market volatility calculation
-        daily_avg_closeadj = df.groupby(level='date')['closeadj'].mean()
-        market_volatility = daily_avg_closeadj.rolling(window=20, min_periods=1).std().ffill()
-        
-        # Efficient join using map instead of join for better performance
-        date_to_vol = market_volatility.to_dict()
-        df[market_feature_col_name] = df.index.get_level_values('date').map(date_to_vol)
-        print(f"[OPTIMIZED] Market feature calculated efficiently")
-    else:
+    if 'closeadj' not in df.columns:
         print("[OPTIMIZED] ERROR: closeadj column missing")
         return (None,) * 12
 
@@ -440,9 +432,14 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     if 'label' not in df.columns:
         label_source_col = 'closeadj'  # Primary choice
         if label_source_col in df.columns:
-            # Vectorized label calculation - more efficient than groupby
-            df['label'] = df.groupby(level='ticker')[label_source_col].pct_change(1)
-            df.dropna(subset=['label'], inplace=True)
+            # Calculate returns (from t-1 to t)
+            df['returns'] = df.groupby(level='ticker')[label_source_col].pct_change(1)
+
+            # Shift to create forward-looking targets (return from t to t+1)
+            df['label'] = df.groupby(level='ticker')['returns'].shift(-1)
+
+            # Drop last row per ticker (it will have NaN label after shift)
+            df = df.groupby(level='ticker').apply(lambda x: x.iloc[:-1])
             print(f"[OPTIMIZED] Labels generated efficiently. Shape: {df.shape}")
         else:
             print("[OPTIMIZED] ERROR: Cannot generate labels")
@@ -479,6 +476,34 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     valid_df = df.loc[valid_mask].copy() if valid_mask.any() else pd.DataFrame()
     test_df = df.loc[test_mask].copy() if test_mask.any() else pd.DataFrame()
 
+    # --- FIXED: MARKET FEATURE CALCULATION AFTER SPLITTING (NO LOOK-AHEAD BIAS) ---
+    def _calculate_market_features_safe(df_split, market_col_name, window=20):
+        """Calculate market features for a data split without look-ahead bias."""
+        if df_split.empty or 'closeadj' not in df_split.columns:
+            return df_split
+        
+        # Calculate daily market average (cross-sectional mean) for this split only
+        daily_avg_closeadj = df_split.groupby(level='date')['closeadj'].mean()
+        
+        # Calculate rolling volatility using only past data (causal)
+        market_volatility = daily_avg_closeadj.rolling(
+            window=window, 
+            min_periods=1
+        ).std().ffill()  # Forward fill only - no backward fill
+        
+        # Map volatility to all stocks on each date
+        date_to_vol = market_volatility.to_dict()
+        df_split[market_col_name] = df_split.index.get_level_values('date').map(date_to_vol)
+        
+        return df_split
+
+    # Apply market feature calculation to each split independently
+    print(f"[FIXED] Calculating market features per split to prevent look-ahead bias...")
+    train_df = _calculate_market_features_safe(train_df, market_feature_col_name)
+    valid_df = _calculate_market_features_safe(valid_df, market_feature_col_name) if not valid_df.empty else valid_df
+    test_df = _calculate_market_features_safe(test_df, market_feature_col_name) if not test_df.empty else test_df
+    print(f"[FIXED] Market features calculated safely for all splits")
+
     # --- OPTIMIZED NaN Column Dropping ---
     def _drop_nan_cols_optimized(slice_df: pd.DataFrame, cols: list, threshold: float = 0.30):
         if slice_df.empty or not cols:
@@ -493,6 +518,10 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
         dropped_cols = cols_array[~keep_mask].tolist()
         
         return keep_cols, dropped_cols
+
+    # Include market feature in feature columns list
+    if market_feature_col_name not in feature_columns and not train_df.empty:
+        feature_columns.append(market_feature_col_name)
 
     feature_columns, dropped_cols = _drop_nan_cols_optimized(train_df, feature_columns)
 
