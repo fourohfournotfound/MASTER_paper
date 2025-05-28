@@ -202,18 +202,17 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
         )
         print("[main_multi_index.py] Converted date index to datetime.")
 
-    # 1. Handle NaNs in features (columns to drop were already handled globally before this function is called on splits)
-    print("[main_multi_index.py] Preprocessing data split: Handling NaNs/Infs in features (replace inf, ffill, fill with 0).")
+    # 1. Handle NaNs/Infs in features following proper time series practices
+    print("[main_multi_index.py] Preprocessing data split: Handling NaNs/Infs in features (replace inf, ffill only, fill remaining with 0).")
     
     if features_list and not df.empty:
-        # Ensure Infs are NaNs for the current df slice for all feature columns
+        # Step 1: Replace Infs with NaNs for all feature columns
         df.loc[:, features_list] = df[features_list].replace([np.inf, -np.inf], np.nan)
 
-        # Grouped forward fill for NaNs in features
-        # Using group_keys=False can sometimes be safer for apply-like operations, though for ffill it might not be strictly necessary.
+        # Step 2: Forward fill only (no backward fill to avoid lookahead bias)
         df.loc[:, features_list] = df.groupby(level='ticker', group_keys=False)[features_list].ffill()
         
-        # Fill any remaining NaNs in features with 0 (e.g., if a ticker's series started with NaN)
+        # Step 3: Fill any remaining NaNs with 0 (e.g., if a ticker's series started with NaN)
         df.loc[:, features_list] = df[features_list].fillna(0)
         print(f"[main_multi_index.py] Feature NaN/Inf handling complete for this split. Features processed: {len(features_list)}")
     elif df.empty:
@@ -221,8 +220,7 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
     elif not features_list:
         print("[main_multi_index.py] features_list is empty, skipping NaN/Inf handling for features.")
 
-
-    # Handle NaNs in the label column (dropna) - this is crucial
+    # Handle NaNs in the label column (dropna) - this is crucial for target variables
     initial_rows_before_label_dropna = len(df)
     df.dropna(subset=[label_column], inplace=True) # This ensures labels are not NaN
     rows_dropped_for_label = initial_rows_before_label_dropna - len(df)
@@ -319,8 +317,8 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
         daily_avg_closeadj = df.groupby(level='date')['closeadj'].mean()
         # Calculate 20-day rolling std of these daily averages
         market_volatility = daily_avg_closeadj.rolling(window=20, min_periods=1).std()
-        # Fill NaNs that can occur at the beginning/end of the rolling calculation
-        market_volatility = market_volatility.ffill().bfill() 
+        # Only forward fill to avoid lookahead bias - NO bfill
+        market_volatility = market_volatility.ffill()
         
         # Join this market feature back to the main df
         df = df.join(market_volatility.rename(market_feature_col_name), on='date')
@@ -385,6 +383,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
     test_df   = df[mask_dates >= val_test_split_dt].copy()
 
     def _drop_nan_cols(slice_df: pd.DataFrame, cols: list, threshold: float = 0.30):
+        # Replace inf with nan first, then calculate nan percentage
         nan_share = slice_df[cols].replace([np.inf, -np.inf], np.nan).isna().sum() / len(slice_df)
         cols_to_drop = nan_share[nan_share > threshold].index.tolist()
         keep_cols    = [c for c in cols if c not in cols_to_drop]
@@ -393,7 +392,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
     feature_columns, dropped_cols = _drop_nan_cols(train_df, feature_columns)
 
     if dropped_cols:
-        logger.info(f"Dropping {len(dropped_cols)} cols (>30% NaNs) based on TRAIN slice: {dropped_cols}")
+        logger.info(f"Dropping {len(dropped_cols)} cols (>30% NaNs/Infs) based on TRAIN slice: {dropped_cols}")
         train_df.drop(columns=dropped_cols, inplace=True, errors='ignore')
         valid_df.drop(columns=dropped_cols, inplace=True, errors='ignore')
         test_df.drop(columns=dropped_cols,  inplace=True, errors='ignore')
