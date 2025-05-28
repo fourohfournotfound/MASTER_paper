@@ -957,16 +957,16 @@ def main():
     valid_idx_multiindex = convert_to_multiindex(valid_idx) if valid_idx else pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
     test_idx_multiindex = convert_to_multiindex(test_idx) if test_idx else pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
 
-    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx_multiindex, device, False, True)
+    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx_multiindex, device, False, False)  # Disable preprocess_labels
     valid_dataset = None
     if X_valid is not None and X_valid.shape[0] > 0:
-        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx_multiindex, device, False, True)
+        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx_multiindex, device, False, False)  # Disable preprocess_labels
     else:
         logger.warning("No validation data. Early stopping and LR scheduling on validation loss will not be active.")
     
     test_dataset = None
     if X_test is not None and X_test.shape[0] > 0:
-        test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx_multiindex, device, False, True)
+        test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx_multiindex, device, False, False)  # Disable preprocess_labels
 
     logger.info(f"Train samples: {len(X_train)}, Valid samples: {len(X_valid) if X_valid is not None else 0}, Test samples: {len(X_test) if X_test is not None else 0}")
     logger.info(f"Train unique days: {len(train_dataset)}, Valid unique days: {len(valid_dataset) if valid_dataset else 0}, Test unique days: {len(test_dataset) if test_dataset else 0}")
@@ -1363,14 +1363,6 @@ def vectorized_batch_forward(pytorch_model, criterion, batch_data, device, is_tr
     y_batch_original = batch_data['y_original'].to(device, non_blocking=True)  # [batch_size, max_stocks, 1]
     attention_masks = batch_data['attention_mask'].to(device, non_blocking=True)  # [batch_size, max_stocks]
     
-    # Move optional tensors to device
-    label_mask_batch = batch_data.get('label_mask')
-    y_processed_batch = batch_data.get('y_processed')
-    if label_mask_batch is not None:
-        label_mask_batch = label_mask_batch.to(device, non_blocking=True)
-    if y_processed_batch is not None:
-        y_processed_batch = y_processed_batch.to(device, non_blocking=True)
-    
     # Squeeze y_batch if needed
     if y_batch_original.dim() > 2 and y_batch_original.shape[-1] == 1:
         y_batch_original = y_batch_original.squeeze(-1)  # [batch_size, max_stocks]
@@ -1390,86 +1382,70 @@ def vectorized_batch_forward(pytorch_model, criterion, batch_data, device, is_tr
     X_valid = X_flat[valid_mask]  # [num_valid_stocks, seq_len, features]
     y_valid = y_flat[valid_mask]  # [num_valid_stocks]
     
-    # Create day indices for grouping losses by day (for proper gradient weighting)
-    day_indices = torch.arange(batch_size, device=device).repeat_interleave(max_stocks)[valid_mask]
+    # Create day indices for each stock (which day each stock belongs to)
+    day_indices_flat = torch.arange(batch_size, device=device).repeat_interleave(max_stocks)  # [batch_size * max_stocks]
+    day_indices_valid = day_indices_flat[valid_mask]  # [num_valid_stocks]
     
-    # Apply label processing based on availability of pre-processed data
-    if label_mask_batch is not None and y_processed_batch is not None:
-        # Use pre-processed labels
-        label_mask_flat = label_mask_batch.view(-1)[valid_mask]  # [num_valid_stocks]
-        y_processed_flat = y_processed_batch.view(-1)[valid_mask]  # [num_valid_stocks]
+    # Simple approach: process all data on-the-fly without pre-processing complications
+    unique_days = torch.unique(day_indices_valid)
+    final_X_list = []
+    final_y_list = []
+    final_day_indices_list = []
+    
+    for day_idx in unique_days:
+        # Get all stocks for this day
+        day_mask = (day_indices_valid == day_idx)
+        X_day = X_valid[day_mask]  # [num_stocks_this_day, seq_len, features]
+        y_day = y_valid[day_mask]  # [num_stocks_this_day]
         
-        if not torch.any(label_mask_flat):
-            return None, 0
-        
-        # Filter by label mask
-        final_mask = label_mask_flat
-        X_final = X_valid[final_mask]  # [num_final_stocks, seq_len, features]
-        y_final = y_processed_flat[final_mask]  # [num_final_stocks]
-        day_indices_final = day_indices[final_mask]  # [num_final_stocks]
-    else:
-        # Apply processing based on day-level stock counts for drop_extreme
-        unique_days = torch.unique(day_indices)
-        all_masks = []
-        all_y_processed = []
-        
-        for day_idx in unique_days:
-            day_mask = (day_indices == day_idx)
-            y_day = y_valid[day_mask]
+        if len(y_day) == 0:
+            continue
             
-            if len(y_day) >= 10 and is_training:
-                # Use drop_extreme for training with sufficient samples
+        # Apply drop_extreme for training if we have enough stocks
+        if len(y_day) >= 10 and is_training:
+            try:
                 label_mask_day, y_dropped = drop_extreme(y_day.clone())
                 if label_mask_day.dim() > 1:
                     label_mask_day = label_mask_day.squeeze(-1)
-                y_processed_day = zscore(y_dropped)
-            else:
-                # Use all stocks for validation or small batches
-                label_mask_day = torch.ones(len(y_day), dtype=torch.bool, device=device)
-                y_processed_day = zscore(y_day.clone())
-            
-            # Create full mask for this day
-            full_day_mask = torch.zeros_like(day_mask, dtype=torch.bool)
-            day_positions = torch.where(day_mask)[0]
-            valid_day_positions = day_positions[label_mask_day]
-            full_day_mask[valid_day_positions] = True
-            
-            all_masks.append(full_day_mask)
-            
-            # Store processed labels aligned with full mask
-            y_day_full = torch.zeros(torch.sum(day_mask), device=device)
-            y_day_full[label_mask_day] = y_processed_day
-            all_y_processed.append(y_day_full)
+                    
+                if torch.any(label_mask_day):
+                    X_day_filtered = X_day[label_mask_day]
+                    y_day_processed = zscore(y_dropped)
+                else:
+                    # If drop_extreme removes everything, use all stocks with zscore
+                    X_day_filtered = X_day
+                    y_day_processed = zscore(y_day.clone())
+            except:
+                # If drop_extreme fails, fall back to zscore all
+                X_day_filtered = X_day
+                y_day_processed = zscore(y_day.clone())
+        else:
+            # For validation or small batches, use all stocks
+            X_day_filtered = X_day
+            y_day_processed = zscore(y_day.clone())
         
-        if not all_masks:
-            return None, 0
-        
-        # Combine all day masks
-        final_mask = torch.cat(all_masks)
-        if not torch.any(final_mask):
-            return None, 0
-        
-        X_final = X_valid[final_mask]
-        
-        # Reconstruct y_final from processed labels
-        y_final = torch.zeros(len(y_valid), device=device)
-        start_idx = 0
-        for day_idx, day_y_processed in zip(unique_days, all_y_processed):
-            day_mask = (day_indices == day_idx)
-            day_count = torch.sum(day_mask)
-            y_final[start_idx:start_idx + day_count] = day_y_processed
-            start_idx += day_count
-        y_final = y_final[final_mask]
-        
-        day_indices_final = day_indices[final_mask]
+        if X_day_filtered.shape[0] > 0:
+            final_X_list.append(X_day_filtered)
+            final_y_list.append(y_day_processed)
+            # Track which day each stock belongs to for loss calculation
+            day_ids = torch.full((X_day_filtered.shape[0],), day_idx, device=device)
+            final_day_indices_list.append(day_ids)
+    
+    if not final_X_list:
+        return None, 0
+    
+    # Concatenate all processed data
+    X_final = torch.cat(final_X_list, dim=0)  # [total_processed_stocks, seq_len, features]
+    y_final = torch.cat(final_y_list, dim=0)  # [total_processed_stocks]
+    day_indices_final = torch.cat(final_day_indices_list, dim=0)  # [total_processed_stocks]
     
     if X_final.shape[0] == 0:
         return None, 0
     
-    # Single vectorized forward pass for ALL stocks from ALL days
-    preds = pytorch_model(X_final)  # [num_final_stocks, 1]
-    preds = preds.squeeze()  # [num_final_stocks]
-    y_final = y_final.squeeze()  # [num_final_stocks]
+    # Single vectorized forward pass for ALL processed stocks from ALL days
+    preds = pytorch_model(X_final)  # [total_processed_stocks, 1]
+    preds = preds.squeeze()  # [total_processed_stocks]
+    y_final = y_final.squeeze()  # [total_processed_stocks]
     
     # Calculate loss per day and average (maintains proper gradient weighting)
     unique_days_final = torch.unique(day_indices_final)
