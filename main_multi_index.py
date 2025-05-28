@@ -150,7 +150,7 @@ class DailyGroupedTimeSeriesDataset(Dataset):
         Simplified to avoid shape mismatch issues with pre-processing.
         """
         print(f"[DailyGroupedTimeSeriesDataset] Initializing with X shape: {X_sequences.shape}, y shape: {y_targets.shape}, index length: {len(multi_index)}")
-        print(f"[DailyGroupedTimeSeriesDataset] Optimization settings: device={device}, pin_memory={pin_memory}")
+        print(f"[DailyGroupedTimeSeriesDataset] Optimization settings: device={device}, pin_memory={pin_memory}, preprocess_labels={preprocess_labels}")
         
         if not isinstance(multi_index, pd.MultiIndex):
             raise ValueError("multi_index must be a Pandas MultiIndex.")
@@ -357,7 +357,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
         potential_feature_cols.append(market_feature_col_name)
     elif market_feature_col_name not in df.columns:
          logger.error(f"Market feature '{market_feature_col_name}' was unexpectedly not found in DataFrame columns before creating feature_columns list.")
-         return (None,) * 12 # Corrected to 12 (and fixed syntax from (None,)*11)
+         return (None,) * 12 # Corrected to 12
 
 
     feature_columns = potential_feature_cols
@@ -1074,50 +1074,36 @@ def main():
                     y_batch_val_original = batch_data['y_original'].to(device, non_blocking=True)
                     attention_masks_val = batch_data['attention_mask'].to(device, non_blocking=True)
                     
-                    # Move optional tensors to device as well
-                    label_mask_batch_val = batch_data.get('label_mask')
-                    y_processed_batch_val = batch_data.get('y_processed')
-                    if label_mask_batch_val is not None:
-                        label_mask_batch_val = label_mask_batch_val.to(device, non_blocking=True)
-                    if y_processed_batch_val is not None:
-                        y_processed_batch_val = y_processed_batch_val.to(device, non_blocking=True)
+                    # Reshape for batch processing
+                    batch_size_val, max_stocks_val, seq_len_val, features_val = X_batch_val.shape
+                    X_reshaped_val = X_batch_val.view(-1, seq_len_val, features_val)
+                    y_reshaped_val = y_batch_val_original.view(-1)
+                    if y_reshaped_val.dim() > 1 and y_reshaped_val.shape[-1] == 1:
+                        y_reshaped_val = y_reshaped_val.squeeze(-1)
                     
-                    # Squeeze y_batch if needed
-                    if y_batch_val_original.dim() > 2 and y_batch_val_original.shape[-1] == 1:
-                        y_batch_val_original = y_batch_val_original.squeeze(-1)
+                    attention_mask_flat_val = attention_masks_val.view(-1)
                     
-                    total_val_loss = 0
-                    total_val_samples = 0
+                    # Filter to real stocks
+                    real_stock_mask_val = attention_mask_flat_val
+                    X_real_val = X_reshaped_val[real_stock_mask_val]
+                    y_real_val = y_reshaped_val[real_stock_mask_val]
                     
-                    for day_idx in range(X_batch_val.shape[0]):
-                        X_day_val = X_batch_val[day_idx]
-                        y_day_val = y_batch_val_original[day_idx]
-                        attention_mask_val = attention_masks_val[day_idx]
-                        
-                        # Filter real stocks
-                        X_day_val_real = X_day_val[attention_mask_val]
-                        y_day_val_real = y_day_val[attention_mask_val]
-                        
-                        if y_day_val_real.numel() == 0:
-                            continue
-                        
-                        # Apply zscore (no drop_extreme for validation)
-                        y_day_val_processed = zscore(y_day_val_real.clone())
-                        
-                        # Forward pass
-                        preds_val = pytorch_model(X_day_val_real)
-                        preds_val = preds_val.squeeze()
-                        y_day_val_processed = y_day_val_processed.squeeze()
-                        
-                        if preds_val.numel() > 0 and y_day_val_processed.numel() > 0:
-                            val_loss = criterion(preds_val, y_day_val_processed)
-                            if not (torch.isnan(val_loss) or torch.isinf(val_loss)):
-                                total_val_loss += val_loss
-                                total_val_samples += 1
+                    if X_real_val.shape[0] == 0:
+                        continue
                     
-                    if total_val_samples > 0:
-                        avg_val_loss = total_val_loss / total_val_samples
-                        epoch_val_loss += avg_val_loss.item()
+                    # Apply zscore (no drop_extreme for validation)
+                    y_processed_val = zscore(y_real_val.clone())
+                    
+                    # Forward pass
+                    preds_val = pytorch_model(X_real_val).squeeze()
+                    if preds_val.dim() == 0:
+                        preds_val = preds_val.unsqueeze(0)
+                    if y_processed_val.dim() == 0:
+                        y_processed_val = y_processed_val.unsqueeze(0)
+                    
+                    val_loss = criterion(preds_val, y_processed_val)
+                    if not (torch.isnan(val_loss) or torch.isinf(val_loss)):
+                        epoch_val_loss += val_loss.item()
                         processed_batches_valid += 1
 
             avg_epoch_val_loss = epoch_val_loss / processed_batches_valid if processed_batches_valid > 0 else 0
@@ -1125,8 +1111,8 @@ def main():
 
             if scheduler:
                 scheduler.step(avg_epoch_val_loss)
-            if early_stopping:  # early_stopping expects a loss (lower is better)
-                if processed_batches_valid > 0:  # Only step if val loss was computed
+            if early_stopping:
+                if processed_batches_valid > 0:
                     early_stopping(avg_epoch_val_loss, pytorch_model) 
                     if early_stopping.early_stop:
                         logger.info("Early stopping triggered.")
@@ -1142,12 +1128,10 @@ def main():
     if valid_dataset and early_stopping and Path(early_stopping.path).exists():
         logger.info(f"Loading best model from: {early_stopping.path}")
         pytorch_model.load_state_dict(torch.load(early_stopping.path, map_location=device))
-    elif not valid_dataset: # If no validation, use the model from the last epoch of training
+    elif not valid_dataset:
         logger.info("No validation set was used. Using model from the last training epoch for predictions.")
-        # (pytorch_model is already in its last state)
     else:
         logger.info("No best model path found or validation not used. Using model from end of training for predictions.")
-
 
     # Generate predictions for backtesting using the (potentially best) trained model
     predictions_df = pd.DataFrame(columns=['date', 'ticker', 'prediction', 'actual_return'])
@@ -1159,9 +1143,10 @@ def main():
             test_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=0,  # Disable multiprocessing for CUDA compatibility
-            pin_memory=False,  # Disable pin_memory when using pre-moved tensors
-            persistent_workers=False  # Disable when num_workers=0
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False,
+            collate_fn=custom_collate_fn,
         )
         
         pytorch_model.eval()
@@ -1207,7 +1192,6 @@ def main():
     else:
         logger.info("No test dataset available, skipping prediction generation for backtesting.")
 
-
     # Perform backtesting
     if predictions_df is not None and not predictions_df.empty:
         logger.info(f"Received predictions DataFrame with shape: {predictions_df.shape}")
@@ -1217,9 +1201,9 @@ def main():
             output_path=save_path,
             risk_free_rate=0.0 
         )
-    elif test_dataset is None: # Redundant due to above check, but safe
+    elif test_dataset is None:
         logger.info("No test dataset was available, skipping backtesting.")
-    else: # predictions_df is empty but test_dataset existed
+    else:
         logger.warning("Predictions DataFrame is empty after test set processing, skipping backtesting.")
 
     print("[main_multi_index.py] main() function completed.")
