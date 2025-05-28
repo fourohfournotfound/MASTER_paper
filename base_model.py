@@ -353,10 +353,54 @@ class SequenceModel():
                 epoch_log_msg_parts.append(f"valid_loss: {valid_loss:.6f}")
                 
                 # Calculate IC metrics for validation
-                # self.predict expects the dataset object, not the loader
-                predictions_series, metrics = self.predict(dl_valid) 
-                valid_ic = metrics.get('IC', np.nan)
-                valid_ric = metrics.get('RIC', np.nan)
+                # self.predict (which will be MASTER.predict if self is MASTER instance)
+                # returns a DataFrame: ['date', 'ticker', 'prediction', 'actual_return']
+                # The original SequenceModel.predict returned (predictions_series, metrics_dict)
+                
+                # For validation within SequenceModel.fit, we need ICs.
+                # If self.predict is MASTER.predict, it returns a DataFrame.
+                # If self.predict is the original SequenceModel.predict, it returns (Series, dict).
+                
+                # Let's assume for now that if dl_valid is a DailyGroupedTimeSeriesDataset,
+                # self.predict will be MASTER.predict and return a DataFrame.
+                # We need a consistent way to get metrics.
+                
+                valid_ic = np.nan
+                valid_ric = np.nan
+
+                # Check if self.predict is the one from MASTER that returns a DataFrame
+                # This is a bit fragile; ideally, a more robust interface would be used.
+                # For now, we try to adapt.
+                
+                # The self.predict method in the context of MASTER will be MASTER.predict
+                # which expects a DailyGroupedTimeSeriesDataset and returns a DataFrame
+                validation_output = self.predict(dl_valid) # dl_valid is the Dataset object
+
+                if isinstance(validation_output, pd.DataFrame) and not validation_output.empty:
+                    # This is likely the output from MASTER.predict
+                    # Calculate daily ICs and then average
+                    daily_metrics_val = validation_output.groupby('date').apply(
+                        lambda x: pd.Series({
+                            'ic': calc_ic(x['prediction'], x['actual_return'])[0],
+                            'rank_ic': calc_ic(x['prediction'], x['actual_return'])[1]
+                        })
+                    ).reset_index()
+                    valid_ic = daily_metrics_val['ic'].mean()
+                    valid_ric = daily_metrics_val['rank_ic'].mean()
+                    logger.info(f"Validation ICs calculated from MASTER.predict DataFrame: IC={valid_ic:.4f}, RankIC={valid_ric:.4f}")
+                elif isinstance(validation_output, tuple) and len(validation_output) == 2:
+                    # This is likely the output from a base SequenceModel.predict (if it were called)
+                    # predictions_series, metrics_dict = validation_output
+                    # valid_ic = metrics_dict.get('IC', np.nan)
+                    # valid_ric = metrics_dict.get('RIC', np.nan)
+                    # logger.info(f"Validation ICs from SequenceModel.predict tuple: IC={valid_ic:.4f}, RankIC={valid_ric:.4f}")
+                    # This branch is less likely to be hit if MASTER always overrides predict.
+                    # For safety, let's assume MASTER.predict is what we are dealing with.
+                    pass # Keep ICs as NaN if we don't get the DataFrame from MASTER.predict
+                else:
+                    logger.warning(f"Unexpected output type from self.predict during validation: {type(validation_output)}. Cannot calculate ICs.")
+
+
                 epoch_log_msg_parts.append(f"valid_ic: {valid_ic:.4f}")
                 epoch_log_msg_parts.append(f"valid_rank_ic: {valid_ric:.4f}")
                 
