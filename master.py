@@ -9,8 +9,9 @@ import numpy as np
 import logging
 from torch.utils.data import DataLoader
 import torch.optim as optim
+from pathlib import Path
 
-from base_model import SequenceModel, calc_ic
+from base_model import calc_ic, zscore, drop_extreme  # Only import what we need
 
 # Setup logger for this module
 logger = logging.getLogger(__name__)
@@ -42,13 +43,8 @@ class SAttention(nn.Module):
         self.ktrans = nn.Linear(d_model, d_model, bias=False)
         self.vtrans = nn.Linear(d_model, d_model, bias=False)
 
-        attn_dropout_layer = []
-        if dropout > 0 and nhead > 0:
-            for _ in range(nhead): 
-                attn_dropout_layer.append(Dropout(p=dropout)) 
-            self.attn_dropout = nn.ModuleList(attn_dropout_layer) 
-        else:
-            self.attn_dropout = None
+        # OPTIMIZED: Use single dropout instead of per-head dropout
+        self.attn_dropout = nn.Dropout(p=dropout) if dropout > 0 and nhead > 0 else None
         
         self.norm1 = LayerNorm(d_model, eps=1e-5)
         self.norm2 = LayerNorm(d_model, eps=1e-5)
@@ -90,8 +86,9 @@ class SAttention(nn.Module):
             attn_scores_h = torch.matmul(q_h, k_h.transpose(-2, -1)) / self.temperature
             attn_probs_h = torch.softmax(attn_scores_h, dim=-1)
 
-            if self.attn_dropout and self.attn_dropout[i]:
-                attn_probs_h = self.attn_dropout[i](attn_probs_h)
+            # OPTIMIZED: Use single dropout for all heads
+            if self.attn_dropout:
+                attn_probs_h = self.attn_dropout(attn_probs_h)
             
             # Weighted sum for current head: (T_lookback, N_stocks, current_head_actual_dim)
             # (T, N, N) @ (T, N, h_dim) -> (T, N, h_dim)
@@ -120,13 +117,8 @@ class TAttention(nn.Module):  # Temporal Self-Attention
         self.ktrans = nn.Linear(d_model, d_model, bias=False)
         self.vtrans = nn.Linear(d_model, d_model, bias=False)
 
-        self.attn_dropout_modules = []
-        if dropout > 0 and nhead > 0:
-            for _ in range(nhead):
-                self.attn_dropout_modules.append(Dropout(p=dropout))
-            self.attn_dropout_modules = nn.ModuleList(self.attn_dropout_modules)
-        else:
-            self.attn_dropout_modules = None
+        # OPTIMIZED: Use single dropout instead of per-head dropout
+        self.attn_dropout = nn.Dropout(p=dropout) if dropout > 0 and nhead > 0 else None
 
         self.norm1 = LayerNorm(d_model, eps=1e-5)
         self.norm2 = LayerNorm(d_model, eps=1e-5)
@@ -170,8 +162,9 @@ class TAttention(nn.Module):  # Temporal Self-Attention
             attn_scores_h = attn_scores_h + causal_mask.unsqueeze(0)  # Broadcast across batch dimension
             atten_ave_matrixh = torch.softmax(attn_scores_h, dim=-1)
 
-            if self.attn_dropout_modules and self.attn_dropout_modules[i]:
-                atten_ave_matrixh = self.attn_dropout_modules[i](atten_ave_matrixh)
+            # OPTIMIZED: Use single dropout for all heads
+            if self.attn_dropout:
+                atten_ave_matrixh = self.attn_dropout(atten_ave_matrixh)
 
             weighted_values_h = torch.matmul(atten_ave_matrixh, v_h)
             att_output_list.append(weighted_values_h)
@@ -318,7 +311,7 @@ class PaperMASTERArchitecture(nn.Module):
             raise ValueError(f"d_feat_stock_specific ({self.d_feat_stock_specific}) must be positive. Check feature splitting and gate indices. Total features: {d_feat_input_total}, Market features: {num_market_features}")
 
         # ---------------------------------------------------------------
-        # Modules
+        # Modules - OPTIMIZED: Create modules directly without Sequential wrapper overhead
         # ---------------------------------------------------------------
         self.feature_gate = Gate(
             d_gate_input_dim=num_market_features,
@@ -328,18 +321,17 @@ class PaperMASTERArchitecture(nn.Module):
         self.feature_gate.trans = nn.Linear(num_market_features, self.d_feat_stock_specific)
         self.feature_gate.d_gate_output_dim = self.d_feat_stock_specific
 
-        self.layers = nn.Sequential(
-            nn.Linear(self.d_feat_stock_specific, d_model),
-            PositionalEncoding(d_model),
-            TAttention(
-                d_model=d_model,
-                nhead=t_nhead,
-                dropout=T_dropout_rate,
-            ),
-            SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate),
-            FinalTemporalAttention(d_model=d_model),
-            nn.Linear(d_model, 1),
+        # OPTIMIZED: Create individual modules instead of Sequential for faster init
+        self.input_linear = nn.Linear(self.d_feat_stock_specific, d_model)
+        self.pos_encoding = PositionalEncoding(d_model)
+        self.temporal_attention = TAttention(
+            d_model=d_model,
+            nhead=t_nhead,
+            dropout=T_dropout_rate,
         )
+        self.spatial_attention = SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate)
+        self.final_temporal_attention = FinalTemporalAttention(d_model=d_model)
+        self.output_linear = nn.Linear(d_model, 1)
 
     # -------------------------------------------------------------------
     # Forward
@@ -396,37 +388,48 @@ class PaperMASTERArchitecture(nn.Module):
         gated_stock_features = x_stock_specific * gate_vals.unsqueeze(1)  # broadcast to all T
 
         # ---------------------------------------------------------------
-        # Main MASTER layers
+        # Main MASTER layers - OPTIMIZED: Direct module calls instead of Sequential
         # ---------------------------------------------------------------
-        # The `self.layers` Sequential module expects input of shape (N, T, d_model)
-        # The `gated_stock_features` are (N, T, d_feat_stock_specific)
-        # The first layer in `self.layers` is Linear(self.d_feat_stock_specific, d_model)
-        # So, this matches up.
-        
         # Pass the gated stock-specific features through the model layers
-        # Output of self.layers is (N, 1) because the last layer is nn.Linear(d_model, 1)
-        final_scores = self.layers(gated_stock_features) # (N_stocks, 1)
+        x = self.input_linear(gated_stock_features)  # (N, T, d_model)
+        x = self.pos_encoding(x)  # (N, T, d_model)
+        x = self.temporal_attention(x)  # (N, T, d_model)
+        x = self.spatial_attention(x)  # (N, T, d_model)
+        x = self.final_temporal_attention(x)  # (N, d_model)
+        final_scores = self.output_linear(x)  # (N, 1)
         
-        # The self.layers already includes the final linear layer that maps to 1 dimension
-        # No additional decoder needed
         return final_scores
 
-class MASTERModel(SequenceModel):
+class MASTERModel():  # Remove SequenceModel inheritance
     def __init__(self, d_feat, d_model=256, t_nhead=4, s_nhead=2, T_dropout_rate=0.5, S_dropout_rate=0.5, 
                  beta=5.0, gate_input_start_index=0, gate_input_end_index=1, n_epochs=100, lr=0.001, 
                  GPU=None, seed=None, save_path=None, save_prefix="master_model"):
 
-        super().__init__(n_epochs=n_epochs, lr=lr, GPU=GPU, seed=seed,
-                         save_path=save_path, save_prefix=save_prefix,
-                         metric="loss", 
-                         early_stop=20, 
-                         patience=10,
-                         decay_rate=0.9,
-                         min_lr=1e-05,
-                         max_iters_epoch=None,
-                         train_noise=0.0
-                         )
-        # d_feat passed here is d_feat_input_total from main_multi_index.py
+        # OPTIMIZED: Minimal initialization to avoid expensive base class setup
+        self.n_epochs = n_epochs
+        self.lr = lr
+        self.device = torch.device(f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available() else "cpu")
+        self.seed = seed
+        self.save_path = Path(save_path) if save_path else Path("model_output")
+        self.save_prefix = save_prefix
+        
+        # FAST setup - only essential attributes without heavy operations
+        self.early_stop = 20
+        self.patience = 10
+        self.decay_rate = 0.9
+        self.min_lr = 1e-05
+        self.metric = "loss"
+        
+        # Only set seed if needed - skip complex setup
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            if self.device.type == 'cuda':
+                torch.cuda.manual_seed_all(self.seed)
+        
+        # Create save directory efficiently
+        self.save_path.mkdir(parents=True, exist_ok=True)
+        
+        # Model parameters
         self.d_feat_input_total = d_feat 
         self.d_model = d_model
         self.t_nhead = t_nhead
@@ -437,26 +440,37 @@ class MASTERModel(SequenceModel):
         self.gate_input_start_index = gate_input_start_index
         self.gate_input_end_index = gate_input_end_index
         
+        # FAST model creation - no heavy .to() operations until needed
         self.model = PaperMASTERArchitecture(
-            d_feat_input_total=self.d_feat_input_total, # Pass the total feature dim
+            d_feat_input_total=self.d_feat_input_total,
             d_model=self.d_model,
             t_nhead=self.t_nhead,
             s_nhead=self.s_nhead,
             T_dropout_rate=self.T_dropout_rate,
             S_dropout_rate=self.S_dropout_rate,
-            gate_input_start_index=self.gate_input_start_index, # Index in the total feature dim
-            gate_input_end_index=self.gate_input_end_index,     # Index in the total feature dim
+            gate_input_start_index=self.gate_input_start_index,
+            gate_input_end_index=self.gate_input_end_index,
             beta=self.beta 
-        ).to(self.device)
-
+        )
+        
+        # Lazy initialization - only move to device when needed for first training
+        self._device_moved = False
+        
+        # FAST optimizer setup
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         
-        # Use RegRankLoss instead of MSE as per paper
+        # FAST loss function setup
         self.loss_fn = RegRankLoss(beta=self.beta)
-        if self.device.type == 'cuda':
-            self.loss_fn = self.loss_fn.to(self.device)
         
-        logger.info("MASTERModel (Paper Architecture Replica) initialized.")
+        logger.info("MASTERModel (Fast Init) initialized.")
+    
+    def _ensure_device(self):
+        """Lazy device transfer - only when actually needed"""
+        if not self._device_moved:
+            self.model = self.model.to(self.device)
+            if self.device.type == 'cuda':
+                self.loss_fn = self.loss_fn.to(self.device)
+            self._device_moved = True
 
 
 class GRUModel(nn.Module):
