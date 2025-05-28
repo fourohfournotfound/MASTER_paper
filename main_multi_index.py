@@ -945,11 +945,6 @@ def main():
 
     logger.info("Starting training loop with paper's label processing...")
     
-    # OPTIMIZED: Create simple collate function to avoid complex tensor operations during DataLoader creation
-    def simple_collate_fn(batch):
-        """Simplified collate function - minimal processing during DataLoader creation"""
-        return batch  # Just return the batch as-is, process in training loop
-    
     # OPTIMIZED: Create DataLoaders with simple collate function (defer complex processing)
     print(f"[PERFORMANCE] Creating DataLoaders...")
     dataloader_start = time.time()
@@ -1092,105 +1087,69 @@ def main():
     if test_dataset:
         logger.info("Generating predictions on the test set...")
         
-        # Create optimized DataLoader for test set
+        # OPTIMIZED: Use simple_collate_fn for fast prediction generation (same as training)
         test_loader = DataLoader(
             test_dataset,
-            batch_size=64,  # Larger batch size for faster inference
+            batch_size=32,  # Use same batch size as training for consistency
             shuffle=False,
             num_workers=0,
-            pin_memory=True if device.type == 'cuda' else False,
-            persistent_workers=False,
-            collate_fn=custom_collate_fn,
+            pin_memory=False,  # Disable pin_memory for faster creation
+            collate_fn=simple_collate_fn,  # FIXED: Use optimized collate function
             drop_last=False
         )
         
         pytorch_model.eval()
         all_predictions_list = []
+        processed_days = 0  # Track which day we're processing
         
         with torch.no_grad():
             for batch_idx, batch_data in enumerate(test_loader):
-                # Use vectorized processing for fast inference
-                X_batch = batch_data['X'].to(device, non_blocking=True)
-                y_batch_original = batch_data['y_original'].to(device, non_blocking=True)
-                attention_masks = batch_data['attention_mask'].to(device, non_blocking=True)
-                
-                # Squeeze y_batch if needed
-                if y_batch_original.dim() > 2 and y_batch_original.shape[-1] == 1:
-                    y_batch_original = y_batch_original.squeeze(-1)
-                
-                batch_size, max_stocks, seq_len, features = X_batch.shape
-                
-                # Reshape for vectorized processing
-                X_flat = X_batch.view(-1, seq_len, features)
-                y_flat = y_batch_original.view(-1)
-                attention_flat = attention_masks.view(-1)
-                
-                # Filter valid stocks
-                valid_mask = attention_flat
-                if not torch.any(valid_mask):
-                    continue
-                
-                X_valid = X_flat[valid_mask]
-                y_valid = y_flat[valid_mask]
-                
-                # Create day and stock indices for mapping back to original structure
-                day_indices = torch.arange(batch_size, device=device).repeat_interleave(max_stocks)[valid_mask]
-                stock_indices_within_day = torch.arange(max_stocks, device=device).repeat(batch_size)[valid_mask]
-                
-                # Single forward pass for all valid stocks
-                if X_valid.shape[0] > 0:
-                    preds = pytorch_model(X_valid).squeeze().cpu().numpy()
-                    actuals = y_valid.cpu().numpy()
-                    day_indices_cpu = day_indices.cpu().numpy()
-                    
-                    # Map predictions back to (day, ticker) pairs
-                    for i, (pred_score, actual_label, day_idx) in enumerate(zip(preds, actuals, day_indices_cpu)):
-                        # Calculate absolute day index in test dataset
-                        absolute_day_idx = batch_idx * batch_size + day_idx
+                # OPTIMIZED: Use simple processing for predictions - much faster
+                for day_data in batch_data:
+                    if processed_days >= len(test_dataset.unique_dates):
+                        break  # Don't process more days than available
                         
-                        if absolute_day_idx < len(test_dataset.unique_dates):
-                            current_date = test_dataset.unique_dates[absolute_day_idx]
-                            
-                            # Get tickers for this day
-                            day_mask = test_dataset.multi_index.get_level_values('date') == current_date
-                            tickers_for_day = test_dataset.multi_index[day_mask].get_level_values('ticker').tolist()
-                            
-                            # Find which stock within the day this corresponds to
-                            day_stock_count = 0
-                            found_stock_idx = None
-                            for orig_day_idx, orig_day_count in enumerate([(test_dataset.multi_index.get_level_values('date') == d).sum() 
-                                                                          for d in test_dataset.unique_dates]):
-                                if orig_day_idx < absolute_day_idx:
-                                    day_stock_count += orig_day_count
-                                elif orig_day_idx == absolute_day_idx:
-                                    # This is our day, find the stock index
-                                    stocks_before_this = sum(1 for j, (d_idx, s_idx) in enumerate(zip(day_indices_cpu[:i], stock_indices_within_day.cpu().numpy()[:i])) 
-                                                            if d_idx == day_idx)
-                                    if stocks_before_this < len(tickers_for_day):
-                                        found_stock_idx = stocks_before_this
-                                    break
-                            
-                            if found_stock_idx is not None and found_stock_idx < len(tickers_for_day):
-                                ticker_val = tickers_for_day[found_stock_idx]
-                                
-                                # Ensure scalar values
-                                pred_score_scalar = float(pred_score) if hasattr(pred_score, 'item') else float(pred_score)
-                                actual_label_scalar = float(actual_label.item()) if hasattr(actual_label, 'item') else float(actual_label)
-                                
+                    X_day = day_data['X'].to(device, non_blocking=True)  # (N_stocks, seq_len, features)
+                    y_day = day_data['y_original'].to(device, non_blocking=True)  # (N_stocks, 1)
+                    
+                    if y_day.dim() > 1 and y_day.shape[-1] == 1:
+                        y_day = y_day.squeeze(-1)
+                    
+                    if X_day.shape[0] > 0:
+                        # Simple forward pass without preprocessing (this is inference)
+                        preds = pytorch_model(X_day)  # (N_stocks, 1)
+                        if preds.dim() > 1:
+                            preds = preds.squeeze()  # (N_stocks,)
+                        
+                        preds_cpu = preds.cpu().numpy()
+                        actuals_cpu = y_day.cpu().numpy()
+                        
+                        # Get the current date being processed
+                        current_date = test_dataset.unique_dates[processed_days]
+                        
+                        # Get tickers for this day efficiently
+                        day_mask = test_dataset.multi_index.get_level_values('date') == current_date
+                        tickers_for_day = test_dataset.multi_index[day_mask].get_level_values('ticker').tolist()
+                        
+                        # Map predictions to tickers
+                        for i, (pred_score, actual_return) in enumerate(zip(preds_cpu, actuals_cpu)):
+                            if i < len(tickers_for_day):
                                 all_predictions_list.append({
                                     'date': current_date,
-                                    'ticker': ticker_val,
-                                    'prediction': pred_score_scalar,
-                                    'actual_return': actual_label_scalar
+                                    'ticker': tickers_for_day[i],
+                                    'prediction': float(pred_score),
+                                    'actual_return': float(actual_return)
                                 })
+                    
+                    processed_days += 1  # Move to next day
                 
                 if batch_idx % 10 == 0:
-                    logger.info(f"Processed test batch {batch_idx}/{len(test_loader)}")
+                    logger.info(f"Processed test batch {batch_idx}/{len(test_loader)} - {len(all_predictions_list)} predictions so far")
         
         if all_predictions_list:
             predictions_df = pd.DataFrame(all_predictions_list)
             predictions_df['date'] = pd.to_datetime(predictions_df['date'])
-            logger.info(f"Generated {len(predictions_df)} predictions for backtesting")
+            logger.info(f"Generated {len(predictions_df)} predictions for backtesting efficiently")
         else:
             logger.warning("No predictions were generated for the test set.")
     else:
@@ -1301,6 +1260,14 @@ def custom_collate_fn(batch):
     result['y_processed'] = torch.stack(y_processed_list, dim=0)  # [batch_size, max_stocks]
     
     return result
+
+def simple_collate_fn(batch):
+    """
+    OPTIMIZED: Simplified collate function - minimal processing during DataLoader creation.
+    Just returns the batch as-is, processing is deferred to the training/inference loop.
+    This is much faster than custom_collate_fn for both training and prediction generation.
+    """
+    return batch  # Just return the batch as-is, process in training loop
 
 def vectorized_batch_forward(pytorch_model, criterion, batch_data, device, is_training=True):
     """
