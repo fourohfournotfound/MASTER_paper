@@ -18,16 +18,18 @@ import matplotlib.pyplot as plt # Added for plotting
 from torch.optim.lr_scheduler import ReduceLROnPlateau # For LR scheduling
 
 from master import MASTERModel
-from base_model import SequenceModel, DailyBatchSamplerRandom, calc_ic, zscore, drop_extreme # Add other necessary imports from base_model
+# Import specific functions we need without importing the entire base_model
+from base_model import zscore, drop_extreme
 
 # Setup basic logging
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Optimize logging for performance
-logger.setLevel(logging.WARNING)  # Reduce logging to only warnings and errors during training
-logging.getLogger('matplotlib').setLevel(logging.WARNING)  # Reduce matplotlib noise
+# Optimize logging for performance - set to ERROR only during intensive operations
+logger.setLevel(logging.ERROR)  # Only show errors, no info/warning spam
+logging.getLogger('matplotlib').setLevel(logging.ERROR)
+logging.getLogger('pandas').setLevel(logging.ERROR)
 
 print("[main_multi_index.py] Script started.") # DIAGNOSTIC PRINT
 
@@ -148,96 +150,89 @@ def create_sequences_multi_index_vectorized(data_multi_index, features_list, tar
     
     return X_array, y_array, all_indices
 
-class DailyGroupedTimeSeriesDataset(Dataset):
-    def __init__(self, X_sequences, y_targets, multi_index, device=None, pin_memory=False, preprocess_labels=True):
-        """
-        Dataset that groups data by unique dates from the multi_index.
-        Modified to keep tensors on CPU for multiprocessing compatibility.
-        """
-        print(f"[DailyGroupedTimeSeriesDataset] Initializing with X shape: {X_sequences.shape}, y shape: {y_targets.shape}, index length: {len(multi_index)}")
-        print(f"[DailyGroupedTimeSeriesDataset] Optimization settings: device={device}, pin_memory={pin_memory}, preprocess_labels={preprocess_labels}")
+def create_sequences_fast(data_multi_index, features_list, target_list, lookback_window, forecast_horizon=1):
+    """
+    FAST sequence creation - optimized version of original logic.
+    Uses efficient pandas operations without over-engineering.
+    """
+    start_time = time.time()
+    all_X, all_y, all_indices = [], [], []
+    
+    # Pre-filter and sort once
+    if not data_multi_index.index.is_monotonic_increasing:
+        data_multi_index = data_multi_index.sort_index()
+    
+    # Use efficient groupby iteration
+    for ticker, group_data in data_multi_index.groupby(level='ticker'):
+        # Direct numpy access for speed
+        features = group_data[features_list].values
+        targets = group_data[target_list].values
+        dates = group_data.index.get_level_values('date').values
         
+        n_samples = len(features)
+        
+        # Simple loop - often faster than complex vectorization for moderate sizes
+        for i in range(n_samples - lookback_window - forecast_horizon + 1):
+            feature_end = i + lookback_window
+            target_idx = feature_end + forecast_horizon - 1
+            
+            if target_idx < n_samples:
+                all_X.append(features[i:feature_end])
+                all_y.append(targets[target_idx])
+                all_indices.append((ticker, dates[target_idx]))
+    
+    if not all_X:
+        return np.array([]).reshape(0, lookback_window, len(features_list)), np.array([]), []
+    
+    X_array = np.array(all_X, dtype=np.float32)
+    y_array = np.array(all_y, dtype=np.float32)
+    
+    elapsed = time.time() - start_time
+    print(f"[FAST] Sequence creation: {elapsed:.2f}s, X: {X_array.shape}, y: {y_array.shape}")
+    
+    return X_array, y_array, all_indices
+
+def choose_sequence_method(data_multi_index, features_list, target_list, lookback_window, forecast_horizon=1):
+    """
+    Automatically choose the best sequence creation method based on dataset size.
+    """
+    n_tickers = len(data_multi_index.index.get_level_values('ticker').unique())
+    n_total_rows = len(data_multi_index)
+    
+    # Use simple method for smaller datasets (often faster due to less overhead)
+    if n_total_rows < 100000 or n_tickers < 100:
+        return create_sequences_fast(data_multi_index, features_list, target_list, lookback_window, forecast_horizon)
+    else:
+        return create_sequences_multi_index_vectorized(data_multi_index, features_list, target_list, lookback_window, forecast_horizon)
+
+class DailyGroupedTimeSeriesDataset(Dataset):
+    def __init__(self, X_sequences, y_targets, multi_index, device=None, pin_memory=False, preprocess_labels=False):
+        """
+        SIMPLIFIED Dataset - removed expensive pre-processing that was causing slowdowns.
+        Now uses lazy loading for better performance.
+        """
         if not isinstance(multi_index, pd.MultiIndex):
             raise ValueError("multi_index must be a Pandas MultiIndex.")
         if not ('date' in multi_index.names and 'ticker' in multi_index.names):
             raise ValueError("multi_index must have 'ticker' and 'date' as level names.")
 
+        self.X_sequences = X_sequences
+        self.y_targets = y_targets
         self.multi_index = multi_index
-        self.target_device = device  # Store target device but don't move tensors yet
+        self.target_device = device
         self.pin_memory = pin_memory
         self.preprocess_labels = preprocess_labels
         
+        # Get unique dates efficiently
         self.unique_dates = sorted(self.multi_index.get_level_values('date').unique())
-        self.data_by_date = {}
-
-        print(f"[DailyGroupedTimeSeriesDataset] Pre-converting data to tensors for {len(self.unique_dates)} unique dates...")
         
-        # Pre-group data by date and convert to CPU tensors for multiprocessing compatibility
-        for date_val in self.unique_dates:
+        # Create a simple mapping from date to indices - much faster than pre-processing everything
+        self.date_to_indices = {}
+        for i, date_val in enumerate(self.unique_dates):
             date_mask = self.multi_index.get_level_values('date') == date_val
-            X_day = X_sequences[date_mask]
-            y_day = y_targets[date_mask]
-            
-            # Convert to CPU tensors for multiprocessing compatibility
-            X_tensor = torch.tensor(X_day, dtype=torch.float32)
-            y_tensor = torch.tensor(y_day, dtype=torch.float32)
-            
-            # Pin memory if requested (faster CPU-GPU transfers)
-            if self.pin_memory:
-                X_tensor = X_tensor.pin_memory()
-                y_tensor = y_tensor.pin_memory()
-            
-            day_data = {
-                'X': X_tensor,
-                'y_original': y_tensor
-            }
-            
-            # Pre-process labels if requested
-            if self.preprocess_labels and y_tensor.numel() > 0:
-                # Import drop_extreme and zscore functions
-                try:
-                    from base_model import drop_extreme, zscore
-                    
-                    # Pre-compute label processing for training efficiency
-                    if y_tensor.shape[0] >= 10:  # Same logic as training loop
-                        with torch.no_grad():
-                            y_tensor_for_processing = y_tensor.clone()
-                            if self.target_device is None:  # Move to device temporarily for processing
-                                y_tensor_for_processing = y_tensor_for_processing.cuda() if torch.cuda.is_available() else y_tensor_for_processing
-                            
-                            label_mask, y_dropped_extreme = drop_extreme(y_tensor_for_processing)
-                            
-                            # Fix shape issue: label_mask might be [N, 1] but we need [N] for indexing
-                            if label_mask.dim() > 1:
-                                label_mask = label_mask.squeeze(-1)
-                            
-                            y_processed = zscore(y_dropped_extreme)
-                            
-                            # Move back to original device/location
-                            if self.target_device is None and torch.cuda.is_available():
-                                label_mask = label_mask.cpu()
-                                y_processed = y_processed.cpu()
-                            
-                            day_data['label_mask'] = label_mask
-                            day_data['y_processed'] = y_processed
-                    else:
-                        # For small batches, use all samples (no drop_extreme)
-                        label_mask = torch.ones(y_tensor.shape[0], dtype=torch.bool, device=y_tensor.device)
-                        y_processed = zscore(y_tensor.clone())
-                        day_data['label_mask'] = label_mask  
-                        day_data['y_processed'] = y_processed
-                        
-                except ImportError:
-                    print("[DailyGroupedTimeSeriesDataset] Warning: Could not import drop_extreme/zscore, skipping label preprocessing")
-                    day_data['label_mask'] = None
-                    day_data['y_processed'] = None
-            else:
-                day_data['label_mask'] = None
-                day_data['y_processed'] = None
-            
-            self.data_by_date[date_val] = day_data
-            
-        print(f"[DailyGroupedTimeSeriesDataset] Tensor pre-conversion completed for {len(self.unique_dates)} unique dates.")
+            self.date_to_indices[date_val] = np.where(date_mask)[0]
+        
+        print(f"[DailyGroupedTimeSeriesDataset] SIMPLIFIED initialization for {len(self.unique_dates)} unique dates - using lazy loading")
 
     def __len__(self):
         """Returns the number of unique days in the dataset."""
@@ -245,25 +240,27 @@ class DailyGroupedTimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        Returns all features and labels for a single day.
-        idx: An index representing a unique day.
+        SIMPLIFIED: Returns data for a single day with lazy tensor conversion.
+        Much faster than pre-processing everything.
         """
         selected_date = self.unique_dates[idx]
-        day_data = self.data_by_date[selected_date]
+        day_indices = self.date_to_indices[selected_date]
         
-        # Data is already converted to tensors and potentially on GPU
-        features_tensor = day_data['X']
-        labels_tensor = day_data['y_original']
+        # Get data for this day - lazy conversion to tensors
+        X_day = self.X_sequences[day_indices]
+        y_day = self.y_targets[day_indices]
         
-        # Return pre-processed labels if available
-        processed_data = {
-            'X': features_tensor,
-            'y_original': labels_tensor,
-            'label_mask': day_data.get('label_mask'),
-            'y_processed': day_data.get('y_processed')
+        # Convert to tensors only when needed
+        X_tensor = torch.tensor(X_day, dtype=torch.float32)
+        y_tensor = torch.tensor(y_day, dtype=torch.float32)
+        
+        # Simple return without complex pre-processing
+        return {
+            'X': X_tensor,
+            'y_original': y_tensor,
+            'label_mask': None,  # Will be processed in training loop if needed
+            'y_processed': None  # Will be processed in training loop if needed
         }
-        
-        return processed_data
 
     def get_index(self):
         """Returns the original multi_index, useful for aligning predictions."""
@@ -312,7 +309,7 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
         print("[main_multi_index.py] ERROR: features_list is empty before creating sequences in preprocess_data.")
         return None, None, None, scaler
 
-    X, y, seq_index = create_sequences_multi_index_vectorized(df, features_list, label_column, lookback_window)
+    X, y, seq_index = choose_sequence_method(df, features_list, label_column, lookback_window)
 
     if X.shape[0] == 0:
         print("[main_multi_index.py] ERROR: No data after sequencing in preprocess_data.")
@@ -407,11 +404,10 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     print(f"[OPTIMIZED] Starting load_and_prepare_data from: {csv_path}")
     
     try:
-        # Optimized CSV loading - specify dtypes to avoid inference overhead
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'closeadj']  # Known numeric columns
-        df = pd.read_csv(csv_path, 
-                        parse_dates=['date'],  # Parse dates during loading
-                        dtype={col: 'float32' for col in numeric_cols})  # Use float32 to save memory
+        # SIMPLIFIED CSV loading - remove complex dtype inference that was causing slowdowns
+        df = pd.read_csv(csv_path)
+        # Convert date after loading - more reliable than during loading
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
         print(f"[OPTIMIZED] CSV loaded efficiently. Shape: {df.shape}")
     except Exception as e:
         print(f"[OPTIMIZED] ERROR loading CSV: {e}")
@@ -562,15 +558,15 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     forecast_horizon = 1
 
     # Use the new vectorized sequence creation function
-    X_train, y_train, train_idx = create_sequences_multi_index_vectorized(
+    X_train, y_train, train_idx = choose_sequence_method(
         train_df, feature_columns, target_columns, lookback, forecast_horizon
     ) if not train_df.empty else (np.array([]), np.array([]), [])
     
-    X_valid, y_valid, valid_idx = create_sequences_multi_index_vectorized(
+    X_valid, y_valid, valid_idx = choose_sequence_method(
         valid_df, feature_columns, target_columns, lookback, forecast_horizon
     ) if not valid_df.empty else (np.array([]), np.array([]), [])
     
-    X_test, y_test, test_idx = create_sequences_multi_index_vectorized(
+    X_test, y_test, test_idx = choose_sequence_method(
         test_df, feature_columns, target_columns, lookback, forecast_horizon
     ) if not test_df.empty else (np.array([]), np.array([]), [])
 
@@ -934,9 +930,10 @@ def main():
         save_prefix=f"paper_master_arch_d{args.d_model}" 
     )
     
-    pytorch_model = model_wrapper.model.to(device)
+    # OPTIMIZED: Remove redundant device transfers - handled by lazy loading
+    pytorch_model = model_wrapper.model  # No .to(device) here
     optimizer = model_wrapper.optimizer 
-    criterion = model_wrapper.loss_fn.to(device) 
+    criterion = model_wrapper.loss_fn  # No .to(device) here
 
     scheduler = None
     if valid_dataset:
@@ -948,19 +945,22 @@ def main():
 
     logger.info("Starting training loop with paper's label processing...")
     
-    # Log initial GPU memory usage
-    if torch.cuda.is_available():
-        logger.info(f"GPU Memory - Initial: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
+    # OPTIMIZED: Create simple collate function to avoid complex tensor operations during DataLoader creation
+    def simple_collate_fn(batch):
+        """Simplified collate function - minimal processing during DataLoader creation"""
+        return batch  # Just return the batch as-is, process in training loop
     
-    # Create DataLoaders with optimized settings for maximum GPU utilization
+    # OPTIMIZED: Create DataLoaders with simple collate function (defer complex processing)
+    print(f"[PERFORMANCE] Creating DataLoaders...")
+    dataloader_start = time.time()
+    
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=32,  # Increased from 16 to 32 for better GPU utilization
+        batch_size=32,
         shuffle=False,
         num_workers=0,
-        pin_memory=True if device.type == 'cuda' else False,
-        persistent_workers=False,
-        collate_fn=custom_collate_fn,
+        pin_memory=False,  # Disable pin_memory to speed up creation
+        collate_fn=simple_collate_fn,  # Use simple collate
         drop_last=False
     )
     
@@ -968,16 +968,23 @@ def main():
     if valid_dataset:
         valid_loader = DataLoader(
             valid_dataset,
-            batch_size=32,  # Increased to match training batch size
+            batch_size=32,
             shuffle=False,
             num_workers=0,
-            pin_memory=True if device.type == 'cuda' else False,
-            persistent_workers=False,
-            collate_fn=custom_collate_fn,
+            pin_memory=False,
+            collate_fn=simple_collate_fn,
             drop_last=False
         )
     
-    logger.info(f"Created optimized DataLoaders with batch_size=32 for maximum GPU utilization")
+    dataloader_time = time.time() - dataloader_start
+    print(f"[PERFORMANCE] DataLoaders created in {dataloader_time:.3f}s")
+    
+    # Trigger lazy device transfer only when training starts
+    if hasattr(model_wrapper, '_ensure_device'):
+        model_wrapper._ensure_device()
+        print(f"[PERFORMANCE] Lazy device transfer completed")
+    
+    logger.info(f"Setup completed - starting training...")
     
     # Track training performance
     epoch_times = []
@@ -990,15 +997,15 @@ def main():
         total_days_processed = 0
         
         # Log GPU memory before training epoch
-        if torch.cuda.is_available() and epoch == 0:
+        if torch.cuda.is_available():
             logger.info(f"GPU Memory - Before training: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
         
-        # Optimized training loop using vectorized batch processing
+        # OPTIMIZED: Simple training loop using simplified batch processing
         for batch_idx, batch_data in enumerate(train_loader):
             optimizer.zero_grad()
             
-            # Use vectorized processing for maximum GPU utilization
-            batch_loss, num_valid_days = vectorized_batch_forward(
+            # Use simplified batch processing for better performance
+            batch_loss, num_valid_days = simple_batch_forward(
                 pytorch_model, criterion, batch_data, device, is_training=True
             )
             
@@ -1014,12 +1021,8 @@ def main():
                 total_days_processed += num_valid_days
                 processed_batches_train += 1
                 
-                if batch_idx % 25 == 0:  # Reduced frequency since batches are larger
-                    if torch.cuda.is_available():
-                        gpu_memory = torch.cuda.memory_allocated() / 1024**3
-                        logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Loss: {batch_loss.item():.6f}, Days: {num_valid_days}, GPU: {gpu_memory:.2f}GB")
-                    else:
-                        logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Loss: {batch_loss.item():.6f}, Days: {num_valid_days}")
+                if batch_idx % 25 == 0:  # Log progress
+                    print(f"[TRAINING] Epoch {epoch+1}, Batch {batch_idx}: Loss: {batch_loss.item():.6f}, Days: {num_valid_days}")
 
         epoch_end_time = time.time()
         epoch_duration = epoch_end_time - epoch_start_time
@@ -1037,8 +1040,8 @@ def main():
             
             with torch.no_grad():
                 for batch_idx, batch_data in enumerate(valid_loader):
-                    # Use vectorized processing for validation too
-                    val_loss, num_valid_days = vectorized_batch_forward(
+                    # Use simplified batch processing for validation too
+                    val_loss, num_valid_days = simple_batch_forward(
                         pytorch_model, criterion, batch_data, device, is_training=False
                     )
                     
@@ -1415,6 +1418,61 @@ def vectorized_batch_forward(pytorch_model, criterion, batch_data, device, is_tr
     num_valid_days = len(day_losses)
     
     return total_loss, num_valid_days
+
+def simple_batch_forward(pytorch_model, criterion, batch_list, device, is_training=True):
+    """
+    OPTIMIZED: Simple batch processing for better performance.
+    Works with simple_collate_fn that just returns a list of day data.
+    """
+    if not batch_list:
+        return None, 0
+    
+    all_X = []
+    all_y = []
+    
+    # Simple processing - just concatenate day data
+    for day_data in batch_list:
+        X_day = day_data['X'].to(device, non_blocking=True)  # (N_stocks, seq_len, features)
+        y_day = day_data['y_original'].to(device, non_blocking=True)  # (N_stocks, 1)
+        
+        if y_day.dim() > 1 and y_day.shape[-1] == 1:
+            y_day = y_day.squeeze(-1)
+        
+        if X_day.shape[0] > 0:
+            # Apply drop_extreme and zscore if training and enough samples
+            if is_training and len(y_day) >= 10:
+                try:
+                    mask, y_filtered = drop_extreme(y_day.clone())
+                    if torch.any(mask):
+                        X_day = X_day[mask]
+                        y_day = zscore(y_filtered)
+                    else:
+                        y_day = zscore(y_day)
+                except:
+                    y_day = zscore(y_day)
+            else:
+                y_day = zscore(y_day)
+            
+            if X_day.shape[0] > 0:
+                all_X.append(X_day)
+                all_y.append(y_day)
+    
+    if not all_X:
+        return None, 0
+    
+    # Concatenate all data
+    X_batch = torch.cat(all_X, dim=0)
+    y_batch = torch.cat(all_y, dim=0)
+    
+    # Forward pass
+    preds = pytorch_model(X_batch)
+    if preds.dim() > 1:
+        preds = preds.squeeze()
+    
+    # Calculate loss
+    loss = criterion(preds, y_batch)
+    
+    return loss, len(batch_list)
 
 # Add performance monitoring utility
 def monitor_performance(func_name):
