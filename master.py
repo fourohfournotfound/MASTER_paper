@@ -178,15 +178,43 @@ class TAttention(nn.Module):  # Temporal Self-Attention
 
 
 class Gate(nn.Module):
-    def __init__(self, d_gate_input_dim, beta: float = 1.0):
+    """
+    CORRECTED Gate implementation matching MASTER paper Equation 1.
+    
+    Paper equation: α(m_τ) = F · softmax_β(W_α m_τ + b_α)
+    where:
+    - m_τ is market info (market_dim)
+    - F is number of stock features (stock_feature_dim) 
+    - β is temperature parameter
+    - W_α maps market_dim -> stock_feature_dim
+    """
+    def __init__(self, market_dim, stock_feature_dim, beta=1.0):
         super(Gate, self).__init__()
-        self.d_gate_input_dim = d_gate_input_dim
-        self.d_gate_output_dim = d_gate_input_dim
-        self.trans = nn.Linear(d_gate_input_dim, d_gate_input_dim)
-        self.t = beta
+        self.market_dim = market_dim
+        self.stock_feature_dim = stock_feature_dim
+        self.beta = beta
+        
+        # Linear transformation: market_dim -> stock_feature_dim
+        self.trans = nn.Linear(market_dim, stock_feature_dim)
 
-    def forward(self, x):
-        return torch.softmax(self.trans(x) / self.t, dim=-1)
+    def forward(self, market_info):
+        """
+        Args:
+            market_info: (N, market_dim) - market features
+            
+        Returns:
+            gate_weights: (N, stock_feature_dim) - gating coefficients
+        """
+        # Apply linear transformation + bias
+        logits = self.trans(market_info)  # (N, stock_feature_dim)
+        
+        # Apply temperature-scaled softmax
+        probabilities = torch.softmax(logits / self.beta, dim=-1)  # (N, stock_feature_dim)
+        
+        # Scale by F (number of features) as in paper equation
+        gate_weights = self.stock_feature_dim * probabilities  # (N, stock_feature_dim)
+        
+        return gate_weights
 
 
 # This is the paper's "final" TemporalAttention that aggregates T dimension
@@ -314,12 +342,10 @@ class PaperMASTERArchitecture(nn.Module):
         # Modules - OPTIMIZED: Create modules directly without Sequential wrapper overhead
         # ---------------------------------------------------------------
         self.feature_gate = Gate(
-            d_gate_input_dim=num_market_features,
+            market_dim=num_market_features,
+            stock_feature_dim=self.d_feat_stock_specific,
             beta=beta
         )
-
-        self.feature_gate.trans = nn.Linear(num_market_features, self.d_feat_stock_specific)
-        self.feature_gate.d_gate_output_dim = self.d_feat_stock_specific
 
         # OPTIMIZED: Create individual modules instead of Sequential for faster init
         self.input_linear = nn.Linear(self.d_feat_stock_specific, d_model)
@@ -370,21 +396,11 @@ class PaperMASTERArchitecture(nn.Module):
         # ---------------------------------------------------------------
         # Gating
         # ---------------------------------------------------------------
-        # --- paper behaviour: use market info from the **last** frame ---
-        gate_vals = self.feature_gate(x_market_info[:, -1, :])           # (N, num_market_features), but gate output is (N, d_feat_stock_specific)
-        # The gate's output dimension must match d_feat_stock_specific for element-wise product.
-        # This implies the Gate module's internal Linear layer should map num_market_features -> d_feat_stock_specific.
-        # Let's re-check Gate __init__ and forward. The current Gate maps d_gate_input_dim -> d_gate_input_dim.
-        # For the paper's logic, Gate should transform market features into a gating signal for stock-specific features.
-        # The paper states: "The feature gate g_t is a linear layer with softmax activation that takes r_M,t as input."
-        # "The output of g_t is a vector of weights w_t of the same dimension as r_S,t."
-        # So, Gate's Linear layer should be from num_market_features to d_feat_stock_specific.
-        # This will be addressed in a subsequent change if Gate's definition needs update.
-        # For now, assuming gate_vals has shape (N, d_feat_stock_specific)
+        # Apply gate using market info from the last timestep (most recent)
+        gate_vals = self.feature_gate(x_market_info[:, -1, :])  # (N, d_feat_stock_specific)
         
-        # The original paper description for gating: w_t = softmax(Linear(r_M,t)). r_S,t_gated = r_S,t * w_t
-        # If gate_vals is (N, d_feat_stock_specific) and x_stock_specific is (N, T, d_feat_stock_specific)
-        # We need to unsqueeze gate_vals to (N, 1, d_feat_stock_specific) to broadcast over T
+        # Apply gating to stock-specific features across all timesteps
+        # gate_vals: (N, d_feat_stock_specific), x_stock_specific: (N, T, d_feat_stock_specific)
         gated_stock_features = x_stock_specific * gate_vals.unsqueeze(1)  # broadcast to all T
 
         # ---------------------------------------------------------------
@@ -518,7 +534,7 @@ class ALSTMModel(LSTMModel):
 
 class MASTERNet(nn.Module):
     def __init__(self, d_feat, d_model, t_nhead, s_nhead, T_dropout_rate, S_dropout_rate, 
-                 gate_input_start_index, gate_input_end_index):
+                 gate_input_start_index, gate_input_end_index, beta=5.0):
         super(MASTERNet, self).__init__()
         self.d_feat = d_feat
         self.d_model = d_model
@@ -526,12 +542,12 @@ class MASTERNet(nn.Module):
         self.gate_input_end_index = gate_input_end_index
         
         # Calculate dimensions
-        gate_dim = gate_input_end_index - gate_input_start_index
+        market_dim = gate_input_end_index - gate_input_start_index
         factor_dim = gate_input_start_index  # Only pre-market factors as per paper
         
-        # Initialize components
-        self.gate = Gate(gate_dim)
-        self.linear_in = nn.Linear(factor_dim + gate_dim, d_model)
+        # Initialize components with corrected Gate
+        self.gate = Gate(market_dim=market_dim, stock_feature_dim=factor_dim, beta=beta)
+        self.linear_in = nn.Linear(factor_dim + market_dim, d_model)
         self.pos_encoding = PositionalEncoding(d_model)
         self.temporal_attention = TAttention(d_model, t_nhead, T_dropout_rate)
         self.spatial_attention = SAttention(d_model, s_nhead, S_dropout_rate)
@@ -549,13 +565,13 @@ class MASTERNet(nn.Module):
         # Apply Gate per timestep to avoid lookahead bias
         gated_features_list = []
         for t in range(T):
-            gate_weights_t = self.gate(market_features[:, t, :])  # (N, gate_dim)
+            gate_weights_t = self.gate(market_features[:, t, :])  # (N, factor_dim)
             if factor_features.shape[2] > 0:
                 # Apply gate to factor features at timestep t
                 gated_factors_t = factor_features[:, t, :] * gate_weights_t
                 combined_t = torch.cat([gated_factors_t, market_features[:, t, :]], dim=1)
             else:
-                combined_t = market_features[:, t, :] * gate_weights_t
+                combined_t = market_features[:, t, :] * gate_weights_t[:, :market_features.shape[2]]
             gated_features_list.append(combined_t.unsqueeze(1))
         
         combined_features = torch.cat(gated_features_list, dim=1)  # (N, T, combined_dim)
