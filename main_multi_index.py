@@ -1008,13 +1008,16 @@ def main():
     logger.info("Starting training loop with paper's label processing...")
     
     # Create DataLoaders for optimized training
+    # Fix: Disable multiprocessing when using CUDA tensors to avoid forking issues
+    num_workers = 0 if device.type == 'cuda' else 4
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=1,  # Keep batch_size=1 since each item is one day
         shuffle=False,  # Don't shuffle to maintain temporal order for time series
-        num_workers=4,  # Enable parallel data loading
-        pin_memory=True if device.type == 'cuda' else False,  # Faster GPU transfers
-        persistent_workers=True  # Keep workers alive between epochs
+        num_workers=num_workers,  # Set to 0 for CUDA to avoid multiprocessing issues
+        pin_memory=False,  # Disable pin_memory when using pre-moved tensors
+        persistent_workers=False  # Disable when num_workers=0
     )
     
     valid_loader = None
@@ -1023,12 +1026,12 @@ def main():
             valid_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=2,  # Fewer workers for validation
-            pin_memory=True if device.type == 'cuda' else False,
-            persistent_workers=True
+            num_workers=num_workers,  # Set to 0 for CUDA
+            pin_memory=False,  # Disable pin_memory when using pre-moved tensors
+            persistent_workers=False  # Disable when num_workers=0
         )
     
-    logger.info(f"Created DataLoaders with {4 if device.type == 'cuda' else 0} workers for training, {2 if valid_dataset and device.type == 'cuda' else 0} for validation")
+    logger.info(f"Created DataLoaders with {num_workers} workers for training/validation (disabled for CUDA compatibility)")
     
     # Gradient accumulation for larger effective batch size
     accumulation_steps = 4  # Accumulate gradients over 4 days before updating
@@ -1241,9 +1244,9 @@ def main():
             test_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=2,
-            pin_memory=True if device.type == 'cuda' else False,
-            persistent_workers=True
+            num_workers=0,  # Disable multiprocessing for CUDA compatibility
+            pin_memory=False,  # Disable pin_memory when using pre-moved tensors
+            persistent_workers=False  # Disable when num_workers=0
         )
         
         pytorch_model.eval()
