@@ -1,11 +1,23 @@
 import numpy as np
 import pandas as pd
 import copy
+import logging
+import sys
+from pathlib import Path
 
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
 import torch
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+import torch.nn as nn
+
+# Setup basic logging for this module if not already configured globally
+logger = logging.getLogger(__name__)
+# Ensure a handler is configured for the logger if running this module standalone or if not configured by the main script.
+if not logger.handlers:
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 def calc_ic(pred, label):
     df = pd.DataFrame({'pred':pred, 'label':label})
@@ -100,33 +112,81 @@ class DaySampler(Sampler):
 
 
 class SequenceModel():
-    def __init__(self, n_epochs, lr, GPU=None, seed=None, train_stop_loss_thred=None, save_path = 'model/', save_prefix= ''):
+    """
+    Base class for sequence models.
+    Handles training, prediction, saving and loading of the model.
+    """
+    def __init__(self, n_epochs=100, lr=0.001, GPU=None, seed=None, 
+                 train_stop_loss_thred=None, save_path="model/", save_prefix="model",
+                 metric="loss", early_stop=20, patience=10, decay_rate=0.9, min_lr=1e-05,
+                 max_iters_epoch=None, train_noise=0.0): # Added missing HPs
+        """
+        Initialize the SequenceModel.
+
+        Parameters:
+        - n_epochs (int): Number of training epochs.
+        - lr (float): Learning rate.
+        - GPU (int or None): GPU ID to use. If None, use CPU.
+        - seed (int or None): Random seed for reproducibility.
+        - train_stop_loss_thred (float or None): Threshold for early stopping based on training loss.
+        - save_path (str): Directory to save the trained model.
+        - save_prefix (str): Prefix for the saved model filename.
+        - metric (str): Metric to monitor for early stopping (e.g., "loss", "ic").
+        - early_stop (int): Number of epochs for early stopping if no improvement.
+        - patience (int): Number of epochs to wait before decaying learning rate.
+        - decay_rate (float): Factor by which to decay learning rate.
+        - min_lr (float): Minimum learning rate.
+        - max_iters_epoch (int or None): Maximum number of iterations (batches) per epoch.
+        - train_noise (float): Standard deviation of Gaussian noise to add to inputs during training.
+        """
         self.n_epochs = n_epochs
         self.lr = lr
-        self.device = torch.device(f"cuda:{GPU}" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available() else "cpu")
         self.seed = seed
         self.train_stop_loss_thred = train_stop_loss_thred
+        self.save_path = Path(save_path)
+        self.save_prefix = save_prefix
+        
+        self.metric = metric
+        self.early_stop = early_stop
+        self.patience = patience
+        self.decay_rate = decay_rate
+        self.min_lr = min_lr
+        self.max_iters_epoch = max_iters_epoch
+        self.train_noise = train_noise
+
+        self.model = None  # This will be set by subclasses (e.g., GRU, LSTM specific models)
+        self.optimizer = None
+        self.criterion = nn.MSELoss() # Default loss, can be overridden
+        self.scheduler = None
+
 
         if self.seed is not None:
             np.random.seed(self.seed)
             torch.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)
-            torch.backends.cudnn.deterministic = True
-        self.fitted = -1
-
-        self.model = None
-        self.train_optimizer = None
-
-        self.save_path = save_path
-        self.save_prefix = save_prefix
-
+            if self.device.type == 'cuda':
+                torch.cuda.manual_seed_all(self.seed)
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+        
+        self.save_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"SequenceModel initialized. Device: {self.device}, Save Path: {self.save_path}")
 
     def init_model(self):
+        """
+        Initializes the optimizer and learning rate scheduler.
+        This method should be called after self.model is defined by a subclass.
+        """
         if self.model is None:
-            raise ValueError("model has not been initialized")
-
-        self.train_optimizer = optim.Adam(self.model.parameters(), self.lr)
+            raise ValueError("self.model must be defined before calling init_model().")
+        
         self.model.to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.scheduler = lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min' if 'loss' in self.metric else 'max', # Adjust mode based on metric
+            factor=self.decay_rate, patience=self.patience, min_lr=self.min_lr, verbose=True
+        )
+        logger.info("Optimizer and LR Scheduler initialized.")
 
     def loss_fn(self, pred, label):
         mask = ~torch.isnan(label)
@@ -176,10 +236,10 @@ class SequenceModel():
             loss = self.loss_fn(pred, current_labels_processed)
             losses.append(loss.item())
 
-            self.train_optimizer.zero_grad()
+            self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
-            self.train_optimizer.step()
+            self.optimizer.step()
 
         return float(np.mean(losses))
 
@@ -259,33 +319,103 @@ class SequenceModel():
         print("[SequenceModel] Initializing training DataLoader...")
         train_loader = self._init_data_loader(dl_train, shuffle=True, drop_last=True)
         
-        if train_loader is None : # or len(train_loader) == 0 if it's an iterable with a __len__
+        valid_loader = None
+        if dl_valid is not None and len(dl_valid) > 0: # Check if dl_valid has data
+            print("[SequenceModel] Initializing validation DataLoader...")
+            valid_loader = self._init_data_loader(dl_valid, shuffle=False, drop_last=False) # No shuffle for validation
+
+        if train_loader is None : 
              print("[SequenceModel] ERROR: train_loader is None after _init_data_loader. Cannot proceed with training.")
              return
-        # A more robust check for an empty DataLoader from a sampler perspective:
-        # Try to get an iterator and see if it's empty, but this might consume the first batch.
-        # For now, we rely on DaySampler's length and _init_data_loader's internal checks.
 
         best_param = None
+        # Initialize based on whether higher or lower metric is better for early stopping
+        best_valid_metric_val = -np.inf if 'ic' in self.metric.lower() else np.inf
+        epochs_no_improve = 0
+
         print("[SequenceModel] Starting training loop...")
         for step in range(self.n_epochs):
-            print(f"[SequenceModel] Epoch {step + 1}/{self.n_epochs} - Starting train_epoch...")
+            epoch_log_msg_parts = []
+            epoch_log_msg_parts.append(f"[SequenceModel] Epoch {step + 1}/{self.n_epochs}")
+            
+            print(f"{epoch_log_msg_parts[0]} - Starting train_epoch...")
             train_loss = self.train_epoch(train_loader)
-            self.fitted = step
-            print(f"[SequenceModel] Epoch {step + 1}/{self.n_epochs} - train_loss: {train_loss:.6f}")
+            self.fitted = step # Mark as fitted at least one epoch
+            epoch_log_msg_parts.append(f"train_loss: {train_loss:.6f}")
 
-            if dl_valid:
-                print(f"[SequenceModel] Epoch {step + 1}/{self.n_epochs} - Performing validation...")
-                predictions, metrics = self.predict(dl_valid)
-                print("Epoch %d, train_loss %.6f, valid ic %.4f, icir %.3f, rankic %.4f, rankicir %.3f." % (step, train_loss, metrics['IC'],  metrics['ICIR'],  metrics['RIC'],  metrics['RICIR']))
-            else: print("Epoch %d, train_loss %.6f" % (step, train_loss))
+            current_lr = self.optimizer.param_groups[0]['lr']
+            epoch_log_msg_parts.append(f"lr: {current_lr:.6e}")
+
+            if valid_loader: # Check if valid_loader was successfully created
+                print(f"{epoch_log_msg_parts[0]} - Performing validation...")
+                # Calculate validation loss
+                valid_loss = self.test_epoch(valid_loader) # Ensure test_epoch returns average loss
+                epoch_log_msg_parts.append(f"valid_loss: {valid_loss:.6f}")
+                
+                # Calculate IC metrics for validation
+                # self.predict expects the dataset object, not the loader
+                predictions_series, metrics = self.predict(dl_valid) 
+                valid_ic = metrics.get('IC', np.nan)
+                valid_ric = metrics.get('RIC', np.nan)
+                epoch_log_msg_parts.append(f"valid_ic: {valid_ic:.4f}")
+                epoch_log_msg_parts.append(f"valid_rank_ic: {valid_ric:.4f}")
+                
+                # Determine metric for scheduler and early stopping
+                metric_for_scheduler = valid_loss # Default to validation loss
+                if self.metric == 'ic':
+                    metric_for_scheduler = valid_ic
+                elif self.metric == 'ric':
+                    metric_for_scheduler = valid_ric
+                
+                self.scheduler.step(metric_for_scheduler)
+
+                # Early stopping logic
+                improved = False
+                if 'ic' in self.metric.lower(): # Higher is better for IC
+                    if metric_for_scheduler > best_valid_metric_val:
+                        best_valid_metric_val = metric_for_scheduler
+                        improved = True
+                else: # Lower is better for loss
+                    if metric_for_scheduler < best_valid_metric_val:
+                        best_valid_metric_val = metric_for_scheduler
+                        improved = True
+                
+                if improved:
+                    epochs_no_improve = 0
+                    best_param = copy.deepcopy(self.model.state_dict())
+                    logger.info(f"Epoch {step + 1}: New best validation {self.metric}: {best_valid_metric_val:.4f}. Saving model.")
+                    torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}_best.pkl')
+                else:
+                    epochs_no_improve += 1
+                
+                if epochs_no_improve >= self.early_stop:
+                    logger.info(f"Early stopping triggered after {epochs_no_improve} epochs with no improvement on validation {self.metric}.")
+                    if best_param is not None:
+                        logger.info("Loading best model parameters.")
+                        self.model.load_state_dict(best_param) # Load best model
+                    break
+            
+            print(" - ".join(epoch_log_msg_parts))
 
             if self.train_stop_loss_thred is not None and train_loss <= self.train_stop_loss_thred:
-                print(f"[SequenceModel] Training stop threshold met. train_loss: {train_loss:.6f} <= {self.train_stop_loss_thred}")
-                best_param = copy.deepcopy(self.model.state_dict())
-                torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}.pkl')
-                print(f"[SequenceModel] Model saved to {self.save_path}/{self.save_prefix}_{self.seed}.pkl")
+                logger.info(f"Training stop threshold based on train_loss met. train_loss: {train_loss:.6f} <= {self.train_stop_loss_thred}")
+                if best_param is None : 
+                    best_param = copy.deepcopy(self.model.state_dict())
+                    torch.save(best_param, f'{self.save_path}/{self.save_prefix}_{self.seed}_best.pkl')
+                    logger.info(f"Model saved to {self.save_path}/{self.save_prefix}_{self.seed}_best.pkl based on train_stop_loss_thred.")
                 break
+        
+        if not (epochs_no_improve >= self.early_stop): # If not early stopped
+            if best_param is None and self.n_epochs > 0 : 
+                 final_model_state = copy.deepcopy(self.model.state_dict())
+                 torch.save(final_model_state, f'{self.save_path}/{self.save_prefix}_{self.seed}_final.pkl')
+                 logger.info(f"Training finished. Final model saved to {self.save_path}/{self.save_prefix}_{self.seed}_final.pkl")
+            elif best_param is not None and not Path(f'{self.save_path}/{self.save_prefix}_{self.seed}_final.pkl').exists():
+                 # If best model was saved due to validation, but training completed all epochs
+                 # and we want to ensure the 'best' model is what's considered final if not overwritten
+                 logger.info(f"Training finished. Best model (from validation) at {self.save_path}/{self.save_prefix}_{self.seed}_best.pkl is considered the final state for this run if no explicit final save.")
+
+
         print("[SequenceModel] Fit method completed.")
 
     def predict(self, dl_test):
