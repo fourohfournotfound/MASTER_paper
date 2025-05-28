@@ -148,10 +148,14 @@ class DailyGroupedTimeSeriesDataset(Dataset):
         """Returns the original multi_index, useful for aligning predictions."""
         return self.multi_index
 
-def preprocess_data(df, features_list, label_column, lookback_window):
+def preprocess_data(df, features_list, label_column, lookback_window, scaler=None, fit_scaler=False):
     """
     Main preprocessing function.
     Handles NaN imputation, feature scaling, and sequence creation.
+    
+    Args:
+        scaler: If provided, use this fitted scaler. If None and fit_scaler=True, fit a new one.
+        fit_scaler: Whether to fit the scaler on this data (should only be True for training data)
     """
     print("[main_multi_index.py] Starting preprocess_data.") # DIAGNOSTIC PRINT
     
@@ -163,46 +167,83 @@ def preprocess_data(df, features_list, label_column, lookback_window):
         )
         print("[main_multi_index.py] Converted date index to datetime.")
 
+    # 1. Handle NaNs in features (columns to drop were already handled globally before this function is called on splits)
+    print("[main_multi_index.py] Preprocessing data split: Handling NaNs/Infs in features (replace inf, ffill, fill with 0).")
+    
+    if features_list and not df.empty:
+        # Ensure Infs are NaNs for the current df slice for all feature columns
+        df.loc[:, features_list] = df[features_list].replace([np.inf, -np.inf], np.nan)
 
-    # 1. Handle NaNs (grouped by ticker, then forward fill, then backward fill)
-    print("[main_multi_index.py] Handling NaNs...")
-    df[features_list] = df.groupby(level='ticker')[features_list].ffill().bfill()
-    # df.dropna(subset=features_list + [label_column], inplace=True) # Drop rows if critical data still missing
-    # A less aggressive approach: drop rows where label is NaN, or too many features are NaN
-    initial_rows = len(df)
-    df.dropna(subset=[label_column], inplace=True) # Label is critical
-    # For features, allow some NaNs if not too many, or fill with 0/mean after ffill/bfill
-    # For simplicity here, let's assume ffill/bfill handled most, or we accept some feature NaNs if model can handle
-    # If any feature is ALL NaN for a ticker after ffill/bfill, those sequence windows will be problematic.
-    # Let's fill any remaining NaNs in features with 0 after ffill/bfill, as a common strategy.
-    df[features_list] = df[features_list].fillna(0)
-    print(f"[main_multi_index.py] NaN handling complete. Rows before: {initial_rows}, after label drop & fill: {len(df)}")
+        # Grouped forward fill for NaNs in features
+        # Using group_keys=False can sometimes be safer for apply-like operations, though for ffill it might not be strictly necessary.
+        df.loc[:, features_list] = df.groupby(level='ticker', group_keys=False)[features_list].ffill()
+        
+        # Fill any remaining NaNs in features with 0 (e.g., if a ticker's series started with NaN)
+        df.loc[:, features_list] = df[features_list].fillna(0)
+        print(f"[main_multi_index.py] Feature NaN/Inf handling complete for this split. Features processed: {len(features_list)}")
+    elif df.empty:
+        print("[main_multi_index.py] DataFrame is empty, skipping NaN/Inf handling for features.")
+    elif not features_list:
+        print("[main_multi_index.py] features_list is empty, skipping NaN/Inf handling for features.")
 
 
-    # 2. Feature Scaling (using StandardScaler, per feature, across all data for simplicity here)
-    # More robust: fit scaler on training data only, then transform train/test.
-    # For now, global scaling for demonstration.
+    # Handle NaNs in the label column (dropna) - this is crucial
+    initial_rows_before_label_dropna = len(df)
+    df.dropna(subset=[label_column], inplace=True) # This ensures labels are not NaN
+    rows_dropped_for_label = initial_rows_before_label_dropna - len(df)
+    if rows_dropped_for_label > 0:
+        print(f"[main_multi_index.py] Dropped {rows_dropped_for_label} rows due to NaNs in label column '{label_column}'.")
+    
+    print(f"[main_multi_index.py] NaN handling for this data split complete. Rows remaining: {len(df)}")
+
+    # 2. Feature Scaling
     print("[main_multi_index.py] Scaling features...")
-    scaler = StandardScaler()
-    # Scale features. Avoid "SettingWithCopyWarning" by using .loc
-    df.loc[:, features_list] = scaler.fit_transform(df[features_list])
-    print("[main_multi_index.py] Feature scaling complete.")
+    if fit_scaler:
+        if not features_list:
+            print("[main_multi_index.py] No features to scale (features_list is empty). Scaler will not be fitted.")
+            # scaler remains as passed (e.g. None) or previous state
+        elif df[features_list].empty:
+             print("[main_multi_index.py] Data for scaling is empty. Scaler will not be fitted.")
+        else:
+            scaler = StandardScaler()
+            df.loc[:, features_list] = scaler.fit_transform(df[features_list])
+            print("[main_multi_index.py] Fitted new scaler and transformed features.")
+    elif scaler is not None:
+        if not features_list:
+            print("[main_multi_index.py] No features to scale (features_list is empty).")
+        elif df[features_list].empty:
+            print("[main_multi_index.py] Data for scaling is empty, skipping transformation.")
+        else:
+            # Ensure only existing columns in df[features_list] are transformed
+            # This can happen if scaler was fit on more features than currently available in a split
+            # However, the global pruning should make features_list consistent.
+            cols_to_scale = [col for col in features_list if col in df.columns]
+            if cols_to_scale:
+                 df.loc[:, cols_to_scale] = scaler.transform(df[cols_to_scale])
+                 print(f"[main_multi_index.py] Transformed features using provided scaler for columns: {cols_to_scale}.")
+            else:
+                print("[main_multi_index.py] No common features to scale with provided scaler or features_list is out of sync.")
+    else:
+        print("[main_multi_index.py] No scaling applied.")
+        # scaler remains None if it was passed as None and fit_scaler is False
 
     # 3. Create sequences
+    if not features_list:
+        print("[main_multi_index.py] ERROR: features_list is empty before creating sequences in preprocess_data.")
+        return None, None, None, scaler
+
     X, y, seq_index = create_sequences_multi_index(df, features_list, label_column, lookback_window)
 
     if X.shape[0] == 0:
-        print("[main_multi_index.py] ERROR: No data after sequencing in preprocess_data. Exiting or handling.")
-        # Depending on desired behavior, you might raise an error or return empty arrays
-        return None, None, None 
+        print("[main_multi_index.py] ERROR: No data after sequencing in preprocess_data.")
+        return None, None, None, scaler # Return scaler here
 
-
-    print(f"[main_multi_index.py] preprocess_data completed. X shape: {X.shape}, y shape: {y.shape}") # DIAGNOSTIC PRINT
-    return X, y, seq_index, scaler # Return scaler if needed later for inverse transform or test set
+    print(f"[main_multi_index.py] preprocess_data completed. X shape: {X.shape}, y shape: {y.shape}")
+    return X, y, seq_index, scaler
 
 
 def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, 
-                          train_val_split_date_str, val_test_split_date_str): # Changed parameter names for clarity
+                          train_val_split_date_str, val_test_split_date_str):
     print(f"[main_multi_index.py] Starting load_and_prepare_data from: {csv_path}") # DIAGNOSTIC PRINT
     try:
         df = pd.read_csv(csv_path)
@@ -256,7 +297,10 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
             print(f"[main_multi_index.py] Generating 'label' as next day's pct_change of '{label_source_col}'.")
             # Ensure label generation is done per ticker to avoid leakage across tickers at boundaries
             df['label'] = df.groupby(level='ticker')[label_source_col].pct_change(1).shift(-1)
-            df.dropna(subset=['label'], inplace=True) # Drop rows where label couldn't be computed (last day per ticker)
+            # It's important to drop NaNs from labels. This might remove the last day for each ticker.
+            # This dropna should happen before feature processing that might depend on alignment.
+            df.dropna(subset=['label'], inplace=True) 
+            print(f"[main_multi_index.py] Dropped rows where new label is NaN. Shape after label generation: {df.shape}")
         else:
             print("[main_multi_index.py] ERROR: 'label' column missing and suitable price column ('closeadj', 'adj_close', 'close') not available to generate it.")
             return None, None, None, None, None, None, None, None, None, None
@@ -278,51 +322,89 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
     # they should be handled (e.g. dropped or converted) before this step.
     # Example: df.drop(columns=['any_other_string_column_not_for_features'], inplace=True, errors='ignore')
 
-    if not feature_columns:
-        print("[main_multi_index.py] ERROR: No numeric feature columns identified after filtering.")
+    print(f"[main_multi_index.py] Initial feature columns identified: {feature_columns[:5] if len(feature_columns) > 5 else feature_columns}... (Total: {len(feature_columns)})")
+
+    # === Global NaN/Inf Column Pruning Step ===
+    if feature_columns: 
+        logger.info("Starting global NaN/Inf column pruning...")
+        # Replace Inf with NaN globally in feature columns for accurate NaN count for pruning
+        df.loc[:, feature_columns] = df[feature_columns].replace([np.inf, -np.inf], np.nan)
+
+        columns_to_drop_globally = []
+        for col in feature_columns:
+            if col in df.columns: # Should always be true at this point
+                nan_percentage = df[col].isnull().sum() / len(df)
+                if nan_percentage > 0.3:
+                    columns_to_drop_globally.append(col)
+                    logger.info(f"Globally identified column '{col}' for removal due to {nan_percentage*100:.2f}% NaN values (threshold 30%).")
+            # This else case should ideally not be hit if feature_columns are derived from df.columns
+            # else: 
+            #     logger.warning(f"Column '{col}' from feature_columns list not found in DataFrame during global pruning. Skipping.")
+
+        if columns_to_drop_globally:
+            df.drop(columns=columns_to_drop_globally, inplace=True)
+            # Update feature_columns list
+            feature_columns = [col for col in feature_columns if col not in columns_to_drop_globally]
+            logger.info(f"Globally dropped {len(columns_to_drop_globally)} columns: {columns_to_drop_globally}.")
+            logger.info(f"Remaining features after pruning: {len(feature_columns)}")
+            if not feature_columns: # If all feature columns were dropped
+                 logger.error("All feature columns were dropped due to high NaN content. No features remaining.")
+                 print("[main_multi_index.py] ERROR: No feature columns remaining after global NaN threshold drop. Cannot proceed.")
+                 return None, None, None, None, None, None, None, None, None, None 
+        else:
+            logger.info("No columns exceeded the 30% NaN threshold globally for pruning.")
+    else: # No initial feature columns identified
+        print("[main_multi_index.py] No numeric feature columns were identified initially. Skipping pruning.")
+        logger.warning("No numeric feature columns identified initially. Cannot proceed with feature processing.")
+        # If feature_columns is empty from the start, the previous error check for it should catch this.
+        # This path (else of `if feature_columns:`) might be redundant if the earlier check is robust.
+        # For safety, if we reach here and feature_columns is empty, it's an error.
+        if not feature_columns: # Double check, as the outer if implies it was empty
+             print("[main_multi_index.py] ERROR: No feature columns identified. Cannot proceed.")
+             return None, None, None, None, None, None, None, None, None, None
+
+
+    if not feature_columns: # Final check after pruning
+        print("[main_multi_index.py] ERROR: No numeric feature columns identified or remaining after filtering.")
         return None, None, None, None, None, None, None, None, None, None
-    print(f"[main_multi_index.py] Identified Label: '{label_column}'. Features: {feature_columns[:5]}... (Total: {len(feature_columns)})")
+    print(f"[main_multi_index.py] Identified Label: '{label_column}'. Features after pruning: {feature_columns[:5] if len(feature_columns) > 5 else feature_columns}... (Total: {len(feature_columns)})")
 
 
-    # Preprocess: handles NaNs, scaling, and sequencing
-    X, y, seq_idx, scaler = preprocess_data(df.copy(), feature_columns, label_column, lookback) # Use df.copy()
+    # First, create sequences without scaling to properly split the data
+    # df.copy() is important here as preprocess_data modifies df inplace (e.g. label dropna)
+    # feature_columns is now the pruned list.
+    X_raw, y_raw, seq_idx, _ = preprocess_data(df.copy(), feature_columns, label_column, lookback, 
+                                                scaler=None, fit_scaler=False)
     
-    if X is None or X.shape[0] == 0:
+    if X_raw is None or X_raw.shape[0] == 0:
         print("[main_multi_index.py] ERROR: Preprocessing returned no data.")
-        return None, None, None, None, None, None, None, None, None, None # Added scaler
+        return None, None, None, None, None, None, None, None, None, None
 
-
-    # Split data
-    # Ensure seq_idx is sorted if it's not already from creation
-    # seq_idx = seq_idx.sort_values() # Should be sorted by (ticker, date)
-    
-    # Get the date part of the multi-index for splitting
+    # Split data first
     dates_for_splitting = seq_idx.get_level_values('date')
-    
-    # Convert split date strings to datetime
     train_val_split_datetime = pd.to_datetime(train_val_split_date_str)
     val_test_split_datetime = pd.to_datetime(val_test_split_date_str)
-
-    if train_val_split_datetime >= val_test_split_datetime:
-        msg = (f"[main_multi_index.py] ERROR: train_val_split_date ({train_val_split_datetime}) "
-               f"must be before val_test_split_date ({val_test_split_datetime}).")
-        print(msg)
-        logger.error(msg)
-        return None, None, None, None, None, None, None, None, None, None
-
 
     train_mask = dates_for_splitting < train_val_split_datetime
     valid_mask = (dates_for_splitting >= train_val_split_datetime) & \
                  (dates_for_splitting < val_test_split_datetime)
     test_mask = dates_for_splitting >= val_test_split_datetime
 
-    X_train, y_train = X[train_mask], y[train_mask]
-    X_valid, y_valid = X[valid_mask], y[valid_mask]
-    X_test, y_test = X[test_mask], y[test_mask]
+    # Now fit scaler only on training data
+    train_df = df[df.index.get_level_values('date') < train_val_split_datetime].copy()
+    valid_df = df[(df.index.get_level_values('date') >= train_val_split_datetime) & 
+                  (df.index.get_level_values('date') < val_test_split_datetime)].copy()
+    test_df = df[df.index.get_level_values('date') >= val_test_split_datetime].copy()
+
+    # Process each split with appropriate scaler usage
+    X_train, y_train, train_idx, scaler = preprocess_data(train_df, feature_columns, label_column, 
+                                                          lookback, scaler=None, fit_scaler=True)
     
-    train_idx = seq_idx[train_mask]
-    valid_idx = seq_idx[valid_mask]
-    test_idx = seq_idx[test_mask]
+    X_valid, y_valid, valid_idx, _ = preprocess_data(valid_df, feature_columns, label_column, 
+                                                     lookback, scaler=scaler, fit_scaler=False) if not valid_df.empty else (None, None, None, None)
+    
+    X_test, y_test, test_idx, _ = preprocess_data(test_df, feature_columns, label_column, 
+                                                  lookback, scaler=scaler, fit_scaler=False) if not test_df.empty else (None, None, None, None)
 
     print(f"[main_multi_index.py] Data split. ") # DIAGNOSTIC PRINT
     print(f"  Train: X{X_train.shape}, y{y_train.shape}, Idx{len(train_idx) if train_idx is not None else 0}")
