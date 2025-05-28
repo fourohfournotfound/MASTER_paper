@@ -450,9 +450,6 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
         return (None,) * 12 # Corrected to 12
 
     # --- Dynamic Gate Index Determination ---
-    gate_input_start_index = None
-    gate_input_end_index = None
-    
     def determine_gate_indices(method, n_features_total, feature_cols, market_col_name):
         """Determine gate indices based on the specified method."""
         if method == 'manual':
@@ -1009,13 +1006,13 @@ def main():
     # Create DataLoaders with custom collate function for variable batch sizes
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=8,  # Can now use larger batch sizes!
-        shuffle=False,  # Don't shuffle to maintain temporal order for time series
-        num_workers=0,  # Disable multiprocessing due to shared memory limitations
+        batch_size=16,  # Increase from 8 to 16 for better GPU utilization
+        shuffle=False,
+        num_workers=0,
         pin_memory=True if device.type == 'cuda' else False,
-        persistent_workers=False,  # Disable when num_workers=0
-        collate_fn=custom_collate_fn,  # Use our custom collate function
-        drop_last=False  # Keep all data
+        persistent_workers=False,
+        collate_fn=custom_collate_fn,
+        drop_last=False
     )
     
     valid_loader = None
@@ -1027,15 +1024,11 @@ def main():
             num_workers=0,  # Disable multiprocessing
             pin_memory=True if device.type == 'cuda' else False,
             persistent_workers=False,
-            prefetch_factor=None,
+            collate_fn=custom_collate_fn,  # ADD THIS - was missing!
             drop_last=False
         )
     
-    logger.info(f"Created DataLoaders with num_workers=0 (multiprocessing disabled) and batch_size=8 for memory optimization")
-    
-    # Gradient accumulation for larger effective batch size
-    accumulation_steps = 4  # Accumulate gradients over 4 days before updating
-    logger.info(f"Using gradient accumulation with {accumulation_steps} steps for effective batch size of {accumulation_steps} days")
+    logger.info(f"Created DataLoaders with custom collate function, batch_size=16 for better GPU utilization")
     
     for epoch in range(args.epochs):
         epoch_train_loss = 0
@@ -1046,108 +1039,100 @@ def main():
         for batch_idx, batch_data in enumerate(train_loader):
             optimizer.zero_grad()
             
-            batch_loss = 0
-            valid_days_in_batch = 0
-            
             # batch_data now contains padded tensors with attention masks
             X_batch = batch_data['X'].to(device, non_blocking=True)  # [batch_size, max_stocks, seq_len, features]
             y_batch_original = batch_data['y_original'].to(device, non_blocking=True)  # [batch_size, max_stocks, 1]
             attention_masks = batch_data['attention_mask'].to(device, non_blocking=True)  # [batch_size, max_stocks]
             
-            # Process each day in the batch
+            # Move optional tensors to device as well
+            label_mask_batch = batch_data.get('label_mask')
+            y_processed_batch = batch_data.get('y_processed')
+            if label_mask_batch is not None:
+                label_mask_batch = label_mask_batch.to(device, non_blocking=True)
+            if y_processed_batch is not None:
+                y_processed_batch = y_processed_batch.to(device, non_blocking=True)
+            
+            # Squeeze y_batch_original if needed
+            if y_batch_original.dim() > 2 and y_batch_original.shape[-1] == 1:
+                y_batch_original = y_batch_original.squeeze(-1)  # [batch_size, max_stocks]
+            
+            # Initialize batch loss
+            total_batch_loss = 0
+            total_valid_samples = 0
+            
+            # Process all days in the batch simultaneously
             for day_idx in range(X_batch.shape[0]):
-                # Get data for this day
                 X_day = X_batch[day_idx]  # [max_stocks, seq_len, features]
-                y_day_original = y_batch_original[day_idx]  # [max_stocks, 1]
+                y_day = y_batch_original[day_idx]  # [max_stocks]
                 attention_mask = attention_masks[day_idx]  # [max_stocks]
                 
-                # Filter out padded stocks using attention mask
+                # Filter real stocks using attention mask
                 X_day_real = X_day[attention_mask]  # [num_real_stocks, seq_len, features]
-                y_day_real = y_day_original[attention_mask]  # [num_real_stocks, 1]
+                y_day_real = y_day[attention_mask]  # [num_real_stocks]
                 
                 if y_day_real.numel() == 0:
                     continue
-
-                # Squeeze the last dimension if needed
-                if y_day_real.dim() > 1 and y_day_real.shape[-1] == 1:
-                    y_day_real = y_day_real.squeeze(-1)  # [num_real_stocks]
-
-                # Handle pre-processed labels if available
-                label_mask_batch = batch_data.get('label_mask')
-                y_processed_batch = batch_data.get('y_processed')
                 
+                # Handle pre-processed labels if available (now on same device)
                 if label_mask_batch is not None and y_processed_batch is not None:
                     # Use pre-processed data, but filter by attention mask
-                    label_mask_day = label_mask_batch[day_idx][attention_mask].to(device, non_blocking=True)
-                    y_processed_day = y_processed_batch[day_idx][attention_mask].to(device, non_blocking=True)
+                    label_mask_day = label_mask_batch[day_idx][attention_mask]  # No need for .to(device) now
+                    y_processed_day = y_processed_batch[day_idx][attention_mask]
                     
                     if not torch.any(label_mask_day):
                         continue
                         
                     X_day_filtered = X_day_real[label_mask_day]
-                    y_day_processed_for_loss = y_processed_day[label_mask_day] if label_mask_day.dim() > 0 else y_processed_day
+                    y_day_processed = y_processed_day[label_mask_day] if label_mask_day.dim() > 0 else y_processed_day
                 else:
                     # Fallback to on-the-fly processing
                     num_stocks = y_day_real.shape[0]
-                    
                     if num_stocks >= 10:
-                        label_mask_day, y_day_dropped_extreme = drop_extreme(y_day_real.clone())
-                        if label_mask_day.dim() > 1:
-                            label_mask_day = label_mask_day.squeeze(-1)
+                        # Use drop_extreme
+                        label_mask, y_dropped = drop_extreme(y_day_real.clone())
+                        if label_mask.dim() > 1:
+                            label_mask = label_mask.squeeze(-1)
+                        
+                        if not torch.any(label_mask):
+                            continue
+                            
+                        X_day_filtered = X_day_real[label_mask]
+                        y_day_processed = zscore(y_dropped)
                     else:
-                        label_mask_day = torch.ones(num_stocks, dtype=torch.bool, device=y_day_real.device)
-                        y_day_dropped_extreme = y_day_real.clone()
-                    
-                    if not torch.any(label_mask_day):
-                        continue
-                    
-                    y_day_processed_for_loss = zscore(y_day_dropped_extreme)
-                    X_day_filtered = X_day_real[label_mask_day]
-
+                        # Use all stocks
+                        X_day_filtered = X_day_real
+                        y_day_processed = zscore(y_day_real.clone())
+                
                 if X_day_filtered.shape[0] == 0:
                     continue
-
-                # Forward pass with real stocks only
-                preds_day_all = pytorch_model(X_day_real)  # Get predictions for real stocks
                 
-                # Filter predictions based on the mask
-                if 'label_mask_day' in locals() and torch.any(label_mask_day):
-                    preds_day_filtered_for_loss = preds_day_all[label_mask_day]
-                else:
-                    preds_day_filtered_for_loss = preds_day_all
-
-                # Ensure matching dimensions
-                if preds_day_filtered_for_loss.numel() == 0 or y_day_processed_for_loss.numel() == 0:
-                    continue
+                # Forward pass
+                preds = pytorch_model(X_day_filtered)  # [num_filtered_stocks, 1]
+                preds = preds.squeeze()  # [num_filtered_stocks]
+                y_day_processed = y_day_processed.squeeze()  # [num_filtered_stocks]
                 
-                if preds_day_filtered_for_loss.shape[0] != y_day_processed_for_loss.shape[0]:
-                    logger.warning(f"Shape mismatch: preds {preds_day_filtered_for_loss.shape} vs labels {y_day_processed_for_loss.shape}")
-                    continue
-
-                # Calculate loss
-                pred_final = preds_day_filtered_for_loss.squeeze()
-                label_final = y_day_processed_for_loss.squeeze()
-
-                day_loss = criterion(pred_final, label_final)
-                
-                if not (torch.isnan(day_loss) or torch.isinf(day_loss)):
-                    batch_loss += day_loss
-                    valid_days_in_batch += 1
-
-            if valid_days_in_batch > 0:
-                # Average loss across valid days in the batch
-                batch_loss = batch_loss / valid_days_in_batch
-                batch_loss.backward()
+                # Calculate loss for this day
+                if preds.numel() > 0 and y_day_processed.numel() > 0:
+                    day_loss = criterion(preds, y_day_processed)
+                    if not (torch.isnan(day_loss) or torch.isinf(day_loss)):
+                        total_batch_loss += day_loss
+                        total_valid_samples += 1
+            
+            # Update weights if we have valid samples
+            if total_valid_samples > 0:
+                # Average loss across all valid samples in the batch
+                avg_batch_loss = total_batch_loss / total_valid_samples
+                avg_batch_loss.backward()
                 
                 # Gradient clipping
                 torch.nn.utils.clip_grad_value_(pytorch_model.parameters(), 3.0)
                 optimizer.step()
                 
-                epoch_train_loss += batch_loss.item()
+                epoch_train_loss += avg_batch_loss.item()
                 processed_batches_train += 1
                 
-                if batch_idx % 50 == 0:  # Log more frequently due to larger batches
-                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Avg Loss: {batch_loss.item():.6f}, Valid days in batch: {valid_days_in_batch}")
+                if batch_idx % 50 == 0:
+                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Avg Loss: {avg_batch_loss.item():.6f}, Valid days: {total_valid_samples}")
 
         avg_epoch_train_loss = epoch_train_loss / processed_batches_train if processed_batches_train > 0 else 0
         logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_epoch_train_loss:.6f}")
@@ -1158,48 +1143,54 @@ def main():
             processed_batches_valid = 0
             with torch.no_grad():
                 for batch_idx, batch_data in enumerate(valid_loader):
-                    X_batch_val = batch_data['X']
-                    y_batch_val_original = batch_data['y_original']
+                    X_batch_val = batch_data['X'].to(device, non_blocking=True)
+                    y_batch_val_original = batch_data['y_original'].to(device, non_blocking=True)
+                    attention_masks_val = batch_data['attention_mask'].to(device, non_blocking=True)
                     
-                    batch_val_loss = 0
-                    valid_days_in_val_batch = 0
+                    # Move optional tensors to device as well
+                    label_mask_batch_val = batch_data.get('label_mask')
+                    y_processed_batch_val = batch_data.get('y_processed')
+                    if label_mask_batch_val is not None:
+                        label_mask_batch_val = label_mask_batch_val.to(device, non_blocking=True)
+                    if y_processed_batch_val is not None:
+                        y_processed_batch_val = y_processed_batch_val.to(device, non_blocking=True)
+                    
+                    # Squeeze y_batch if needed
+                    if y_batch_val_original.dim() > 2 and y_batch_val_original.shape[-1] == 1:
+                        y_batch_val_original = y_batch_val_original.squeeze(-1)
+                    
+                    total_val_loss = 0
+                    total_val_samples = 0
                     
                     for day_idx in range(X_batch_val.shape[0]):
                         X_day_val = X_batch_val[day_idx]
-                        y_day_val_original = y_batch_val_original[day_idx]
-
-                        if y_day_val_original.numel() == 0:
+                        y_day_val = y_batch_val_original[day_idx]
+                        attention_mask_val = attention_masks_val[day_idx]
+                        
+                        # Filter real stocks
+                        X_day_val_real = X_day_val[attention_mask_val]
+                        y_day_val_real = y_day_val[attention_mask_val]
+                        
+                        if y_day_val_real.numel() == 0:
                             continue
                         
-                        # Squeeze the last dimension if it's [num_stocks, 1]
-                        if y_day_val_original.dim() > 1 and y_day_val_original.shape[-1] == 1:
-                            y_day_val_original = y_day_val_original.squeeze(-1)
+                        # Apply zscore (no drop_extreme for validation)
+                        y_day_val_processed = zscore(y_day_val_real.clone())
                         
-                        # Apply CSZscoreNorm for validation labels (NO drop_extreme)
-                        y_day_val_processed = zscore(y_day_val_original.clone())
+                        # Forward pass
+                        preds_val = pytorch_model(X_day_val_real)
+                        preds_val = preds_val.squeeze()
+                        y_day_val_processed = y_day_val_processed.squeeze()
                         
-                        preds_day_val = pytorch_model(X_day_val)
-
-                        # Ensure matching dimensions
-                        if preds_day_val.shape[0] != y_day_val_processed.shape[0]:
-                            logger.warning(f"Validation shape mismatch: preds {preds_day_val.shape} vs labels {y_day_val_processed.shape}")
-                            continue
-                            
-                        pred_final = preds_day_val.squeeze()
-                        label_final = y_day_val_processed.squeeze()
-                        
-                        if pred_final.numel() == 0 or label_final.numel() == 0:
-                            continue
-
-                        val_loss_item = criterion(pred_final, label_final)
-                        
-                        if not (torch.isnan(val_loss_item) or torch.isinf(val_loss_item)):
-                            batch_val_loss += val_loss_item
-                            valid_days_in_val_batch += 1
+                        if preds_val.numel() > 0 and y_day_val_processed.numel() > 0:
+                            val_loss = criterion(preds_val, y_day_val_processed)
+                            if not (torch.isnan(val_loss) or torch.isinf(val_loss)):
+                                total_val_loss += val_loss
+                                total_val_samples += 1
                     
-                    if valid_days_in_val_batch > 0:
-                        batch_val_loss = batch_val_loss / valid_days_in_val_batch
-                        epoch_val_loss += batch_val_loss.item()
+                    if total_val_samples > 0:
+                        avg_val_loss = total_val_loss / total_val_samples
+                        epoch_val_loss += avg_val_loss.item()
                         processed_batches_valid += 1
 
             avg_epoch_val_loss = epoch_val_loss / processed_batches_valid if processed_batches_valid > 0 else 0
