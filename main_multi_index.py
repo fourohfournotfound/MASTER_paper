@@ -16,6 +16,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt # Added for plotting
 from torch.optim.lr_scheduler import ReduceLROnPlateau # For LR scheduling
+from torch.cuda.amp import autocast, GradScaler
 
 from master import MASTERModel
 from base_model import SequenceModel, DailyBatchSamplerRandom, calc_ic, zscore, drop_extreme # Add other necessary imports from base_model
@@ -1006,13 +1007,11 @@ def main():
     # Create DataLoaders with custom collate function for variable batch sizes
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=16,  # Increase from 8 to 16 for better GPU utilization
+        batch_size=32,  # Increase from 16 to 32 or even 64
         shuffle=False,
         num_workers=0,
-        pin_memory=True if device.type == 'cuda' else False,
-        persistent_workers=False,
+        pin_memory=True,
         collate_fn=custom_collate_fn,
-        drop_last=False
     )
     
     valid_loader = None
@@ -1028,111 +1027,54 @@ def main():
             drop_last=False
         )
     
-    logger.info(f"Created DataLoaders with custom collate function, batch_size=16 for better GPU utilization")
+    logger.info(f"Created DataLoaders with custom collate function, batch_size=32 for better GPU utilization")
+    
+    scaler = GradScaler()
     
     for epoch in range(args.epochs):
         epoch_train_loss = 0
         pytorch_model.train()
         processed_batches_train = 0
         
-        # Use DataLoader for optimized iteration with batching
+        # --- OPTIMIZED TRAINING LOOP ---
         for batch_idx, batch_data in enumerate(train_loader):
             optimizer.zero_grad()
             
-            # batch_data now contains padded tensors with attention masks
+            # Get batch data - all days at once
             X_batch = batch_data['X'].to(device, non_blocking=True)  # [batch_size, max_stocks, seq_len, features]
-            y_batch_original = batch_data['y_original'].to(device, non_blocking=True)  # [batch_size, max_stocks, 1]
-            attention_masks = batch_data['attention_mask'].to(device, non_blocking=True)  # [batch_size, max_stocks]
+            y_batch_original = batch_data['y_original'].to(device, non_blocking=True)
+            attention_masks = batch_data['attention_mask'].to(device, non_blocking=True)
             
-            # Move optional tensors to device as well
-            label_mask_batch = batch_data.get('label_mask')
-            y_processed_batch = batch_data.get('y_processed')
-            if label_mask_batch is not None:
-                label_mask_batch = label_mask_batch.to(device, non_blocking=True)
-            if y_processed_batch is not None:
-                y_processed_batch = y_processed_batch.to(device, non_blocking=True)
+            # Pre-processed labels (already handled in dataset)
+            label_mask_batch = batch_data['label_mask'].to(device, non_blocking=True)
+            y_processed_batch = batch_data['y_processed'].to(device, non_blocking=True)
             
-            # Squeeze y_batch_original if needed
-            if y_batch_original.dim() > 2 and y_batch_original.shape[-1] == 1:
-                y_batch_original = y_batch_original.squeeze(-1)  # [batch_size, max_stocks]
+            # Reshape for batch processing: [batch_size * max_stocks, seq_len, features]
+            batch_size, max_stocks, seq_len, features = X_batch.shape
+            X_reshaped = X_batch.view(-1, seq_len, features)
             
-            # Initialize batch loss
-            total_batch_loss = 0
-            total_valid_samples = 0
+            # Create combined mask for valid stocks across all days
+            combined_mask = attention_masks.view(-1)  # [batch_size * max_stocks]
+            combined_label_mask = label_mask_batch.view(-1)  # [batch_size * max_stocks]
             
-            # Process all days in the batch simultaneously
-            for day_idx in range(X_batch.shape[0]):
-                X_day = X_batch[day_idx]  # [max_stocks, seq_len, features]
-                y_day = y_batch_original[day_idx]  # [max_stocks]
-                attention_mask = attention_masks[day_idx]  # [max_stocks]
-                
-                # Filter real stocks using attention mask
-                X_day_real = X_day[attention_mask]  # [num_real_stocks, seq_len, features]
-                y_day_real = y_day[attention_mask]  # [num_real_stocks]
-                
-                if y_day_real.numel() == 0:
-                    continue
-                
-                # Handle pre-processed labels if available (now on same device)
-                if label_mask_batch is not None and y_processed_batch is not None:
-                    # Use pre-processed data, but filter by attention mask
-                    label_mask_day = label_mask_batch[day_idx][attention_mask]  # No need for .to(device) now
-                    y_processed_day = y_processed_batch[day_idx][attention_mask]
-                    
-                    if not torch.any(label_mask_day):
-                        continue
-                        
-                    X_day_filtered = X_day_real[label_mask_day]
-                    y_day_processed = y_processed_day[label_mask_day] if label_mask_day.dim() > 0 else y_processed_day
-                else:
-                    # Fallback to on-the-fly processing
-                    num_stocks = y_day_real.shape[0]
-                    if num_stocks >= 10:
-                        # Use drop_extreme
-                        label_mask, y_dropped = drop_extreme(y_day_real.clone())
-                        if label_mask.dim() > 1:
-                            label_mask = label_mask.squeeze(-1)
-                        
-                        if not torch.any(label_mask):
-                            continue
-                            
-                        X_day_filtered = X_day_real[label_mask]
-                        y_day_processed = zscore(y_dropped)
-                    else:
-                        # Use all stocks
-                        X_day_filtered = X_day_real
-                        y_day_processed = zscore(y_day_real.clone())
-                
-                if X_day_filtered.shape[0] == 0:
-                    continue
-                
-                # Forward pass
-                preds = pytorch_model(X_day_filtered)  # [num_filtered_stocks, 1]
-                preds = preds.squeeze()  # [num_filtered_stocks]
-                y_day_processed = y_day_processed.squeeze()  # [num_filtered_stocks]
-                
-                # Calculate loss for this day
-                if preds.numel() > 0 and y_day_processed.numel() > 0:
-                    day_loss = criterion(preds, y_day_processed)
-                    if not (torch.isnan(day_loss) or torch.isinf(day_loss)):
-                        total_batch_loss += day_loss
-                        total_valid_samples += 1
+            # Filter to only real, valid stocks
+            final_mask = combined_mask & combined_label_mask
+            X_final = X_reshaped[final_mask]  # [num_valid_stocks, seq_len, features]
+            y_final = y_processed_batch.view(-1)[final_mask]  # [num_valid_stocks]
             
-            # Update weights if we have valid samples
-            if total_valid_samples > 0:
-                # Average loss across all valid samples in the batch
-                avg_batch_loss = total_batch_loss / total_valid_samples
-                avg_batch_loss.backward()
-                
-                # Gradient clipping
-                torch.nn.utils.clip_grad_value_(pytorch_model.parameters(), 3.0)
-                optimizer.step()
-                
-                epoch_train_loss += avg_batch_loss.item()
-                processed_batches_train += 1
-                
-                if batch_idx % 50 == 0:
-                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Avg Loss: {avg_batch_loss.item():.6f}, Valid days: {total_valid_samples}")
+            if X_final.shape[0] == 0:
+                continue
+            
+            with autocast():
+                preds = pytorch_model(X_final).squeeze()
+                loss = criterion(preds, y_final)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_train_loss += loss.item()
+            processed_batches_train += 1
 
         avg_epoch_train_loss = epoch_train_loss / processed_batches_train if processed_batches_train > 0 else 0
         logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_epoch_train_loss:.6f}")
