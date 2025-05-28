@@ -12,6 +12,9 @@ import sys
 import warnings
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt # Added for plotting
 
 from master import MASTERModel
 from base_model import SequenceModel, DailyBatchSamplerRandom, calc_ic, zscore, drop_extreme # Add other necessary imports from base_model
@@ -234,18 +237,32 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, train_test
         
         if label_source_col:
             print(f"[main_multi_index.py] Generating 'label' as next day's pct_change of '{label_source_col}'.")
-            df['label'] = df.groupby(level='ticker')[label_source_col].pct_change(1).shift(-1) # Example: next day's return
+            # Ensure label generation is done per ticker to avoid leakage across tickers at boundaries
+            df['label'] = df.groupby(level='ticker')[label_source_col].pct_change(1).shift(-1)
             df.dropna(subset=['label'], inplace=True) # Drop rows where label couldn't be computed (last day per ticker)
         else:
             print("[main_multi_index.py] ERROR: 'label' column missing and suitable price column ('closeadj', 'adj_close', 'close') not available to generate it.")
             return None, None, None, None, None, None, None
     
     label_column = 'label'
-    all_cols = df.columns.tolist()
-    feature_columns = [col for col in all_cols if col != label_column]
+    
+    # Identify potential feature columns: all columns that are numeric and not the label.
+    # Exclude known non-feature string columns explicitly if necessary.
+    potential_feature_cols = df.select_dtypes(include=np.number).columns.tolist()
+    
+    # Remove the label column from this list if it's present (it should be, as it's numeric)
+    if label_column in potential_feature_cols:
+        potential_feature_cols.remove(label_column)
+    
+    feature_columns = potential_feature_cols
+
+    # If there are other known non-numeric columns that might have slipped through 
+    # (e.g., if they were accidentally converted to object type but should be numeric, or vice-versa),
+    # they should be handled (e.g. dropped or converted) before this step.
+    # Example: df.drop(columns=['any_other_string_column_not_for_features'], inplace=True, errors='ignore')
 
     if not feature_columns:
-        print("[main_multi_index.py] ERROR: No feature columns identified.")
+        print("[main_multi_index.py] ERROR: No numeric feature columns identified after filtering.")
         return None, None, None, None, None, None, None
     print(f"[main_multi_index.py] Identified Label: '{label_column}'. Features: {feature_columns[:5]}... (Total: {len(feature_columns)})")
 
@@ -308,12 +325,223 @@ def parse_args():
     print(f"[main_multi_index.py] Arguments parsed: {args}") # DIAGNOSTIC PRINT
     return args
 
+def calculate_sortino_ratio(daily_returns, risk_free_rate=0.0, target_return=0.0, periods_per_year=252):
+    """
+    Calculates the Sortino Ratio for a series of daily returns.
+    """
+    if daily_returns.empty or daily_returns.std() == 0: # Avoid division by zero or NaN results
+        return np.nan
+
+    excess_returns = daily_returns - (risk_free_rate / periods_per_year) # Daily risk-free rate
+    downside_returns = excess_returns[excess_returns < target_return].copy() # Use target_return for downside deviation
+    
+    if downside_returns.empty: # No returns below target
+        return np.nan if np.mean(excess_returns) <= 0 else np.inf # Or handle as very high if mean positive
+
+    downside_std = np.std(downside_returns)
+    if downside_std == 0: # No variation in downside returns
+        return np.nan if np.mean(excess_returns) <= 0 else np.inf
+
+
+    mean_portfolio_return_annualized = np.mean(daily_returns) * periods_per_year
+    downside_std_annualized = downside_std * np.sqrt(periods_per_year)
+    
+    # Standard Sortino: (Mean Portfolio Return - Risk Free Rate) / Downside Deviation
+    # Using mean daily return for numerator before annualizing, consistent with downside_std being from daily
+    sortino = (np.mean(daily_returns) * periods_per_year - risk_free_rate) / downside_std_annualized
+    # Alternative: (Mean(daily_returns) - daily_target_return) / daily_downside_std, then annualize.
+    # Let's use annualized mean return and annualized downside deviation.
+    # Mean excess return for numerator:
+    # mean_daily_excess_return = np.mean(excess_returns)
+    # sortino_ratio = (mean_daily_excess_return * periods_per_year) / (downside_std * np.sqrt(periods_per_year))
+    
+    # A common way: (Annualized Portfolio Return - Annualized Target Return) / Annualized Downside Deviation
+    # Here, target_return is daily. Annualized target_return for comparison:
+    # annualized_target = (1 + target_return)**periods_per_year - 1 if target_return !=0 else 0.0 (approx for small daily)
+    # Or simply use annualized mean return and risk free rate.
+    
+    # Numerator: Annualized mean return - Annualized risk-free rate
+    # Denominator: Annualized standard deviation of returns falling below the target return
+    
+    annualized_mean_return = np.mean(daily_returns) * periods_per_year
+    annualized_downside_std = downside_std * np.sqrt(periods_per_year)
+
+    if annualized_downside_std == 0:
+        return np.nan if (annualized_mean_return - risk_free_rate) <= 0 else np.inf
+
+    sortino = (annualized_mean_return - risk_free_rate) / annualized_downside_std
+    return sortino
+
+
+def perform_backtesting(predictions_df, N_values_list, output_path, risk_free_rate=0.0):
+    """
+    Performs backtesting based on model predictions.
+    - predictions_df: DataFrame with 'date', 'ticker', 'prediction', 'actual_return'.
+    - N_values_list: List of integers for N (e.g., [1, 3, 5]) for top/bottom N stocks.
+    - output_path: Path to save plots and results.
+    - risk_free_rate: Annual risk-free rate for Sortino ratio.
+    """
+    logger.info("Starting backtesting...")
+    if predictions_df.empty:
+        logger.warning("Predictions DataFrame is empty. Skipping backtesting.")
+        return
+
+    predictions_df['date'] = pd.to_datetime(predictions_df['date'])
+    predictions_df.sort_values(by=['date', 'ticker'], inplace=True)
+
+    # Benchmark: Equally weighted portfolio of all stocks available each day
+    benchmark_daily_returns = predictions_df.groupby('date')['actual_return'].mean()
+    benchmark_cumulative_returns = (1 + benchmark_daily_returns).cumprod()
+
+    results_summary = []
+
+    for N in N_values_list:
+        logger.info(f"--- Backtesting for N = {N} ---")
+        
+        long_only_returns_list = []
+        short_only_returns_list = []
+        long_short_returns_list = [] # Optional: Long-Short strategy
+        dates_for_plot = []
+
+        for date, group in predictions_df.groupby('date'):
+            dates_for_plot.append(date)
+            group_sorted = group.sort_values(by='prediction', ascending=False)
+            
+            # Ensure N is not greater than available stocks
+            num_available_stocks = len(group_sorted)
+            current_N_long = min(N, num_available_stocks)
+            current_N_short = min(N, num_available_stocks)
+
+
+            # Long-only strategy
+            if current_N_long > 0:
+                long_portfolio = group_sorted.head(current_N_long)
+                long_return = long_portfolio['actual_return'].mean()
+            else:
+                long_return = 0.0
+            long_only_returns_list.append(long_return)
+
+            # Short-only strategy
+            if current_N_short > 0:
+                # For shorting, we want stocks predicted to perform poorly (lowest scores)
+                # If 'prediction' is higher-is-better, then .tail() gives lowest scores.
+                short_portfolio = group_sorted.tail(current_N_short)
+                # Return from shorting is -1 * stock_return
+                short_return = -short_portfolio['actual_return'].mean() 
+            else:
+                short_return = 0.0
+            short_only_returns_list.append(short_return)
+            
+            # Long-Short strategy (example: 50% long, 50% short, dollar neutral conceptual)
+            if current_N_long > 0 and current_N_short > 0 :
+                ls_return = 0.5 * long_return + 0.5 * short_return # If short_return is already -mean(actual)
+                                                                # If short_return was mean(actual_of_shorted_stocks), then 0.5 * long_R - 0.5 * short_portfolio_actual_R
+                                                                # With current short_return def: 0.5 * mean(top_N_actual) + 0.5 * (-mean(bottom_N_actual))
+            elif current_N_long > 0:
+                ls_return = long_return # Only long leg if cannot short
+            elif current_N_short > 0:
+                ls_return = short_return # Only short leg if cannot long (unlikely if N_short > 0)
+            else:
+                ls_return = 0.0
+            long_short_returns_list.append(ls_return)
+
+
+        long_only_daily_returns = pd.Series(long_only_returns_list, index=pd.to_datetime(dates_for_plot))
+        short_only_daily_returns = pd.Series(short_only_returns_list, index=pd.to_datetime(dates_for_plot))
+        long_short_daily_returns = pd.Series(long_short_returns_list, index=pd.to_datetime(dates_for_plot))
+
+
+        # Align benchmark returns with strategy dates
+        aligned_benchmark_daily_returns = benchmark_daily_returns.reindex(long_only_daily_returns.index).fillna(0)
+
+
+        # Cumulative Returns
+        long_only_cumulative = (1 + long_only_daily_returns).cumprod()
+        short_only_cumulative = (1 + short_only_daily_returns).cumprod()
+        long_short_cumulative = (1 + long_short_daily_returns).cumprod()
+        benchmark_cumulative_aligned = (1 + aligned_benchmark_daily_returns).cumprod()
+
+
+        # Metrics
+        total_return_long = (long_only_cumulative.iloc[-1] - 1) * 100 if not long_only_cumulative.empty else 0
+        total_return_short = (short_only_cumulative.iloc[-1] - 1) * 100 if not short_only_cumulative.empty else 0
+        total_return_ls = (long_short_cumulative.iloc[-1] - 1) * 100 if not long_short_cumulative.empty else 0
+        total_return_benchmark = (benchmark_cumulative_aligned.iloc[-1] - 1) * 100 if not benchmark_cumulative_aligned.empty else 0
+        
+        annualized_return_long = ((1 + long_only_daily_returns.mean())**252 - 1) * 100 if not long_only_daily_returns.empty else 0
+        annualized_return_short = ((1 + short_only_daily_returns.mean())**252 - 1) * 100 if not short_only_daily_returns.empty else 0
+        annualized_return_ls = ((1 + long_short_daily_returns.mean())**252 - 1) * 100 if not long_short_daily_returns.empty else 0
+        annualized_return_benchmark = ((1 + aligned_benchmark_daily_returns.mean())**252 - 1) * 100 if not aligned_benchmark_daily_returns.empty else 0
+
+        sortino_long = calculate_sortino_ratio(long_only_daily_returns, risk_free_rate)
+        sortino_short = calculate_sortino_ratio(short_only_daily_returns, risk_free_rate)
+        sortino_ls = calculate_sortino_ratio(long_short_daily_returns, risk_free_rate)
+        sortino_benchmark = calculate_sortino_ratio(aligned_benchmark_daily_returns, risk_free_rate)
+
+
+        logger.info(f"  Long Top {N}: Total Return: {total_return_long:.2f}%, Ann. Return: {annualized_return_long:.2f}%, Sortino: {sortino_long:.2f}")
+        logger.info(f"  Short Bottom {N}: Total Return: {total_return_short:.2f}%, Ann. Return: {annualized_return_short:.2f}%, Sortino: {sortino_short:.2f}")
+        logger.info(f"  Long-Short Top/Bottom {N}: Total Return: {total_return_ls:.2f}%, Ann. Return: {annualized_return_ls:.2f}%, Sortino: {sortino_ls:.2f}")
+        logger.info(f"  Benchmark: Total Return: {total_return_benchmark:.2f}%, Ann. Return: {annualized_return_benchmark:.2f}%, Sortino: {sortino_benchmark:.2f}")
+
+        results_summary.append({
+            'N': N,
+            'Strategy': 'Long Only',
+            'Total Return (%)': total_return_long,
+            'Annualized Return (%)': annualized_return_long,
+            'Sortino Ratio': sortino_long
+        })
+        results_summary.append({
+            'N': N,
+            'Strategy': 'Short Only',
+            'Total Return (%)': total_return_short,
+            'Annualized Return (%)': annualized_return_short,
+            'Sortino Ratio': sortino_short
+        })
+        results_summary.append({
+            'N': N,
+            'Strategy': 'Long-Short',
+            'Total Return (%)': total_return_ls,
+            'Annualized Return (%)': annualized_return_ls,
+            'Sortino Ratio': sortino_ls
+        })
+
+
+        # Plotting
+        plt.figure(figsize=(12, 7))
+        if not long_only_cumulative.empty:
+            plt.plot(long_only_cumulative.index, long_only_cumulative, label=f'Long Top {N} Stocks')
+        if not short_only_cumulative.empty:
+            plt.plot(short_only_cumulative.index, short_only_cumulative, label=f'Short Bottom {N} Stocks')
+        if not long_short_cumulative.empty:
+            plt.plot(long_short_cumulative.index, long_short_cumulative, label=f'Long-Short Top/Bottom {N} Stocks')
+        if not benchmark_cumulative_aligned.empty:
+            plt.plot(benchmark_cumulative_aligned.index, benchmark_cumulative_aligned, label='Benchmark (Equal Weight)', linestyle='--')
+        
+        plt.title(f'Backtest Cumulative Returns (N={N})')
+        plt.xlabel('Date')
+        plt.ylabel('Cumulative Returns')
+        plt.legend()
+        plt.grid(True)
+        plot_filename = Path(output_path) / f'backtest_cumulative_returns_N{N}.png'
+        plt.savefig(plot_filename)
+        plt.close()
+        logger.info(f"Saved backtest plot to {plot_filename}")
+
+    results_df = pd.DataFrame(results_summary)
+    results_filename = Path(output_path) / 'backtest_summary_metrics.csv'
+    results_df.to_csv(results_filename, index=False)
+    logger.info(f"Saved backtest summary metrics to {results_filename}")
+    logger.info("Backtesting finished.")
+
+
 def main():
     print("[main_multi_index.py] main() function started.") # DIAGNOSTIC PRINT
     args = parse_args()
 
     # Create save_path directory if it doesn't exist
-    Path(args.save_path).mkdir(parents=True, exist_ok=True)
+    save_path = Path(args.save_path) # Ensure save_path is a Path object
+    save_path.mkdir(parents=True, exist_ok=True)
     print(f"[main_multi_index.py] Save path ensured: {args.save_path}")
 
     # Set seed for reproducibility
@@ -336,11 +564,6 @@ def main():
         print("[main_multi_index.py] ERROR: No training data available after load_and_prepare_data. Exiting.") # DIAGNOSTIC PRINT
         return
 
-    if X_test is None or X_test.shape[0] == 0:
-        print("[main_multi_index.py] WARNING: No test data available. Proceeding with training only if this is intended.")
-        # Depending on requirements, you might want to exit if test data is crucial.
-        # For now, we'll allow it to proceed for training.
-
     # Determine d_feat (number of features) from the data
     if args.d_feat is None:
         d_feat = X_train.shape[2] # N, T, F -> F is the number of features
@@ -355,47 +578,56 @@ def main():
 
     # Create Datasets and DataLoaders
     print("[main_multi_index.py] Creating train dataset...") # DIAGNOSTIC PRINT
-    # Corrected: Pass the MultiIndex directly to the dataset
     train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx)
-    if X_test is not None and X_test.shape[0] > 0:
+    
+    test_dataset = None
+    if X_test is not None and X_test.shape[0] > 0 and y_test is not None and y_test.shape[0] > 0 and test_idx is not None and len(test_idx) > 0:
         print("[main_multi_index.py] Creating test dataset...") # DIAGNOSTIC PRINT
         test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx)
     else:
-        test_dataset = None
-        print("[main_multi_index.py] No test dataset will be created.")
+        print("[main_multi_index.py] Test data is empty or incomplete. No test dataset will be created.")
 
 
     # Initialize MASTER model
     print("[main_multi_index.py] Initializing MASTER model...") # DIAGNOSTIC PRINT
-    # The MASTER class needs to be defined or imported correctly.
-    # Assuming MASTER class takes these parameters. Adjust as per actual MASTER class definition.
     master_model = MASTER(
         d_feat=d_feat,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         dropout=args.dropout,
-        n_epochs=args.n_epochs_gru, # This is for the base SequenceModel (GRU/LSTM)
-        lr=args.lr_gru, # This is for the base SequenceModel
+        n_epochs=args.n_epochs_gru, 
+        lr=args.lr_gru, 
         GPU=args.gpu,
         seed=args.seed,
-        model_type=args.model_type, # Pass model_type to MASTER
-        save_path=args.save_path,
+        model_type=args.model_type, 
+        save_path=str(save_path), # Pass save_path as string
         save_prefix=f"master_model_{args.model_type}"
     )
     print("[main_multi_index.py] MASTER model initialized.") # DIAGNOSTIC PRINT
 
 
-    # Train the model
-    # The MASTER model's train method should internally use its SequenceModel and the datasets
-    print("[main_multi_index.py] Starting MASTER model training...") # DIAGNOSTIC PRINT
-    master_model.train_predict(
-        train_data=train_dataset, # Pass the dataset object
-        test_data=test_dataset    # Pass the dataset object, can be None
+    # Train the model and get predictions
+    print("[main_multi_index.py] Starting MASTER model training/prediction...") # DIAGNOSTIC PRINT
+    # The train_predict method in MASTER class now returns a DataFrame of predictions
+    predictions_df = master_model.train_predict(
+        train_data=train_dataset, 
+        test_data=test_dataset    
     )
     print("[main_multi_index.py] MASTER model training/prediction finished.") # DIAGNOSTIC PRINT
 
-    # Example of how you might save predictions if train_predict returns them
-    # For now, assume train_predict handles its own output/saving or prints metrics.
+    if predictions_df is not None and not predictions_df.empty:
+        logger.info(f"Received predictions DataFrame with shape: {predictions_df.shape}")
+        perform_backtesting(
+            predictions_df=predictions_df,
+            N_values_list=[1, 2, 3, 5, 10], # Configurable list of N values
+            output_path=save_path, # Use the Path object
+            risk_free_rate=0.0 # Assume 0% annual risk-free rate
+        )
+    elif test_dataset is None:
+        logger.info("No test dataset was available, skipping backtesting.")
+    else:
+        logger.warning("No predictions returned from model or predictions_df is empty, skipping backtesting.")
+
 
     print("[main_multi_index.py] main() function completed.") # DIAGNOSTIC PRINT
 
