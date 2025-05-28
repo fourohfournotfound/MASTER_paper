@@ -30,7 +30,8 @@ print("[main_multi_index.py] Script started.") # DIAGNOSTIC PRINT
 # Global configurations
 FEATURE_START_COL = 3  # Assuming 'ticker', 'date', 'label' are the first three
 LOOKBACK_WINDOW = 8
-TRAIN_TEST_SPLIT_DATE = '2019-01-01' # Example split date
+TRAIN_TEST_SPLIT_DATE = '2019-01-01' # Date for val/test split
+VALIDATION_SPLIT_DATE = '2018-01-01' # Date for train/val split
 
 # Ensure Numba and other warnings are handled if necessary
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -200,24 +201,40 @@ def preprocess_data(df, features_list, label_column, lookback_window):
     return X, y, seq_index, scaler # Return scaler if needed later for inverse transform or test set
 
 
-def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, train_test_split_date_str):
+def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, 
+                          train_val_split_date_str, val_test_split_date_str): # Changed parameter names for clarity
     print(f"[main_multi_index.py] Starting load_and_prepare_data from: {csv_path}") # DIAGNOSTIC PRINT
     try:
         df = pd.read_csv(csv_path)
         print(f"[main_multi_index.py] CSV loaded. Shape: {df.shape}. Columns: {df.columns.tolist()}")
     except FileNotFoundError:
         print(f"[main_multi_index.py] ERROR: CSV file not found at {csv_path}")
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None # Added scaler
     except Exception as e:
         print(f"[main_multi_index.py] ERROR: Could not read CSV: {e}")
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None # Added scaler
 
     if 'ticker' not in df.columns or 'date' not in df.columns:
         print("[main_multi_index.py] ERROR: 'ticker' or 'date' column missing from CSV.")
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None # Added scaler
         
     # Convert date column to datetime objects
-    df['date'] = pd.to_datetime(df['date'])
+    try:
+        # Attempt to infer format first, then specify if errors or for consistency
+        df['date'] = pd.to_datetime(df['date']) 
+    except ValueError:
+        try:
+            # Fallback if direct conversion fails, try inferring (slower)
+            print("[main_multi_index.py] Initial pd.to_datetime failed, trying with infer_datetime_format=True")
+            df['date'] = pd.to_datetime(df['date'], infer_datetime_format=True)
+        except Exception as e_infer:
+            print(f"[main_multi_index.py] ERROR: Could not parse 'date' column: {e_infer}")
+            return None, None, None, None, None, None, None, None, None, None
+    except Exception as e_other: # Catch any other pd.to_datetime errors
+            print(f"[main_multi_index.py] ERROR: pd.to_datetime failed with: {e_other}")
+            return None, None, None, None, None, None, None, None, None, None
+
+
     df.set_index(['ticker', 'date'], inplace=True)
     df.sort_index(inplace=True)
     print(f"[main_multi_index.py] Data indexed by ticker and date. Shape: {df.shape}")
@@ -242,7 +259,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, train_test
             df.dropna(subset=['label'], inplace=True) # Drop rows where label couldn't be computed (last day per ticker)
         else:
             print("[main_multi_index.py] ERROR: 'label' column missing and suitable price column ('closeadj', 'adj_close', 'close') not available to generate it.")
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None, None
     
     label_column = 'label'
     
@@ -263,7 +280,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, train_test
 
     if not feature_columns:
         print("[main_multi_index.py] ERROR: No numeric feature columns identified after filtering.")
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None
     print(f"[main_multi_index.py] Identified Label: '{label_column}'. Features: {feature_columns[:5]}... (Total: {len(feature_columns)})")
 
 
@@ -272,7 +289,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, train_test
     
     if X is None or X.shape[0] == 0:
         print("[main_multi_index.py] ERROR: Preprocessing returned no data.")
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None # Added scaler
 
 
     # Split data
@@ -282,23 +299,47 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, train_test
     # Get the date part of the multi-index for splitting
     dates_for_splitting = seq_idx.get_level_values('date')
     
-    # Convert split date string to datetime
-    split_datetime = pd.to_datetime(train_test_split_date_str)
-    
-    train_mask = dates_for_splitting < split_datetime
-    test_mask = dates_for_splitting >= split_datetime
+    # Convert split date strings to datetime
+    train_val_split_datetime = pd.to_datetime(train_val_split_date_str)
+    val_test_split_datetime = pd.to_datetime(val_test_split_date_str)
+
+    if train_val_split_datetime >= val_test_split_datetime:
+        msg = (f"[main_multi_index.py] ERROR: train_val_split_date ({train_val_split_datetime}) "
+               f"must be before val_test_split_date ({val_test_split_datetime}).")
+        print(msg)
+        logger.error(msg)
+        return None, None, None, None, None, None, None, None, None, None
+
+
+    train_mask = dates_for_splitting < train_val_split_datetime
+    valid_mask = (dates_for_splitting >= train_val_split_datetime) & \
+                 (dates_for_splitting < val_test_split_datetime)
+    test_mask = dates_for_splitting >= val_test_split_datetime
 
     X_train, y_train = X[train_mask], y[train_mask]
+    X_valid, y_valid = X[valid_mask], y[valid_mask]
     X_test, y_test = X[test_mask], y[test_mask]
-    train_idx, test_idx = seq_idx[train_mask], seq_idx[test_mask]
-
-    print(f"[main_multi_index.py] Data split. Train shape X: {X_train.shape}, y: {y_train.shape}. Test shape X: {X_test.shape}, y: {y_test.shape}") # DIAGNOSTIC PRINT
     
-    if X_train.shape[0] == 0 or X_test.shape[0] == 0:
-        print("[main_multi_index.py] WARNING: Train or test set is empty after split. Check split date and data range.")
-        # Decide if this is an error or acceptable (e.g., for a very short dataset)
+    train_idx = seq_idx[train_mask]
+    valid_idx = seq_idx[valid_mask]
+    test_idx = seq_idx[test_mask]
 
-    return X_train, y_train, train_idx, X_test, y_test, test_idx, scaler
+    print(f"[main_multi_index.py] Data split. ") # DIAGNOSTIC PRINT
+    print(f"  Train: X{X_train.shape}, y{y_train.shape}, Idx{len(train_idx) if train_idx is not None else 0}")
+    print(f"  Valid: X{X_valid.shape}, y{y_valid.shape}, Idx{len(valid_idx) if valid_idx is not None else 0}")
+    print(f"  Test:  X{X_test.shape}, y{y_test.shape}, Idx{len(test_idx) if test_idx is not None else 0}")
+    
+    if X_train.shape[0] == 0 :
+        print("[main_multi_index.py] WARNING: Training set is empty after split. Check split dates and data range.")
+    if X_valid.shape[0] == 0 :
+        print("[main_multi_index.py] WARNING: Validation set is empty after split. No validation will be performed during training.")
+    if X_test.shape[0] == 0 :
+        print("[main_multi_index.py] WARNING: Test set is empty after split. No final test evaluation will be performed.")
+        # Decide if this is an error or acceptable
+
+    return X_train, y_train, train_idx, \
+           X_valid, y_valid, valid_idx, \
+           X_test, y_test, test_idx, scaler
 
 
 def parse_args():
@@ -316,7 +357,8 @@ def parse_args():
     parser.add_argument('--gpu', type=int, default=None, help="GPU ID to use (e.g., 0, 1). None for CPU.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed.")
     parser.add_argument('--lookback', type=int, default=LOOKBACK_WINDOW, help="Lookback window for sequences.")
-    parser.add_argument('--split_date', type=str, default=TRAIN_TEST_SPLIT_DATE, help="Date to split train/test data (YYYY-MM-DD).")
+    parser.add_argument('--train_val_split_date', type=str, default=VALIDATION_SPLIT_DATE, help="Date to split train into train/validation (YYYY-MM-DD).")
+    parser.add_argument('--val_test_split_date', type=str, default=TRAIN_TEST_SPLIT_DATE, help="Date to split validation and test data (YYYY-MM-DD).")
     parser.add_argument('--save_path', type=str, default='model_output/', help="Path to save trained models and results.")
     parser.add_argument('--model_type', type=str, default='GRU', choices=['GRU', 'LSTM', 'ALSTM'], help="Type of base model for SequenceModel.")
 
@@ -556,8 +598,11 @@ def main():
 
     # Load and prepare data
     print("[main_multi_index.py] Calling load_and_prepare_data...") # DIAGNOSTIC PRINT
-    X_train, y_train, train_idx, X_test, y_test, test_idx, _ = load_and_prepare_data(
-        args.csv, FEATURE_START_COL, args.lookback, args.split_date
+    X_train, y_train, train_idx, \
+    X_valid, y_valid, valid_idx, \
+    X_test, y_test, test_idx, scaler_obj = load_and_prepare_data( # Renamed _ to scaler_obj
+        args.csv, FEATURE_START_COL, args.lookback, 
+        args.train_val_split_date, args.val_test_split_date # Pass new args
     )
 
     if X_train is None or X_train.shape[0] == 0:
@@ -580,6 +625,15 @@ def main():
     print("[main_multi_index.py] Creating train dataset...") # DIAGNOSTIC PRINT
     train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx)
     
+    valid_dataset = None
+    if X_valid is not None and X_valid.shape[0] > 0 and y_valid is not None and y_valid.shape[0] > 0 and valid_idx is not None and len(valid_idx) > 0:
+        print("[main_multi_index.py] Creating validation dataset...") # DIAGNOSTIC PRINT
+        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx)
+    else:
+        print("[main_multi_index.py] Validation data is empty or incomplete. No validation dataset will be created for training.")
+        logger.warning("Validation data is empty or incomplete. No validation dataset will be created for training.")
+
+
     test_dataset = None
     if X_test is not None and X_test.shape[0] > 0 and y_test is not None and y_test.shape[0] > 0 and test_idx is not None and len(test_idx) > 0:
         print("[main_multi_index.py] Creating test dataset...") # DIAGNOSTIC PRINT
@@ -608,9 +662,9 @@ def main():
 
     # Train the model and get predictions
     print("[main_multi_index.py] Starting MASTER model training/prediction...") # DIAGNOSTIC PRINT
-    # The train_predict method in MASTER class now returns a DataFrame of predictions
     predictions_df = master_model.train_predict(
         train_data=train_dataset, 
+        valid_data=valid_dataset, # Pass validation dataset here
         test_data=test_dataset    
     )
     print("[main_multi_index.py] MASTER model training/prediction finished.") # DIAGNOSTIC PRINT
