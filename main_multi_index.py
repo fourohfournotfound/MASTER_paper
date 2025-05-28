@@ -76,55 +76,71 @@ def get_relevant_weighted_log_returns(df, date_column='date', ticker_column='tic
     # ... existing code ...
     pass
 
-def create_sequences_multi_index(data, features_list, label_column, lookback_window):
+def create_sequences_multi_index(data_multi_index, features_list, target_list, lookback_window, forecast_horizon, selected_tickers=None):
     """
-    Creates sequences for each ticker individually from a MultiIndex DataFrame.
-    Ensures that sequences are only created where enough historical data exists for a ticker.
+    Creates sequences of features and corresponding targets for a multi-index DataFrame.
+
+    Args:
+        data_multi_index (pd.DataFrame): Multi-index DataFrame with 'ticker' and 'date' levels.
+        features_list (list): List of column names to be used as features.
+        target_list (list): List of column names to be used as targets.
+        lookback_window (int): Number of time steps to look back for features.
+        forecast_horizon (int): Number of time steps to forecast forward. 1 means predicting next step.
+        selected_tickers (list, optional): A list of specific tickers to process. If None, all tickers are processed.
+
+    Returns:
+        tuple: (np.array of X sequences, np.array of y targets, list of (ticker, date) tuples for indices)
     """
-    print(f"[main_multi_index.py] Starting create_sequences_multi_index for {len(data.index.get_level_values('ticker').unique())} tickers.") # DIAGNOSTIC PRINT
-    all_X_list = []
-    all_y_list = []
-    new_multi_index_tuples = []
-
-    grouped = data.groupby(level='ticker')
-    processed_tickers = 0
-    for ticker, group in grouped:
-        # Ensure the group is sorted by date for sequence creation
-        group = group.sort_index(level='date')
-        
-        df_features = group[features_list]
-        df_labels = group[label_column]
-
-        X_ticker, y_ticker = [], []
-        ticker_index_tuples = []
-
-        if len(df_features) >= lookback_window:
-            for i in range(len(df_features) - lookback_window):
-                X_ticker.append(df_features.iloc[i:i + lookback_window].values)
-                y_ticker.append(df_labels.iloc[i + lookback_window])
-                
-                current_date = group.index.get_level_values('date')[i + lookback_window]
-                ticker_index_tuples.append((ticker, current_date))
-
-        if X_ticker: # Only add if sequences were created for this ticker
-            all_X_list.extend(X_ticker)
-            all_y_list.extend(y_ticker)
-            new_multi_index_tuples.extend(ticker_index_tuples)
-        processed_tickers += 1
-        if processed_tickers % 100 == 0:
-            print(f"[main_multi_index.py] Processed {processed_tickers}/{len(grouped)} tickers for sequencing.")
-
-
-    if not all_X_list:
-        print("[main_multi_index.py] No sequences created. Check data length and lookback window.") # DIAGNOSTIC PRINT
-        return np.array([]), np.array([]), pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
-
-    final_X = np.array(all_X_list)
-    final_y = np.array(all_y_list)
-    final_index = pd.MultiIndex.from_tuples(new_multi_index_tuples, names=['ticker', 'date'])
+    logger.debug(f"Starting create_sequences_multi_index for {len(data_multi_index.index.get_level_values('ticker').unique())} tickers.")
+    all_X, all_y, all_indices = [], [], []
     
-    print(f"[main_multi_index.py] Finished create_sequences_multi_index. X shape: {final_X.shape}, y shape: {final_y.shape}, index length: {len(final_index)}") # DIAGNOSTIC PRINT
-    return final_X, final_y, final_index
+    tickers_to_process = data_multi_index.index.get_level_values('ticker').unique() if selected_tickers is None else selected_tickers
+    
+    processed_count = 0
+    for ticker in tickers_to_process:
+        if ticker in data_multi_index.index.get_level_values('ticker'):
+            # Ensure data is sorted by date for each ticker
+            df_ticker = data_multi_index.xs(ticker, level='ticker').sort_index()
+            
+            df_features = df_ticker[features_list]
+            df_target = df_ticker[target_list]
+            
+            # Iterate to create sequences
+            # The loop should go up to the point where the last feature window can be formed.
+            # If len(df_features) is L and lookback_window is W,
+            # the last valid start index i is such that i + W <= L, so i <= L - W.
+            # range(L - W + 1) goes from 0 to L - W.
+            for i in range(len(df_features) - lookback_window + 1):
+                feature_end_idx = i + lookback_window
+                # Target index is relative to the END of the feature window.
+                # If forecast_horizon is 1, target is at feature_end_idx (i.e., next step after features).
+                # target_idx in df_target corresponds to feature_end_idx -1 + forecast_horizon in df_features terms.
+                target_date_actual_idx_in_df_target = feature_end_idx + forecast_horizon - 1
+
+                # Ensure this target_date_actual_idx_in_df_target is within the bounds of df_target
+                if target_date_actual_idx_in_df_target < len(df_target):
+                    X_sequence = df_features.iloc[i:feature_end_idx].values
+                    # Correctly select all target columns for the specific forecast point
+                    y_sequence_targets = df_target.iloc[target_date_actual_idx_in_df_target].values 
+                    
+                    all_X.append(X_sequence)
+                    all_y.append(y_sequence_targets) # y_target is now an array if target_list has multiple items
+                    all_indices.append((ticker, df_target.index[target_date_actual_idx_in_df_target]))
+                # else:
+                    # logger.debug(f"Ticker {ticker}: Target index {target_date_actual_idx_in_df_target} out of bounds for df_target len {len(df_target)} at feature_end_idx {feature_end_idx}. Skipping sequence.")
+
+        processed_count += 1
+        if processed_count % 250 == 0:
+            logger.debug(f"Processed {processed_count}/{len(tickers_to_process)} tickers for sequencing.")
+            
+    if not all_X:
+        logger.warning("No sequences were created. Check data length, lookback window, and forecast horizon.")
+        num_features = len(features_list)
+        num_targets = len(target_list)
+        return np.empty((0, lookback_window, num_features)), np.empty((0, num_targets)), []
+
+    logger.debug(f"Finished create_sequences_multi_index. X shape: {np.array(all_X).shape}, y shape: {np.array(all_y).shape}, index length: {len(all_indices)}")
+    return np.array(all_X), np.array(all_y), all_indices
 
 class DailyGroupedTimeSeriesDataset(Dataset):
     def __init__(self, X_sequences, y_targets, multi_index):
@@ -236,21 +252,25 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
 
 
 def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback, 
-                          train_val_split_date_str, val_test_split_date_str):
+                          train_val_split_date_str, val_test_split_date_str,
+                          gate_method='auto', gate_n_features=1, gate_percentage=0.1,
+                          gate_start_index=None, gate_end_index=None):
     print(f"[main_multi_index.py] Starting load_and_prepare_data from: {csv_path}")
+    print(f"[main_multi_index.py] Gate configuration: method={gate_method}, n_features={gate_n_features}, percentage={gate_percentage}, manual_indices=({gate_start_index}, {gate_end_index})")
+    
     try:
         df = pd.read_csv(csv_path)
         print(f"[main_multi_index.py] CSV loaded. Shape: {df.shape}. Columns: {df.columns.tolist()}")
     except FileNotFoundError:
         print(f"[main_multi_index.py] ERROR: CSV file not found at {csv_path}")
-        return (None,) * 11 # Adjusted for new return values
+        return (None,) * 12 # Corrected to 12
     except Exception as e:
         print(f"[main_multi_index.py] ERROR: Could not read CSV: {e}")
-        return (None,) * 11
+        return (None,) * 12 # Corrected to 12
 
     if 'ticker' not in df.columns or 'date' not in df.columns:
         print("[main_multi_index.py] ERROR: 'ticker' or 'date' column missing from CSV.")
-        return (None,) * 11
+        return (None,) * 12 # Corrected to 12
         
     try:
         df['date'] = pd.to_datetime(df['date']) 
@@ -260,10 +280,10 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
             df['date'] = pd.to_datetime(df['date'], infer_datetime_format=True)
         except Exception as e_infer:
             print(f"[main_multi_index.py] ERROR: Could not parse 'date' column: {e_infer}")
-            return (None,) * 11
+            return (None,) * 12 # Corrected to 12
     except Exception as e_other:
             print(f"[main_multi_index.py] ERROR: pd.to_datetime failed with: {e_other}")
-            return (None,) * 11
+            return (None,) * 12 # Corrected to 12
 
     df.set_index(['ticker', 'date'], inplace=True)
     df.sort_index(inplace=True)
@@ -290,7 +310,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
             logger.warning(f"'{market_feature_col_name}' contains NaNs after join. These will be handled by per-ticker ffill later.")
     else:
         logger.error("'closeadj' column not found. Cannot calculate market volatility feature for the Gate. Exiting.")
-        return (None,) * 11
+        return (None,) * 12 # Corrected to 12
     # --- End of Market Feature Calculation ---
 
     if 'label' not in df.columns:
@@ -311,7 +331,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
             print(f"[main_multi_index.py] Shape after label generation: {df.shape}")
         else:
             print("[main_multi_index.py] ERROR: 'label' column missing and no suitable price column ('closeadj', 'adj_close', 'close') found.")
-            return (None,) * 11
+            return (None,) * 12 # Corrected to 12
     
     label_column = 'label'
     # Now, potential_feature_cols will include our new market_feature_col_name if it's numeric
@@ -326,7 +346,7 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
         potential_feature_cols.append(market_feature_col_name)
     elif market_feature_col_name not in df.columns:
          logger.error(f"Market feature '{market_feature_col_name}' was unexpectedly not found in DataFrame columns before creating feature_columns list.")
-         return (None,)*11
+         return (None,) * 12 # Corrected to 12 (and fixed syntax from (None,)*11)
 
 
     feature_columns = potential_feature_cols
@@ -362,25 +382,94 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
 
     if not feature_columns:
         logger.error("All numeric feature candidates were dropped – aborting.")
-        return (None,) * 11
+        return (None,) * 12 # Corrected to 12
 
-    # --- Automatic Gate Index Determination (using the single calculated market feature) ---
+    # --- Dynamic Gate Index Determination ---
     gate_input_start_index = None
     gate_input_end_index = None
-
-    try:
-        # The market_feature_col_name should be in the finalized feature_columns list.
-        # If it was dropped by _drop_nan_cols, this will raise ValueError.
-        gate_idx = feature_columns.index(market_feature_col_name)
-        gate_input_start_index = gate_idx
-        gate_input_end_index = gate_idx + 1 # Slice of length 1
-        logger.info(f"Successfully set Gate to use internally calculated market feature: '{market_feature_col_name}'. "
-                    f"Index in final feature list: {gate_idx}. Gate slice: [{gate_input_start_index}:{gate_input_end_index}]")
-    except ValueError:
-        logger.error(f"The internally calculated market feature '{market_feature_col_name}' was NOT FOUND in the final list of feature columns "
-                       f"(it might have been dropped due to excessive NaNs on train split). Cannot configure Gate. Exiting.")
-        return (None,) * 11
-    # --- End of Gate Index Detection ---
+    
+    def determine_gate_indices(method, n_features_total, feature_cols, market_col_name):
+        """Determine gate indices based on the specified method."""
+        if method == 'manual':
+            if gate_start_index is None or gate_end_index is None:
+                logger.error("Manual gate method specified but gate_start_index or gate_end_index not provided.")
+                return None, None
+            if not (0 <= gate_start_index < n_features_total and gate_start_index < gate_end_index <= n_features_total):
+                logger.error(f"Manual gate indices [{gate_start_index}:{gate_end_index}] are invalid for {n_features_total} features.")
+                return None, None
+            return gate_start_index, gate_end_index
+            
+        elif method == 'calculated_market':
+            # Use the single calculated market feature
+            try:
+                gate_idx = feature_cols.index(market_col_name)
+                return gate_idx, gate_idx + 1
+            except ValueError:
+                logger.error(f"Calculated market feature '{market_col_name}' not found in feature columns.")
+                return None, None
+                
+        elif method == 'last_n':
+            # Use the last N features as market features
+            if gate_n_features > n_features_total:
+                logger.error(f"Requested {gate_n_features} gate features but only {n_features_total} total features available.")
+                return None, None
+            start_idx = n_features_total - gate_n_features
+            return start_idx, n_features_total
+            
+        elif method == 'percentage':
+            # Use the last X% of features as market features
+            n_market_features = max(1, int(n_features_total * gate_percentage))
+            if n_market_features >= n_features_total:
+                logger.warning(f"Percentage {gate_percentage} results in {n_market_features} market features, which is >= total features {n_features_total}. Using last feature only.")
+                n_market_features = 1
+            start_idx = n_features_total - n_market_features
+            return start_idx, n_features_total
+            
+        elif method == 'auto':
+            # Smart detection: try different strategies based on dataset size and feature names
+            # Strategy 1: If we have the calculated market feature, use it
+            if market_col_name in feature_cols:
+                try:
+                    gate_idx = feature_cols.index(market_col_name)
+                    logger.info(f"Auto mode: Using calculated market feature '{market_col_name}' at index {gate_idx}")
+                    return gate_idx, gate_idx + 1
+                except ValueError:
+                    pass
+            
+            # Strategy 2: Look for market-like feature names
+            market_keywords = ['market', 'mrkt', 'index', 'vix', 'vol', 'volatility', 'macro', 'sentiment']
+            for i, col_name in enumerate(feature_cols):
+                if any(keyword.lower() in col_name.lower() for keyword in market_keywords):
+                    logger.info(f"Auto mode: Found market-like feature '{col_name}' at index {i}, using as gate input")
+                    return i, i + 1
+            
+            # Strategy 3: Based on dataset size, use different defaults
+            if n_features_total >= 50:
+                # Large dataset: use last 10% as market features (similar to paper's approach)
+                n_market_features = max(1, int(n_features_total * 0.1))
+                start_idx = n_features_total - n_market_features
+                logger.info(f"Auto mode: Large dataset ({n_features_total} features), using last {n_market_features} features as market features")
+                return start_idx, n_features_total
+            else:
+                # Small dataset: use last feature as market feature
+                logger.info(f"Auto mode: Small dataset ({n_features_total} features), using last feature as market feature")
+                return n_features_total - 1, n_features_total
+        
+        logger.error(f"Unknown gate method: {method}")
+        return None, None
+    
+    gate_input_start_index, gate_input_end_index = determine_gate_indices(
+        gate_method, len(feature_columns), feature_columns, market_feature_col_name
+    )
+    
+    if gate_input_start_index is None or gate_input_end_index is None:
+        logger.error("Failed to determine gate indices. Check gate configuration and dataset.")
+        return (None,) * 12
+    
+    num_market_features_from_gate = gate_input_end_index - gate_input_start_index
+    logger.info(f"Gate configuration successful: method='{gate_method}', indices=[{gate_input_start_index}:{gate_input_end_index}], market_features={num_market_features_from_gate}")
+    logger.info(f"Market features for gate: {feature_columns[gate_input_start_index:gate_input_end_index]}")
+    # --- End of Dynamic Gate Index Determination ---
 
     # First, handle NaN/Inf replacement and ffill for all splits before scaling
     def _preprocess_features_no_scaling(df_slice, feature_cols):
@@ -390,43 +479,99 @@ def load_and_prepare_data(csv_path, feature_cols_start_idx, lookback,
             df_slice.loc[:, feature_cols] = df_slice[feature_cols].replace([np.inf, -np.inf], np.nan)
             # Step 2: Forward fill only (no backward fill)
             df_slice.loc[:, feature_cols] = df_slice.groupby(level='ticker', group_keys=False)[feature_cols].ffill()
-            # Step 3: Fill remaining NaNs with 0
+            # Step 3: Fill remaining NaNs with 0 (after ffill)
+            # This is a common strategy, but consider if per-feature median/mean imputation before ffill might be better for some cases.
+            # For now, 0-fill is simple and matches potential previous states of the code.
             df_slice.loc[:, feature_cols] = df_slice[feature_cols].fillna(0)
         return df_slice
 
-    # Apply preprocessing to all splits
-    train_df = _preprocess_features_no_scaling(train_df, feature_columns)
-    valid_df = _preprocess_features_no_scaling(valid_df, feature_columns) if not valid_df.empty else valid_df
-    test_df = _preprocess_features_no_scaling(test_df, feature_columns) if not test_df.empty else test_df
+    # Apply NaN/Inf handling and ffill to all splits first
+    train_df = _preprocess_features_no_scaling(train_df.copy(), feature_columns) # Use .copy() to avoid SettingWithCopyWarning
+    valid_df = _preprocess_features_no_scaling(valid_df.copy(), feature_columns) if not valid_df.empty else valid_df
+    test_df  = _preprocess_features_no_scaling(test_df.copy(), feature_columns) if not test_df.empty else test_df
+    
+    logger.info("Completed NaN/Inf replacement and ffill for train, valid, and test sets.")
 
-    # Fit scaler ONLY on training data
-    scaler = StandardScaler()
+    # --- Feature Scaling: RobustZScoreNorm + clip [-3, 3] --- 
+    # Fit scaler ONLY on training data using median and MAD
+    train_median = None
+    train_mad = None
+    scaler_fitted_successfully = False
+
     if feature_columns and not train_df.empty:
-        scaler.fit(train_df[feature_columns])
-        logger.info("Fitted StandardScaler on training data only.")
+        cols_to_scale = [col for col in feature_columns if col in train_df.columns and pd.api.types.is_numeric_dtype(train_df[col])]
+        if cols_to_scale:
+            logger.info(f"Calculating median and MAD for scaling on {len(cols_to_scale)} columns from training data.")
+            train_median = train_df[cols_to_scale].median()
+            # Calculate MAD: median of absolute deviations from the median. Add small epsilon to avoid division by zero.
+            train_mad = (train_df[cols_to_scale] - train_median).abs().median().replace(0, 1e-8) # paper suggests .replace(0,1)
+            
+            # Apply scaling to training data
+            train_df.loc[:, cols_to_scale] = ((train_df[cols_to_scale] - train_median) / train_mad).clip(-3, 3)
+            logger.info("Applied RobustZScoreNorm + clip to training data.")
+            scaler_fitted_successfully = True
+
+            # Apply scaling to validation data using train_median and train_mad
+            if not valid_df.empty and cols_to_scale:
+                valid_cols_to_scale = [col for col in cols_to_scale if col in valid_df.columns]
+                if valid_cols_to_scale:
+                    valid_df.loc[:, valid_cols_to_scale] = ((valid_df[valid_cols_to_scale] - train_median[valid_cols_to_scale]) / train_mad[valid_cols_to_scale]).clip(-3, 3)
+                    logger.info("Applied RobustZScoreNorm + clip to validation data using training set parameters.")
+            
+            # Apply scaling to test data using train_median and train_mad
+            if not test_df.empty and cols_to_scale:
+                test_cols_to_scale = [col for col in cols_to_scale if col in test_df.columns]
+                if test_cols_to_scale:
+                    test_df.loc[:, test_cols_to_scale] = ((test_df[test_cols_to_scale] - train_median[test_cols_to_scale]) / train_mad[test_cols_to_scale]).clip(-3, 3)
+                    logger.info("Applied RobustZScoreNorm + clip to test data using training set parameters.")
+        else:
+            logger.warning("No numeric columns found in feature_columns for scaling in training data.")
     else:
-        logger.warning("No features to fit scaler on training data.")
-        scaler = None
+        logger.warning("Training data is empty or no feature columns specified. Skipping scaling.")
 
-    # Update preprocess_data calls to use the pre-fitted scaler
-    X_train, y_train, train_idx, _ = preprocess_data(
-        train_df, feature_columns, label_column, lookback, scaler=scaler, fit_scaler=False
-    )
-    X_valid, y_valid, valid_idx, _ = preprocess_data(
-        valid_df, feature_columns, label_column, lookback, scaler=scaler, fit_scaler=False
-    ) if not valid_df.empty else (None, None, None, None)
-    X_test, y_test, test_idx, _ = preprocess_data(
-        test_df, feature_columns, label_column, lookback, scaler=scaler, fit_scaler=False
-    ) if not test_df.empty else (None, None, None, None)
+    # The old scaler object is no longer used. We pass None for it.
+    # The `preprocess_data` function, if it still expects a scaler, would need adjustment or to not apply scaling again.
+    # For this change, we assume scaling is done here in load_and_prepare_data completely.
+    # The X_train, y_train etc. are now generated by calling create_sequences_multi_index directly with the scaled dataframes.
 
-    logger.info(f"Data split summary → Train:{0 if X_train is None else X_train.shape[0]} "
-                f"| Valid:{0 if X_valid is None else X_valid.shape[0]} "
-                f"| Test:{0 if X_test  is None else X_test.shape[0]}")
+    # --- Sequence Creation --- 
+    # Create sequences from the preprocessed and scaled DataFrames
+    # The `preprocess_data` function was previously called here. Now we directly call `create_sequences_multi_index`
+    # as scaling is handled above. The `label_column` and `lookback` are needed.
 
+    # Ensure label_column is defined (it should be from earlier in the function)
+    if 'label_column' not in locals() and 'label_column' not in globals():
+        # Attempt to redefine it if it got lost, though this indicates a flow issue.
+        if 'label' in df.columns: label_column = 'label'
+        else: 
+            logger.error("label_column is not defined before sequence creation. Cannot proceed.")
+            return (None,) * 12 # Adjusted for 12 return values if scaler was one of them.
+
+    target_columns_for_sequence = [label_column] # create_sequences_multi_index expects a list of targets
+    forecast_horizon = 1 # Assuming a forecast horizon of 1 for the label
+
+    X_train, y_train, train_idx = create_sequences_multi_index(
+        train_df, feature_columns, target_columns_for_sequence, lookback, forecast_horizon
+    ) if not train_df.empty else (np.array([]), np.array([]), [])
+    
+    X_valid, y_valid, valid_idx = create_sequences_multi_index(
+        valid_df, feature_columns, target_columns_for_sequence, lookback, forecast_horizon
+    ) if not valid_df.empty else (np.array([]), np.array([]), [])
+    
+    X_test, y_test, test_idx = create_sequences_multi_index(
+        test_df, feature_columns, target_columns_for_sequence, lookback, forecast_horizon
+    ) if not test_df.empty else (np.array([]), np.array([]), [])
+
+    logger.info(f"Data split summary after scaling and sequencing → Train:{X_train.shape[0] if X_train is not None else 0} "
+                f"| Valid:{X_valid.shape[0] if X_valid is not None else 0} "
+                f"| Test:{X_test.shape[0] if X_test is not None else 0}")
+
+    # Return None for the scaler object as it's not a StandardScaler instance anymore and scaling is self-contained.
+    # The function now returns 12 values, including the gate indices.
     return X_train, y_train, train_idx, \
            X_valid, y_valid, valid_idx, \
-           X_test, y_test, test_idx, scaler, \
-           gate_input_start_index, gate_input_end_index
+           X_test, y_test, test_idx, \
+           None, gate_input_start_index, gate_input_end_index # Returning None for scaler object
 
 
 def parse_args():
@@ -442,6 +587,19 @@ def parse_args():
     parser.add_argument('--t_nhead', type=int, default=4, help="Heads for Temporal Attention.")
     parser.add_argument('--s_nhead', type=int, default=2, help="Heads for Cross-sectional Attention.")
     parser.add_argument('--beta', type=float, default=5.0, help="Beta for Gate mechanism or RegRankLoss.")
+    
+    # Gate configuration arguments
+    parser.add_argument('--gate_method', type=str, default='auto', 
+                       choices=['auto', 'calculated_market', 'last_n', 'percentage', 'manual'],
+                       help="Method for determining gate indices: 'auto' (smart detection), 'calculated_market' (use single calculated market feature), 'last_n' (last N features), 'percentage' (last X%% of features), 'manual' (specify indices)")
+    parser.add_argument('--gate_n_features', type=int, default=1, 
+                       help="Number of features to use for gate when using 'last_n' method (default: 1)")
+    parser.add_argument('--gate_percentage', type=float, default=0.1, 
+                       help="Percentage of features to use for gate when using 'percentage' method (default: 0.1 = 10%%)")
+    parser.add_argument('--gate_start_index', type=int, default=None,
+                       help="Manual gate start index (0-based) when using 'manual' method")
+    parser.add_argument('--gate_end_index', type=int, default=None,
+                       help="Manual gate end index (exclusive, 0-based) when using 'manual' method")
     
     parser.add_argument('--gpu', type=int, default=None, help="GPU ID (e.g., 0). None for CPU.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed.")
@@ -697,38 +855,46 @@ def main():
     X_test, y_test, test_idx, scaler_obj, \
     gate_input_start_index, gate_input_end_index = load_and_prepare_data(
         args.csv, FEATURE_START_COL, args.lookback, 
-        args.train_val_split_date, args.val_test_split_date
+        args.train_val_split_date, args.val_test_split_date,
+        args.gate_method, args.gate_n_features, args.gate_percentage,
+        args.gate_start_index, args.gate_end_index
     )
 
-    if X_train is None or X_train.shape[0] == 0: 
-        print("[main_multi_index.py] ERROR: No training data or failed market feature/gate index setup. Exiting.")
-        return
+    # Check if data loading and preparation was successful
+    if X_train is None or gate_input_start_index is None: 
+        logger.error("Data loading and preparation failed (e.g., feature mismatch for gate indices or other critical error). See logs above. Exiting.")
+        return # Exit main function if critical data is missing
 
     d_feat_total = X_train.shape[2]
-    if args.d_feat is not None: # d_feat from args is expected to be d_feat_total
+    if args.d_feat is not None: 
         if args.d_feat != d_feat_total:
-            logger.warning(f"Provided d_feat ({args.d_feat}) != data's actual total feature dim ({d_feat_total}). Using data's dim.")
-        # d_feat_total = args.d_feat # No, always use from data.
+            logger.warning(f"Provided d_feat ({args.d_feat}) from arguments != data's actual total feature dim ({d_feat_total}). Using data's dim.")
     
-    print(f"[main_multi_index.py] d_feat_total (num_features including market): {d_feat_total}")
-    
-    if not (0 <= gate_input_start_index < d_feat_total and 
-            gate_input_start_index < gate_input_end_index <= d_feat_total and 
-            gate_input_end_index == gate_input_start_index + 1): # For single market feature
-        logger.error(f"Internally determined Gate indices [{gate_input_start_index}, {gate_input_end_index}) "
-                       f"are invalid for d_feat_total={d_feat_total}. Check market feature processing.")
-        sys.exit(1)
+    logger.info(f"d_feat_total (num_features after processing, used by model): {d_feat_total}")
+    logger.info(f"Gate indices passed to model: start={gate_input_start_index}, end={gate_input_end_index}")
 
-    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx)
+    # Convert index lists to MultiIndex objects for compatibility with DailyGroupedTimeSeriesDataset
+    def convert_to_multiindex(idx_list):
+        """Convert list of (ticker, date) tuples to MultiIndex"""
+        if idx_list and isinstance(idx_list, list) and len(idx_list) > 0:
+            return pd.MultiIndex.from_tuples(idx_list, names=['ticker', 'date'])
+        else:
+            return pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
+
+    train_idx_multiindex = convert_to_multiindex(train_idx)
+    valid_idx_multiindex = convert_to_multiindex(valid_idx) if valid_idx else pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
+    test_idx_multiindex = convert_to_multiindex(test_idx) if test_idx else pd.MultiIndex.from_tuples([], names=['ticker', 'date'])
+
+    train_dataset = DailyGroupedTimeSeriesDataset(X_train, y_train, train_idx_multiindex)
     valid_dataset = None
     if X_valid is not None and X_valid.shape[0] > 0:
-        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx)
+        valid_dataset = DailyGroupedTimeSeriesDataset(X_valid, y_valid, valid_idx_multiindex)
     else:
         logger.warning("No validation data. Early stopping and LR scheduling on validation loss will not be active.")
     
     test_dataset = None
     if X_test is not None and X_test.shape[0] > 0:
-        test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx)
+        test_dataset = DailyGroupedTimeSeriesDataset(X_test, y_test, test_idx_multiindex)
 
     logger.info(f"Train samples: {len(X_train)}, Valid samples: {len(X_valid) if X_valid is not None else 0}, Test samples: {len(X_test) if X_test is not None else 0}")
     logger.info(f"Train unique days: {len(train_dataset)}, Valid unique days: {len(valid_dataset) if valid_dataset else 0}, Test unique days: {len(test_dataset) if test_dataset else 0}")
@@ -777,10 +943,26 @@ def main():
 
             # Apply label processing as per paper for training
             # drop_extreme and zscore expect torch tensors
-            label_mask, y_day_dropped_extreme = drop_extreme(y_day_original.clone()) 
+            num_original = y_day_original.shape[0]
+            
+            # Smart drop_extreme: only apply when we have enough samples
+            # With small batches (< 10 samples), drop_extreme becomes counterproductive
+            if num_original >= 10:
+                label_mask, y_day_dropped_extreme = drop_extreme(y_day_original.clone()) 
+                
+                # Fix shape issue: label_mask might be [N, 1] but we need [N] for indexing
+                if label_mask.dim() > 1:
+                    label_mask = label_mask.squeeze(-1)  # Convert [N, 1] to [N]
+            else:
+                # For small batches, use all samples (no drop_extreme)
+                label_mask = torch.ones(num_original, dtype=torch.bool, device=y_day_original.device)
+                y_day_dropped_extreme = y_day_original.clone()
+            
+            # Debug logging for training loss issue
+            num_after_drop = torch.sum(label_mask).item()
             
             if not torch.any(label_mask): # if all labels were dropped
-                # logger.debug(f"Epoch {epoch+1}, Day {i}: All labels dropped by drop_extreme. Skipping batch.")
+                logger.debug(f"Epoch {epoch+1}, Day {i}: All labels dropped by drop_extreme. Original: {num_original}, After: {num_after_drop}")
                 continue
             
             y_day_processed_for_loss = zscore(y_day_dropped_extreme) # CSZscoreNorm
@@ -789,7 +971,7 @@ def main():
             X_day_filtered = X_day[label_mask]
 
             if X_day_filtered.shape[0] == 0: # If all corresponding features are gone
-                # logger.debug(f"Epoch {epoch+1}, Day {i}: All features dropped after label mask. Skipping batch.")
+                logger.debug(f"Epoch {epoch+1}, Day {i}: All features dropped after label mask. Skipping batch.")
                 continue
                 
             optimizer.zero_grad()
@@ -800,17 +982,26 @@ def main():
                 logger.error(f"Epoch {epoch+1}, Day {i}: Mismatch after filtering. Preds: {preds_day_filtered_for_loss.shape}, Labels: {y_day_processed_for_loss.shape}. Skipping.")
                 continue
             if preds_day_filtered_for_loss.numel() == 0: # If no elements left to calculate loss
+                logger.debug(f"Epoch {epoch+1}, Day {i}: No elements left for loss calculation.")
                 continue
 
-
             loss = criterion(preds_day_filtered_for_loss.squeeze(), y_day_processed_for_loss.squeeze()) 
+            
+            # Debug: Log actual loss values
+            if i % 100 == 0:  # Log every 100th batch
+                logger.info(f"Epoch {epoch+1}, Day {i}: Original samples: {num_original}, After drop_extreme: {num_after_drop}, Loss: {loss.item():.6f}")
             
             if torch.isnan(loss) or torch.isinf(loss):
                 logger.warning(f"Epoch {epoch+1}, Day {i}: NaN or Inf loss detected. Skipping update. Preds: {preds_day_filtered_for_loss}, Labels: {y_day_processed_for_loss}")
                 continue
 
             loss.backward()
-            torch.nn.utils.clip_grad_value_(pytorch_model.parameters(), 3.0) # As per paper's base_model
+            
+            # Only clip gradients if they exist
+            has_grads = any(param.grad is not None for param in pytorch_model.parameters())
+            if has_grads:
+                torch.nn.utils.clip_grad_value_(pytorch_model.parameters(), 3.0) # As per paper's base_model
+            
             optimizer.step()
             epoch_train_loss += loss.item()
             processed_batches_train += 1
@@ -903,11 +1094,15 @@ def main():
                     continue
                 
                 for ticker_val, pred_score, actual_label in zip(tickers_for_day, preds_day_test, actuals_day_test):
+                    # Ensure scalar values for backtesting
+                    pred_score_scalar = float(pred_score) if hasattr(pred_score, 'item') else float(pred_score)
+                    actual_label_scalar = float(actual_label.item()) if hasattr(actual_label, 'item') else float(actual_label[0] if isinstance(actual_label, (list, np.ndarray)) and len(actual_label) > 0 else actual_label)
+                    
                     all_predictions_list.append({
                         'date': current_date_for_day,
                         'ticker': ticker_val,
-                        'prediction': pred_score,
-                        'actual_return': actual_label 
+                        'prediction': pred_score_scalar,
+                        'actual_return': actual_label_scalar 
                     })
         
         if all_predictions_list:
