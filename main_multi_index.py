@@ -1006,18 +1006,15 @@ def main():
 
     logger.info("Starting training loop with paper's label processing...")
     
-    # Create DataLoaders for optimized training
-    # Enable multiprocessing with spawn method for better GPU utilization
-    num_workers = 4 if device.type == 'cuda' else 4
-    
+    # Create DataLoaders with custom collate function for variable batch sizes
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=8,  # Increase batch size for better GPU utilization
+        batch_size=8,  # Can now use larger batch sizes!
         shuffle=False,  # Don't shuffle to maintain temporal order for time series
-        num_workers=num_workers,  # Re-enable multiprocessing with spawn
-        pin_memory=True if device.type == 'cuda' else False,  # Re-enable pin_memory
-        persistent_workers=True,  # Keep workers alive between epochs
-        prefetch_factor=2,  # Prefetch batches for smoother data flow
+        num_workers=0,  # Disable multiprocessing due to shared memory limitations
+        pin_memory=True if device.type == 'cuda' else False,
+        persistent_workers=False,  # Disable when num_workers=0
+        collate_fn=custom_collate_fn,  # Use our custom collate function
         drop_last=False  # Keep all data
     )
     
@@ -1027,14 +1024,14 @@ def main():
             valid_dataset,
             batch_size=8,  # Match training batch size
             shuffle=False,
-            num_workers=2,  # Fewer workers for validation
+            num_workers=0,  # Disable multiprocessing
             pin_memory=True if device.type == 'cuda' else False,
-            persistent_workers=True,
-            prefetch_factor=2,
+            persistent_workers=False,
+            prefetch_factor=None,
             drop_last=False
         )
     
-    logger.info(f"Created DataLoaders with {num_workers} workers and batch_size=8 for better GPU utilization")
+    logger.info(f"Created DataLoaders with num_workers=0 (multiprocessing disabled) and batch_size=8 for memory optimization")
     
     # Gradient accumulation for larger effective batch size
     accumulation_steps = 4  # Accumulate gradients over 4 days before updating
@@ -1046,74 +1043,100 @@ def main():
         processed_batches_train = 0
         
         # Use DataLoader for optimized iteration with batching
-        for batch_idx, batch_data_list in enumerate(train_loader):
-            # batch_data_list is now a list of dictionaries (one per day in the batch)
+        for batch_idx, batch_data in enumerate(train_loader):
             optimizer.zero_grad()
             
             batch_loss = 0
-            valid_batches_in_batch = 0
+            valid_days_in_batch = 0
+            
+            # batch_data now contains padded tensors with attention masks
+            X_batch = batch_data['X'].to(device, non_blocking=True)  # [batch_size, max_stocks, seq_len, features]
+            y_batch_original = batch_data['y_original'].to(device, non_blocking=True)  # [batch_size, max_stocks, 1]
+            attention_masks = batch_data['attention_mask'].to(device, non_blocking=True)  # [batch_size, max_stocks]
             
             # Process each day in the batch
-            for day_data in batch_data_list:
-                # Move tensors to device here for multiprocessing compatibility
-                X_day = day_data['X'].to(device, non_blocking=True)
-                y_day_original = day_data['y_original'].to(device, non_blocking=True)
+            for day_idx in range(X_batch.shape[0]):
+                # Get data for this day
+                X_day = X_batch[day_idx]  # [max_stocks, seq_len, features]
+                y_day_original = y_batch_original[day_idx]  # [max_stocks, 1]
+                attention_mask = attention_masks[day_idx]  # [max_stocks]
                 
-                if y_day_original.numel() == 0:
+                # Filter out padded stocks using attention mask
+                X_day_real = X_day[attention_mask]  # [num_real_stocks, seq_len, features]
+                y_day_real = y_day_original[attention_mask]  # [num_real_stocks, 1]
+                
+                if y_day_real.numel() == 0:
                     continue
 
-                # Use pre-processed labels if available, otherwise compute on-the-fly
-                label_mask = day_data.get('label_mask')
-                y_day_processed = day_data.get('y_processed')
+                # Squeeze the last dimension if needed
+                if y_day_real.dim() > 1 and y_day_real.shape[-1] == 1:
+                    y_day_real = y_day_real.squeeze(-1)  # [num_real_stocks]
+
+                # Handle pre-processed labels if available
+                label_mask_batch = batch_data.get('label_mask')
+                y_processed_batch = batch_data.get('y_processed')
                 
-                if label_mask is not None and y_day_processed is not None:
-                    # Move pre-processed data to device
-                    label_mask = label_mask.to(device, non_blocking=True)
-                    y_day_processed = y_day_processed.to(device, non_blocking=True)
+                if label_mask_batch is not None and y_processed_batch is not None:
+                    # Use pre-processed data, but filter by attention mask
+                    label_mask_day = label_mask_batch[day_idx][attention_mask].to(device, non_blocking=True)
+                    y_processed_day = y_processed_batch[day_idx][attention_mask].to(device, non_blocking=True)
                     
-                    if not torch.any(label_mask):
+                    if not torch.any(label_mask_day):
                         continue
                         
-                    X_day_filtered = X_day[label_mask]
-                    y_day_processed_for_loss = y_day_processed
+                    X_day_filtered = X_day_real[label_mask_day]
+                    y_day_processed_for_loss = y_processed_day[label_mask_day] if label_mask_day.dim() > 0 else y_processed_day
                 else:
                     # Fallback to on-the-fly processing
-                    num_original = y_day_original.shape[0]
+                    num_stocks = y_day_real.shape[0]
                     
-                    if num_original >= 10:
-                        label_mask, y_day_dropped_extreme = drop_extreme(y_day_original.clone())
-                        if label_mask.dim() > 1:
-                            label_mask = label_mask.squeeze(-1)
+                    if num_stocks >= 10:
+                        label_mask_day, y_day_dropped_extreme = drop_extreme(y_day_real.clone())
+                        if label_mask_day.dim() > 1:
+                            label_mask_day = label_mask_day.squeeze(-1)
                     else:
-                        label_mask = torch.ones(num_original, dtype=torch.bool, device=y_day_original.device)
-                        y_day_dropped_extreme = y_day_original.clone()
+                        label_mask_day = torch.ones(num_stocks, dtype=torch.bool, device=y_day_real.device)
+                        y_day_dropped_extreme = y_day_real.clone()
                     
-                    if not torch.any(label_mask):
+                    if not torch.any(label_mask_day):
                         continue
                     
                     y_day_processed_for_loss = zscore(y_day_dropped_extreme)
-                    X_day_filtered = X_day[label_mask]
+                    X_day_filtered = X_day_real[label_mask_day]
 
                 if X_day_filtered.shape[0] == 0:
                     continue
 
-                preds_day_all = pytorch_model(X_day)
-                preds_day_filtered_for_loss = preds_day_all[label_mask]
+                # Forward pass with real stocks only
+                preds_day_all = pytorch_model(X_day_real)  # Get predictions for real stocks
+                
+                # Filter predictions based on the mask
+                if 'label_mask_day' in locals() and torch.any(label_mask_day):
+                    preds_day_filtered_for_loss = preds_day_all[label_mask_day]
+                else:
+                    preds_day_filtered_for_loss = preds_day_all
 
+                # Ensure matching dimensions
+                if preds_day_filtered_for_loss.numel() == 0 or y_day_processed_for_loss.numel() == 0:
+                    continue
+                
                 if preds_day_filtered_for_loss.shape[0] != y_day_processed_for_loss.shape[0]:
-                    continue
-                if preds_day_filtered_for_loss.numel() == 0:
+                    logger.warning(f"Shape mismatch: preds {preds_day_filtered_for_loss.shape} vs labels {y_day_processed_for_loss.shape}")
                     continue
 
-                day_loss = criterion(preds_day_filtered_for_loss.squeeze(), y_day_processed_for_loss.squeeze())
+                # Calculate loss
+                pred_final = preds_day_filtered_for_loss.squeeze()
+                label_final = y_day_processed_for_loss.squeeze()
+
+                day_loss = criterion(pred_final, label_final)
                 
                 if not (torch.isnan(day_loss) or torch.isinf(day_loss)):
                     batch_loss += day_loss
-                    valid_batches_in_batch += 1
+                    valid_days_in_batch += 1
 
-            if valid_batches_in_batch > 0:
+            if valid_days_in_batch > 0:
                 # Average loss across valid days in the batch
-                batch_loss = batch_loss / valid_batches_in_batch
+                batch_loss = batch_loss / valid_days_in_batch
                 batch_loss.backward()
                 
                 # Gradient clipping
@@ -1123,8 +1146,8 @@ def main():
                 epoch_train_loss += batch_loss.item()
                 processed_batches_train += 1
                 
-                if batch_idx % 100 == 0:
-                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Avg Loss: {batch_loss.item():.6f}, Valid days in batch: {valid_batches_in_batch}")
+                if batch_idx % 50 == 0:  # Log more frequently due to larger batches
+                    logger.info(f"Epoch {epoch+1}, Batch {batch_idx}: Avg Loss: {batch_loss.item():.6f}, Valid days in batch: {valid_days_in_batch}")
 
         avg_epoch_train_loss = epoch_train_loss / processed_batches_train if processed_batches_train > 0 else 0
         logger.info(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {avg_epoch_train_loss:.6f}")
@@ -1135,37 +1158,49 @@ def main():
             processed_batches_valid = 0
             with torch.no_grad():
                 for batch_idx, batch_data in enumerate(valid_loader):
-                    # Extract data from the batch - DataLoader returns dict with batch dimension
-                    X_day_val = batch_data['X'].squeeze(0)  # Remove batch dimension
-                    y_day_val_original = batch_data['y_original'].squeeze(0)
-
-                    # Move to device if not already there
-                    if X_day_val.device != device:
-                        X_day_val = X_day_val.to(device, non_blocking=True)
-                    if y_day_val_original.device != device:
-                        y_day_val_original = y_day_val_original.to(device, non_blocking=True)
-
-                    if y_day_val_original.numel() == 0:
-                        continue
+                    X_batch_val = batch_data['X']
+                    y_batch_val_original = batch_data['y_original']
                     
-                    # Apply CSZscoreNorm for validation labels (NO drop_extreme)
-                    y_day_val_processed = zscore(y_day_val_original.clone())
+                    batch_val_loss = 0
+                    valid_days_in_val_batch = 0
                     
-                    preds_day_val = pytorch_model(X_day_val)
+                    for day_idx in range(X_batch_val.shape[0]):
+                        X_day_val = X_batch_val[day_idx]
+                        y_day_val_original = y_batch_val_original[day_idx]
 
-                    if preds_day_val.shape[0] != y_day_val_processed.shape[0]:
-                        logger.error(f"Epoch {epoch+1}, Valid Batch {batch_idx}: Mismatch shapes. Preds: {preds_day_val.shape}, Labels: {y_day_val_processed.shape}. Skipping.")
-                        continue
-                    if preds_day_val.numel() == 0:
-                         continue
+                        if y_day_val_original.numel() == 0:
+                            continue
+                        
+                        # Squeeze the last dimension if it's [num_stocks, 1]
+                        if y_day_val_original.dim() > 1 and y_day_val_original.shape[-1] == 1:
+                            y_day_val_original = y_day_val_original.squeeze(-1)
+                        
+                        # Apply CSZscoreNorm for validation labels (NO drop_extreme)
+                        y_day_val_processed = zscore(y_day_val_original.clone())
+                        
+                        preds_day_val = pytorch_model(X_day_val)
 
-                    val_loss_item = criterion(preds_day_val.squeeze(), y_day_val_processed.squeeze())
+                        # Ensure matching dimensions
+                        if preds_day_val.shape[0] != y_day_val_processed.shape[0]:
+                            logger.warning(f"Validation shape mismatch: preds {preds_day_val.shape} vs labels {y_day_val_processed.shape}")
+                            continue
+                            
+                        pred_final = preds_day_val.squeeze()
+                        label_final = y_day_val_processed.squeeze()
+                        
+                        if pred_final.numel() == 0 or label_final.numel() == 0:
+                            continue
+
+                        val_loss_item = criterion(pred_final, label_final)
+                        
+                        if not (torch.isnan(val_loss_item) or torch.isinf(val_loss_item)):
+                            batch_val_loss += val_loss_item
+                            valid_days_in_val_batch += 1
                     
-                    if not (torch.isnan(val_loss_item) or torch.isinf(val_loss_item)):
-                        epoch_val_loss += val_loss_item.item()
+                    if valid_days_in_val_batch > 0:
+                        batch_val_loss = batch_val_loss / valid_days_in_val_batch
+                        epoch_val_loss += batch_val_loss.item()
                         processed_batches_valid += 1
-                    else:
-                        logger.warning(f"Epoch {epoch+1}, Valid Batch {batch_idx}: NaN or Inf validation loss detected.")
 
             avg_epoch_val_loss = epoch_val_loss / processed_batches_valid if processed_batches_valid > 0 else 0
             logger.info(f"Epoch {epoch+1}/{args.epochs} - Validation Loss: {avg_epoch_val_loss:.6f}")
@@ -1270,6 +1305,96 @@ def main():
         logger.warning("Predictions DataFrame is empty after test set processing, skipping backtesting.")
 
     print("[main_multi_index.py] main() function completed.")
+
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle variable number of stocks per day.
+    Pads all days in the batch to the maximum number of stocks and creates attention masks.
+    """
+    # Find the maximum number of stocks in this batch
+    max_stocks = max([item['X'].shape[0] for item in batch])
+    
+    padded_X = []
+    padded_y_original = []
+    attention_masks = []
+    label_masks = []
+    y_processed_list = []
+    
+    for item in batch:
+        X = item['X']  # Shape: [num_stocks, seq_len, features]
+        y_original = item['y_original']  # Shape: [num_stocks, 1]
+        
+        num_stocks = X.shape[0]
+        
+        # Create attention mask (True for real stocks, False for padding)
+        attention_mask = torch.zeros(max_stocks, dtype=torch.bool)
+        attention_mask[:num_stocks] = True
+        
+        # Pad X and y to max_stocks
+        if num_stocks < max_stocks:
+            pad_size = max_stocks - num_stocks
+            # Pad X: ensure padding tensor has same last 2 dimensions
+            X_pad = torch.zeros(pad_size, X.shape[1], X.shape[2], dtype=X.dtype)
+            X_padded = torch.cat([X, X_pad], dim=0)
+            
+            # Pad y_original: ensure padding tensor has same last dimension
+            y_pad = torch.zeros(pad_size, y_original.shape[1], dtype=y_original.dtype)
+            y_padded = torch.cat([y_original, y_pad], dim=0)
+        else:
+            X_padded = X
+            y_padded = y_original
+        
+        padded_X.append(X_padded)
+        padded_y_original.append(y_padded)
+        attention_masks.append(attention_mask)
+        
+        # Handle pre-processed labels if available
+        if 'label_mask' in item and item['label_mask'] is not None:
+            label_mask = item['label_mask']
+            y_processed = item['y_processed']
+            
+            # Pad label_mask and y_processed
+            if num_stocks < max_stocks:
+                pad_size = max_stocks - num_stocks
+                
+                # Pad label_mask (boolean tensor)
+                label_mask_pad = torch.zeros(pad_size, dtype=torch.bool)
+                label_mask_padded = torch.cat([label_mask, label_mask_pad], dim=0)
+                
+                # Pad y_processed: check if it's 1D or 2D and pad accordingly
+                if y_processed.dim() == 1:
+                    y_processed_pad = torch.zeros(pad_size, dtype=y_processed.dtype)
+                    y_processed_padded = torch.cat([y_processed, y_processed_pad], dim=0)
+                elif y_processed.dim() == 2:
+                    y_processed_pad = torch.zeros(pad_size, y_processed.shape[1], dtype=y_processed.dtype)
+                    y_processed_padded = torch.cat([y_processed, y_processed_pad], dim=0)
+                else:
+                    # Handle unexpected dimensions
+                    y_processed_pad = torch.zeros(pad_size, dtype=y_processed.dtype)
+                    y_processed_padded = torch.cat([y_processed.flatten()[:num_stocks], y_processed_pad], dim=0)
+            else:
+                label_mask_padded = label_mask
+                y_processed_padded = y_processed
+                
+            label_masks.append(label_mask_padded)
+            y_processed_list.append(y_processed_padded)
+        else:
+            # Create placeholder tensors with correct shape
+            label_masks.append(torch.zeros(max_stocks, dtype=torch.bool))
+            y_processed_list.append(torch.zeros(max_stocks, dtype=torch.float32))
+    
+    # Stack all tensors
+    result = {
+        'X': torch.stack(padded_X, dim=0),  # [batch_size, max_stocks, seq_len, features]
+        'y_original': torch.stack(padded_y_original, dim=0),  # [batch_size, max_stocks, 1]
+        'attention_mask': torch.stack(attention_masks, dim=0),  # [batch_size, max_stocks]
+    }
+    
+    # Add processed labels - always include them now (even if some are placeholder)
+    result['label_mask'] = torch.stack(label_masks, dim=0)  # [batch_size, max_stocks]
+    result['y_processed'] = torch.stack(y_processed_list, dim=0)  # [batch_size, max_stocks]
+    
+    return result
 
 if __name__ == "__main__":
     print("[main_multi_index.py] Script execution started from __main__.") # DIAGNOSTIC PRINT
