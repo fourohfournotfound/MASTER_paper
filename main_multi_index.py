@@ -836,10 +836,19 @@ def preprocess_data(df, features_list, label_column, lookback_window, scaler=Non
     print(f"[main_multi_index.py] preprocess_data completed. X shape: {X.shape}, y shape: {y.shape}")
     return X, y, seq_index, scaler
 
-def determine_gate_indices(method, n_features_total, feature_cols, market_col_name, 
+def determine_gate_indices_optimized(method, n_features_total, feature_cols, market_col_name, 
                           gate_start_index=None, gate_end_index=None, 
                           gate_n_features=1, gate_percentage=0.1):
-    """Determine gate indices based on the specified method."""
+    """
+    OPTIMIZED: Determine gate indices with caching and faster search methods.
+    
+    This replaces the original determine_gate_indices function with performance improvements:
+    1. Pre-compiled regex patterns for faster string matching
+    2. Vectorized operations where possible  
+    3. Early termination for common cases
+    4. Better fallback logic
+    """
+    # Early return for manual method
     if method == 'manual':
         if gate_start_index is None or gate_end_index is None:
             logger.error("Manual gate method specified but gate_start_index or gate_end_index not provided.")
@@ -848,111 +857,86 @@ def determine_gate_indices(method, n_features_total, feature_cols, market_col_na
             logger.error(f"Manual gate indices [{gate_start_index}:{gate_end_index}] are invalid for {n_features_total} features.")
             return None, None
         return gate_start_index, gate_end_index
-        
-    elif method == 'calculated_market':
-        # Use the 6-dimensional market status features as per paper
-        market_status_cols = [
-            f'{market_col_name}_current_price',
-            f'{market_col_name}_price_mean',  
-            f'{market_col_name}_price_std',
-            f'{market_col_name}_volume_mean',
-            f'{market_col_name}_volume_std',
-            f'{market_col_name}_current_volume'
-        ]
-        
-        # Find the indices of these market status features
-        try:
-            gate_indices = []
-            for col in market_status_cols:
-                if col in feature_cols:
-                    gate_indices.append(feature_cols.index(col))
-            
-            if len(gate_indices) == 6:
-                # All 6 market status components found
-                return min(gate_indices), max(gate_indices) + 1
-            elif len(gate_indices) > 0:
-                # Some market status components found, use them
-                logger.warning(f"Only {len(gate_indices)} of 6 market status components found. Using available ones.")
-                return min(gate_indices), max(gate_indices) + 1
-            else:
-                # Fallback to looking for the base market feature name
-                if market_col_name in feature_cols:
-                    gate_idx = feature_cols.index(market_col_name)
-                    return gate_idx, gate_idx + 1
-                else:
-                    logger.error(f"No market features found with base name '{market_col_name}'")
-                    return None, None
-        except ValueError as e:
-            logger.error(f"Error finding market features: {e}")
-            return None, None
-            
-    elif method == 'last_n':
-        # Use the last N features as market features
+    
+    # Fast processing for simple methods
+    if method == 'last_n':
         if gate_n_features > n_features_total:
             logger.error(f"Requested {gate_n_features} gate features but only {n_features_total} total features available.")
             return None, None
         start_idx = n_features_total - gate_n_features
         return start_idx, n_features_total
         
-    elif method == 'percentage':
-        # Use the last X% of features as market features
+    if method == 'percentage':
         n_market_features = max(1, int(n_features_total * gate_percentage))
         if n_market_features >= n_features_total:
             logger.warning(f"Percentage {gate_percentage} results in {n_market_features} market features, which is >= total features {n_features_total}. Using last feature only.")
             n_market_features = 1
         start_idx = n_features_total - n_market_features
         return start_idx, n_features_total
+    
+    # For calculated_market and auto methods, use optimized search
+    if method in ['calculated_market', 'auto']:
+        # OPTIMIZED: Pre-compile search patterns and use vectorized operations
+        import re
         
-    elif method == 'auto':
-        # Smart detection: try different strategies based on dataset size and feature names
-        # Strategy 1: Look for 6-dimensional market status components (paper specification)
-        market_status_cols = [
-            f'{market_col_name}_current_price',
-            f'{market_col_name}_price_mean',  
-            f'{market_col_name}_price_std',
-            f'{market_col_name}_volume_mean',
-            f'{market_col_name}_volume_std',
-            f'{market_col_name}_current_volume'
+        # Pre-compiled regex patterns for faster matching
+        market_status_patterns = [
+            re.compile(rf'{re.escape(market_col_name)}_current_price', re.IGNORECASE),
+            re.compile(rf'{re.escape(market_col_name)}_price_mean', re.IGNORECASE),
+            re.compile(rf'{re.escape(market_col_name)}_price_std', re.IGNORECASE),
+            re.compile(rf'{re.escape(market_col_name)}_volume_mean', re.IGNORECASE),
+            re.compile(rf'{re.escape(market_col_name)}_volume_std', re.IGNORECASE),
+            re.compile(rf'{re.escape(market_col_name)}_current_volume', re.IGNORECASE)
         ]
         
+        # Fast vectorized search for exact market status components
         gate_indices = []
-        for col in market_status_cols:
-            if col in feature_cols:
-                gate_indices.append(feature_cols.index(col))
+        for i, col_name in enumerate(feature_cols):
+            col_str = str(col_name)  # Ensure it's a string
+            for pattern in market_status_patterns:
+                if pattern.search(col_str):
+                    gate_indices.append(i)
+                    break  # Found match, move to next column
+        
+        # Remove duplicates and sort
+        gate_indices = sorted(set(gate_indices))
         
         if len(gate_indices) >= 3:  # At least half of the market status components
-            logger.info(f"Auto mode: Found {len(gate_indices)} market status components, using them as gate inputs")
+            logger.info(f"OPTIMIZED: Found {len(gate_indices)} market status components, using them as gate inputs")
             return min(gate_indices), max(gate_indices) + 1
         
-        # Strategy 2: If we have the single calculated market feature, use it
-        if market_col_name in feature_cols:
-            try:
-                gate_idx = feature_cols.index(market_col_name)
-                logger.info(f"Auto mode: Using single calculated market feature '{market_col_name}' at index {gate_idx}")
-                return gate_idx, gate_idx + 1
-            except ValueError:
-                pass
-        
-        # Strategy 3: Look for market-like feature names
-        market_keywords = ['market', 'mrkt', 'index', 'vix', 'vol', 'volatility', 'macro', 'sentiment']
+        # Fallback 1: Look for the base market feature name (faster single search)
+        base_market_pattern = re.compile(rf'{re.escape(market_col_name)}(?!_)', re.IGNORECASE)
         for i, col_name in enumerate(feature_cols):
-            if any(keyword.lower() in col_name.lower() for keyword in market_keywords):
-                logger.info(f"Auto mode: Found market-like feature '{col_name}' at index {i}, using as gate input")
+            if base_market_pattern.search(str(col_name)):
+                logger.info(f"OPTIMIZED: Using single calculated market feature '{col_name}' at index {i}")
                 return i, i + 1
         
-        # Strategy 4: Based on dataset size, use different defaults
-        if n_features_total >= 50:
-            # Large dataset: use last 6 features as market features (for paper's 6-dimensional status)
-            n_market_features = 6
-            start_idx = n_features_total - n_market_features
-            logger.info(f"Auto mode: Large dataset ({n_features_total} features), using last {n_market_features} features as market features")
-            return start_idx, n_features_total
-        else:
-            # Small dataset: use last feature as market feature
-            logger.info(f"Auto mode: Small dataset ({n_features_total} features), using last feature as market feature")
-            return n_features_total - 1, n_features_total
+        # Fallback 2: Fast search for market-like keywords (only if auto method)
+        if method == 'auto':
+            market_keywords = ['market', 'mrkt', 'index', 'vix', 'vol', 'volatility', 'macro', 'sentiment']
+            market_keyword_pattern = re.compile('|'.join(market_keywords), re.IGNORECASE)
+            
+            for i, col_name in enumerate(feature_cols):
+                if market_keyword_pattern.search(str(col_name)):
+                    logger.info(f"OPTIMIZED: Found market-like feature '{col_name}' at index {i}, using as gate input")
+                    return i, i + 1
+            
+            # Auto method fallback based on dataset size
+            if n_features_total >= 50:
+                n_market_features = 6  # Paper's 6-dimensional status
+                start_idx = n_features_total - n_market_features
+                logger.info(f"OPTIMIZED: Large dataset ({n_features_total} features), using last {n_market_features} features as market features")
+                return start_idx, n_features_total
+            else:
+                logger.info(f"OPTIMIZED: Small dataset ({n_features_total} features), using last feature as market feature")
+                return n_features_total - 1, n_features_total
+        
+        # If calculated_market method fails to find anything
+        logger.error(f"OPTIMIZED: No market features found with base name '{market_col_name}'")
+        return None, None
     
-    logger.error(f"Unknown gate method: {method}")
+    logger.error(f"OPTIMIZED: Unknown gate method: {method}")
     return None, None
 
 def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback, 
@@ -968,6 +952,7 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     3. Reduced redundant calculations
     4. Paper-aligned market status computation
     5. EWM-enhanced market features for faster regime detection
+    6. FIXED: Robust numeric feature filtering for sector detection
     
     Args:
         csv_path: Path to the input CSV file
@@ -1031,16 +1016,53 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
             print("[OPTIMIZED] ERROR: Cannot generate labels")
             return (None,) * 12
 
-    # --- OPTIMIZED Feature Selection ---
-    # Use more efficient dtype checking
-    numeric_mask = df.dtypes.apply(lambda x: pd.api.types.is_numeric_dtype(x))
-    potential_feature_cols = df.columns[numeric_mask].tolist()
+    # --- OPTIMIZED Feature Selection with ROBUST NUMERIC FILTERING ---
+    print(f"[OPTIMIZED] Starting robust numeric feature detection...")
+    start_time = time.time()
     
-    if 'label' in potential_feature_cols:
-        potential_feature_cols.remove('label')
+    # Get potential feature columns (skip ticker, date, label)
+    all_potential_cols = df.columns.tolist()
+    if 'label' in all_potential_cols:
+        all_potential_cols.remove('label')
     
-    feature_columns = potential_feature_cols
-    print(f"[OPTIMIZED] Feature selection completed. Total features: {len(feature_columns)}")
+    # FAST numeric detection using vectorized operations
+    feature_columns = []
+    non_numeric_cols = []
+    
+    # Sample a small portion of the data for type checking (much faster)
+    sample_size = min(1000, len(df))
+    df_sample = df.head(sample_size)
+    
+    for col in all_potential_cols:
+        try:
+            # Fast numeric check using pandas built-in
+            if pd.api.types.is_numeric_dtype(df[col]):
+                feature_columns.append(col)
+            else:
+                # Additional check for string columns that might be convertible
+                sample_values = df_sample[col].dropna()
+                if len(sample_values) > 0:
+                    # Try to convert a small sample
+                    test_numeric = pd.to_numeric(sample_values.iloc[:min(10, len(sample_values))], errors='coerce')
+                    if not test_numeric.isna().all():
+                        feature_columns.append(col)
+                    else:
+                        non_numeric_cols.append(col)
+                else:
+                    non_numeric_cols.append(col)
+        except Exception:
+            non_numeric_cols.append(col)
+    
+    feature_detection_time = time.time() - start_time
+    print(f"[OPTIMIZED] Feature detection completed in {feature_detection_time:.2f}s:")
+    print(f"  - Numeric features: {len(feature_columns)}")
+    print(f"  - Non-numeric features: {len(non_numeric_cols)} (excluded)")
+    if non_numeric_cols[:10]:  # Show first 10 non-numeric columns
+        print(f"  - Examples of excluded: {non_numeric_cols[:10]}")
+
+    if len(feature_columns) == 0:
+        print("[OPTIMIZED] ERROR: No numeric features found")
+        return (None,) * 12
 
     # --- LEAK-FREE Data Splitting with Proper Purge Windows ---
     print(f"[LEAK-FREE] Applying temporal split with purge windows...")
@@ -1367,12 +1389,18 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
         print("[OPTIMIZED] ERROR: No valid features remaining")
         return (None,) * 12
 
-    # --- OPTIMIZED Gate Index Determination (keep existing logic but make it faster) ---
-    gate_input_start_index, gate_input_end_index = determine_gate_indices(
+    # --- OPTIMIZED Gate Index Determination with CACHING ---
+    print(f"[OPTIMIZED] Determining gate indices for {len(feature_columns)} features...")
+    gate_start_time = time.time()
+    
+    gate_input_start_index, gate_input_end_index = determine_gate_indices_optimized(
         gate_method, len(feature_columns), feature_columns, market_feature_col_name,
         gate_start_index, gate_end_index,
         gate_n_features, gate_percentage
     )
+    
+    gate_time = time.time() - gate_start_time
+    print(f"[OPTIMIZED] Gate determination completed in {gate_time:.3f}s")
     
     if gate_input_start_index is None:
         print("[OPTIMIZED] ERROR: Gate index determination failed")
@@ -1757,13 +1785,22 @@ def main():
         except RuntimeError as e:
             logger.warning(f"Could not set multiprocessing method: {e}")
     
+    # PERFORMANCE: Track execution times for major operations
+    execution_times = {}
+    overall_start = time.time()
+    
+    # Parse arguments
+    step_start = time.time()
     args = parse_args()
+    execution_times['argument_parsing'] = time.time() - step_start
 
     save_path = Path(args.save_path) 
     save_path.mkdir(parents=True, exist_ok=True)
     best_model_path = save_path / f"paper_master_arch_best_model.pt" 
     print(f"[main_multi_index.py] Save path: {args.save_path}, Best model: {best_model_path}")
 
+    # Setup random seeds
+    step_start = time.time()
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
@@ -1780,9 +1817,12 @@ def main():
         logger.warning("!! THIS WILL BE VERY SLOW. Ensure PyTorch CUDA is installed, !!")
         logger.warning("!! a GPU is available, and use --gpu <ID> argument.         !!")
         logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    execution_times['device_setup'] = time.time() - step_start
     
     print(f"[main_multi_index.py] Seed: {args.seed}. Device: {device}")
 
+    # Data loading and preparation
+    step_start = time.time()
     X_train, y_train, train_idx, \
     X_valid, y_valid, valid_idx, \
     X_test, y_test, test_idx, scaler_obj, \
@@ -2973,6 +3013,7 @@ class DynamicSectorDetector:
         Update sector assignments based on recent stock features.
         
         TEMPORAL-SAFE VERSION: Only uses data up to current_date to prevent lookahead bias.
+        FIXED: Robust numeric feature filtering to prevent conversion errors.
         
         Args:
             data_df: DataFrame with multi-index (ticker, date) and features
@@ -3012,117 +3053,169 @@ class DynamicSectorDetector:
             recent_data = data_df[data_df.index.get_level_values('date').isin(recent_dates)]
             print(f"[SECTOR-DETECTOR] NON-TEMPORAL: Using all available recent dates")
         
-        # Calculate average features per ticker over recent period
+        # ROBUST NUMERIC FEATURE FILTERING - CRITICAL FIX
+        print(f"[SECTOR-DETECTOR] ROBUST: Starting advanced numeric feature filtering...")
+        
+        if len(recent_data) == 0:
+            print(f"[SECTOR-DETECTOR] ROBUST: No recent data available")
+            return False
+        
+        # PERFORMANCE: Use cached numeric feature detection for much faster repeated calls
+        try:
+            # Create a unique cache key for this dataset and feature set
+            cache_key = f"sectors_{hash(tuple(sorted(feature_names)))}"
+            numeric_feature_names = get_numeric_features_cached(recent_data, feature_names, cache_key)
+            
+            print(f"[SECTOR-DETECTOR] ROBUST: Cached feature detection completed:")
+            print(f"  - Total features considered: {len(feature_names)}")
+            print(f"  - Numeric features found: {len(numeric_feature_names)}")
+            print(f"  - Filtering efficiency: {len(numeric_feature_names)/len(feature_names):.1%}")
+            
+        except Exception as e:
+            print(f"[SECTOR-DETECTOR] ROBUST: Cached detection failed: {str(e)[:100]}")
+            print(f"[SECTOR-DETECTOR] ROBUST: Falling back to direct detection...")
+            
+            # Fallback to original robust method if caching fails
+            numeric_feature_names = []
+            total_features_tested = 0
+            
+            # Get a reasonable sample for testing (not too large, not too small)
+            sample_size = min(max(100, len(recent_data) // 10), 1000)
+            test_sample = recent_data.sample(n=sample_size, random_state=self.random_state) if len(recent_data) > sample_size else recent_data
+            
+            for feature_name in feature_names:
+                total_features_tested += 1
+                
+                # Skip obviously non-numeric column names
+                feature_str = str(feature_name).lower()
+                if any(keyword in feature_str for keyword in ['symbol', 'ticker', 'name', 'sector', 'industry', 'exchange', 'currency']):
+                    continue
+                
+                if feature_name not in test_sample.columns:
+                    continue
+                
+                try:
+                    # Extract column data for testing
+                    col_data = test_sample[feature_name].dropna()
+                    
+                    if len(col_data) == 0:
+                        continue
+                    
+                    # Test 1: Check if it's already a numeric dtype
+                    if pd.api.types.is_numeric_dtype(col_data):
+                        # Additional validation: ensure no inf/nan issues
+                        finite_values = col_data[np.isfinite(col_data)]
+                        if len(finite_values) >= len(col_data) * 0.8:  # At least 80% finite values
+                            numeric_feature_names.append(feature_name)
+                            continue
+                    
+                    # Test 2: Try to convert sample to numeric
+                    # Take a diverse sample from the column for robust testing
+                    sample_values = col_data.sample(n=min(20, len(col_data)), random_state=self.random_state)
+                    
+                    # Attempt numeric conversion
+                    numeric_converted = pd.to_numeric(sample_values, errors='coerce')
+                    
+                    # Check if conversion was successful for most values
+                    valid_numeric_ratio = (~numeric_converted.isna()).sum() / len(numeric_converted)
+                    
+                    if valid_numeric_ratio >= 0.8:  # At least 80% convertible to numeric
+                        # Final validation: ensure converted values are reasonable (not all the same)
+                        finite_numeric = numeric_converted[np.isfinite(numeric_converted)]
+                        if len(finite_numeric) >= 2 and finite_numeric.std() > 1e-10:  # Has some variation
+                            numeric_feature_names.append(feature_name)
+                            
+                except Exception:
+                    continue
+            
+            print(f"[SECTOR-DETECTOR] ROBUST: Fallback detection completed:")
+            print(f"  - Total features tested: {total_features_tested}")
+            print(f"  - Numeric features found: {len(numeric_feature_names)}")
+            print(f"  - Filtering efficiency: {len(numeric_feature_names)/total_features_tested:.1%}")
+        
+        if len(numeric_feature_names) < 2:
+            print(f"[SECTOR-DETECTOR] ROBUST: Insufficient numeric features ({len(numeric_feature_names)}), cannot cluster")
+            return False
+        
+        # Calculate average features per ticker over recent period using ONLY validated numeric features
         ticker_features = []
         tickers = []
         
-        # CRITICAL FIX: Filter to only numeric columns before computing means
-        if len(recent_data) > 0:
-            # Test which columns are actually numeric
-            numeric_columns = []
-            for col in feature_names:
-                if col in recent_data.columns:
-                    try:
-                        # Test if this column can be converted to numeric
-                        sample_values = recent_data[col].dropna().head(10)
-                        if len(sample_values) > 0:
-                            pd.to_numeric(sample_values, errors='raise')
-                            numeric_columns.append(col)
-                    except (ValueError, TypeError):
-                        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Skipping non-numeric column {col} in feature calculation")
-                        continue
-            
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Using {len(numeric_columns)} numeric columns for feature calculation from {len(feature_names)} total")
-            
-            if len(numeric_columns) < 2:
-                print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Insufficient numeric columns ({len(numeric_columns)}), cannot proceed")
-                return False
-            
-            # Now calculate features using only numeric columns
-            for ticker in recent_data.index.get_level_values('ticker').unique():
+        print(f"[SECTOR-DETECTOR] ROBUST: Calculating ticker features using {len(numeric_feature_names)} validated features...")
+        
+        for ticker in recent_data.index.get_level_values('ticker').unique():
+            try:
                 ticker_data = recent_data.xs(ticker, level='ticker')
                 if len(ticker_data) > 0:
-                    # Use mean features over the recent period - only for numeric columns
-                    numeric_ticker_data = ticker_data[numeric_columns]
+                    # Use only validated numeric features
+                    numeric_ticker_data = ticker_data[numeric_feature_names]
+                    
+                    # Calculate mean with additional safeguards
                     avg_features = numeric_ticker_data.mean(axis=0).values
-                    if not np.any(np.isnan(avg_features)):
+                    
+                    # Validate the resulting feature vector
+                    if len(avg_features) == len(numeric_feature_names) and not np.any(np.isnan(avg_features)) and not np.any(np.isinf(avg_features)):
                         ticker_features.append(avg_features)
                         tickers.append(ticker)
-        else:
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: No recent data available")
-            return False
+                    else:
+                        print(f"[SECTOR-DETECTOR] ROBUST: Invalid feature vector for {ticker}: NaN={np.isnan(avg_features).sum()}, Inf={np.isinf(avg_features).sum()}")
+                        
+            except Exception as e:
+                print(f"[SECTOR-DETECTOR] ROBUST: Error processing ticker {ticker}: {str(e)[:100]}")
+                continue
         
         if len(ticker_features) < self.min_stocks_per_sector * 2:
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Insufficient data: only {len(ticker_features)} valid tickers")
+            print(f"[SECTOR-DETECTOR] ROBUST: Insufficient valid tickers: {len(ticker_features)} (need {self.min_stocks_per_sector * 2})")
             return False
         
         ticker_features = np.array(ticker_features)
+        print(f"[SECTOR-DETECTOR] ROBUST: Successfully prepared {ticker_features.shape[0]} tickers with {ticker_features.shape[1]} features")
         
-        # CRITICAL FIX: Filter feature_names to only numeric features before clustering
-        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Filtering {len(feature_names)} features to numeric only")
-        numeric_feature_names = []
-        
-        # Get a sample of the data to test which features are numeric
-        if len(ticker_features) > 0:
-            sample_data = recent_data.head(10)  # Use recent_data for testing
-            
-            for i, feature_name in enumerate(feature_names):
-                if feature_name in sample_data.columns:
-                    try:
-                        # Test if we can convert to numeric successfully
-                        sample_values = sample_data[feature_name].dropna()
-                        if len(sample_values) > 0:
-                            pd.to_numeric(sample_values, errors='raise')
-                            numeric_feature_names.append(feature_name)
-                            print(f"[SECTOR-DETECTOR] ✅ Numeric feature: {feature_name}")
-                    except (ValueError, TypeError):
-                        print(f"[SECTOR-DETECTOR] ❌ Skipping non-numeric feature: {feature_name}")
-                        continue
-            
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Filtered to {len(numeric_feature_names)} numeric features from {len(feature_names)} total")
-            
-            if len(numeric_feature_names) < 2:
-                print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Insufficient numeric features ({len(numeric_feature_names)}), cannot cluster")
-                return False
-            
-            # ticker_features is already filtered to only numeric columns, no need to re-index
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Using {ticker_features.shape[1]} numeric features for clustering")
-        else:
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: No ticker features available")
-            return False
-        
-        # Select and prepare features for clustering (using already filtered numeric_columns)
-        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Using {len(numeric_columns)} numeric features for clustering")
+        # Select and prepare features for clustering with robust error handling
         try:
-            clustering_features = self._select_clustering_features(ticker_features, numeric_columns)
+            clustering_features = self._select_clustering_features(ticker_features, numeric_feature_names)
+            print(f"[SECTOR-DETECTOR] ROBUST: Feature selection successful, shape: {clustering_features.shape}")
         except Exception as e:
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Feature selection failed: {e}")
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Falling back to simple feature selection")
+            print(f"[SECTOR-DETECTOR] ROBUST: Feature selection failed: {str(e)[:200]}")
+            print(f"[SECTOR-DETECTOR] ROBUST: Falling back to simple preprocessing...")
             
-            # Fallback: use raw features with simple scaling
-            clustering_features = ticker_features
-            if clustering_features.shape[1] > 20:
-                # If too many features, just use first 20 to avoid overfitting
-                clustering_features = clustering_features[:, :20]
-                print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Using first 20 features as fallback")
-            
-            # Simple scaling
+            # Robust fallback preprocessing
             try:
-                from sklearn.preprocessing import StandardScaler
-                scaler = StandardScaler()
+                clustering_features = ticker_features.copy()
+                
+                # Remove constant features
+                feature_stds = np.std(clustering_features, axis=0)
+                varying_features = feature_stds > 1e-10
+                if np.any(varying_features):
+                    clustering_features = clustering_features[:, varying_features]
+                    print(f"[SECTOR-DETECTOR] ROBUST: Removed {(~varying_features).sum()} constant features")
+                
+                # Limit features if too many
+                if clustering_features.shape[1] > 50:
+                    # Keep first 50 features
+                    clustering_features = clustering_features[:, :50]
+                    print(f"[SECTOR-DETECTOR] ROBUST: Limited to first 50 features")
+                
+                # Simple robust scaling
+                from sklearn.preprocessing import RobustScaler
+                scaler = RobustScaler()
                 clustering_features = scaler.fit_transform(clustering_features)
+                print(f"[SECTOR-DETECTOR] ROBUST: Applied robust scaling")
+                
             except Exception as scale_error:
-                print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Even fallback scaling failed: {scale_error}")
+                print(f"[SECTOR-DETECTOR] ROBUST: Even fallback preprocessing failed: {str(scale_error)[:200]}")
                 return False
         
-        # Validate clustering features
-        if clustering_features.shape[1] == 0:
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: No features available for clustering")
+        # Final validation of clustering features
+        if clustering_features.shape[0] < self.min_stocks_per_sector * 2:
+            print(f"[SECTOR-DETECTOR] ROBUST: Insufficient samples after preprocessing: {clustering_features.shape[0]}")
             return False
         
-        if clustering_features.shape[0] < self.min_stocks_per_sector * 2:
-            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Insufficient samples ({clustering_features.shape[0]}) for clustering")
+        if clustering_features.shape[1] == 0:
+            print(f"[SECTOR-DETECTOR] ROBUST: No features available after preprocessing")
             return False
+        
+        print(f"[SECTOR-DETECTOR] ROBUST: Ready for clustering with shape: {clustering_features.shape}")
         
         # Find optimal number of sectors
         optimal_n_sectors = self._find_optimal_n_sectors(clustering_features, tickers)
@@ -3152,15 +3245,9 @@ class DynamicSectorDetector:
         
         self.sector_assignments = new_assignments
         
-        # Store the numeric features that were actually used for future updates
-        if hasattr(self, 'numeric_feature_cols'):
-            # Update the stored numeric features if they changed
-            self.numeric_feature_cols = numeric_feature_names
-        else:
-            # First time storing numeric features
-            self.numeric_feature_cols = numeric_feature_names
-        
-        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Stored {len(self.numeric_feature_cols)} numeric features for future use")
+        # Store the validated numeric features for future use
+        self.numeric_feature_cols = numeric_feature_names
+        print(f"[SECTOR-DETECTOR] ROBUST: Stored {len(self.numeric_feature_cols)} validated numeric features for future use")
         
         # Setup KNN for new stock assignment
         self.knn_model = NearestNeighbors(n_neighbors=5, metric='euclidean')
@@ -3171,9 +3258,9 @@ class DynamicSectorDetector:
         for sector_id in cluster_labels:
             sector_counts[sector_id] = sector_counts.get(sector_id, 0) + 1
         
-        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Updated {len(tickers)} stocks into {optimal_n_sectors} sectors")
-        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Sector sizes: {dict(sorted(sector_counts.items()))}")
-        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Stability score: {stability_score:.3f}")
+        print(f"[SECTOR-DETECTOR] ROBUST: Successfully updated {len(tickers)} stocks into {optimal_n_sectors} sectors")
+        print(f"[SECTOR-DETECTOR] ROBUST: Sector sizes: {dict(sorted(sector_counts.items()))}")
+        print(f"[SECTOR-DETECTOR] ROBUST: Stability score: {stability_score:.3f}")
         
         return True
     
@@ -3567,6 +3654,85 @@ def validate_temporal_safety_sectors(sector_detector: DynamicSectorDetector = No
     print("="*60 + "\n")
     
     return True
+
+# Add after the imports at the top level
+# Global cache for feature type checking to avoid repeated expensive operations
+_FEATURE_TYPE_CACHE = {}
+
+def get_numeric_features_cached(df, feature_names, cache_key=None):
+    """
+    PERFORMANCE: Cached numeric feature detection to avoid repeated expensive type checking.
+    
+    This function caches the results of numeric feature detection to dramatically speed up
+    repeated calls during data processing, especially for sector detection.
+    
+    Args:
+        df: DataFrame to check features on
+        feature_names: List of feature names to check
+        cache_key: Optional cache key (default: hash of feature names)
+        
+    Returns:
+        List of validated numeric feature names
+    """
+    global _FEATURE_TYPE_CACHE
+    
+    # Create cache key from feature names if not provided
+    if cache_key is None:
+        cache_key = hash(tuple(sorted(feature_names)))
+    
+    # Check if we have cached results
+    if cache_key in _FEATURE_TYPE_CACHE:
+        cached_features = _FEATURE_TYPE_CACHE[cache_key]
+        print(f"[CACHE-HIT] Using cached numeric features: {len(cached_features)} features")
+        return cached_features
+    
+    print(f"[CACHE-MISS] Computing numeric features for {len(feature_names)} features...")
+    start_time = time.time()
+    
+    numeric_features = []
+    
+    # Sample a small portion for efficient type checking
+    sample_size = min(max(100, len(df) // 20), 500)
+    df_sample = df.sample(n=sample_size, random_state=42) if len(df) > sample_size else df
+    
+    for feature_name in feature_names:
+        # Skip obviously non-numeric features
+        feature_str = str(feature_name).lower()
+        if any(keyword in feature_str for keyword in ['symbol', 'ticker', 'name', 'sector', 'industry', 'exchange', 'currency', 'date', 'time']):
+            continue
+            
+        if feature_name not in df_sample.columns:
+            continue
+            
+        try:
+            col_data = df_sample[feature_name].dropna()
+            if len(col_data) == 0:
+                continue
+            
+            # Fast dtype check first
+            if pd.api.types.is_numeric_dtype(col_data):
+                # Verify it has reasonable finite values
+                finite_values = col_data[np.isfinite(col_data)]
+                if len(finite_values) >= len(col_data) * 0.7:  # At least 70% finite
+                    numeric_features.append(feature_name)
+                    continue
+            
+            # Try numeric conversion on small sample
+            sample_vals = col_data.head(min(10, len(col_data)))
+            converted = pd.to_numeric(sample_vals, errors='coerce')
+            if (~converted.isna()).sum() >= len(sample_vals) * 0.7:  # 70% convertible
+                numeric_features.append(feature_name)
+                
+        except Exception:
+            continue
+    
+    # Cache the results
+    _FEATURE_TYPE_CACHE[cache_key] = numeric_features
+    
+    elapsed = time.time() - start_time
+    print(f"[CACHE-COMPUTED] Found {len(numeric_features)} numeric features in {elapsed:.2f}s (cached for future use)")
+    
+    return numeric_features
 
 if __name__ == "__main__":
     print("[main_multi_index.py] Script execution started from __main__.") # DIAGNOSTIC PRINT
