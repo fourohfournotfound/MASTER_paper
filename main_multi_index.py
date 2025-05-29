@@ -1974,20 +1974,46 @@ def main():
             if len(train_data_for_sectors) > 0:
                 # TEMPORAL-SAFE: Use EARLIEST training date for initial sector detection
                 initial_date = train_dates[0]  # Use FIRST training date, not last
-                sectors_updated = sector_detector.update_sectors(
-                    train_data_for_sectors, 
-                    initial_date,
-                    feature_cols,
-                    strict_temporal=True  # Enable temporal safety
-                )
                 
-                if sectors_updated:
-                    sector_info = sector_detector.get_sector_info()
-                    print(f"[SECTOR-INIT] Successfully detected {len(sector_info)} initial sectors using data up to {initial_date}")
-                    for sector_id, tickers in sector_info.items():
-                        print(f"  Sector {sector_id}: {len(tickers)} stocks")
+                # CRITICAL FIX: Filter to only numeric features before sector detection
+                numeric_feature_cols = []
+                for col in feature_cols:
+                    if col in train_data_for_sectors.columns:
+                        # Check if column is numeric and doesn't contain string/categorical data
+                        try:
+                            # Test if we can convert to numeric successfully
+                            sample_values = train_data_for_sectors[col].dropna().head(10)
+                            if len(sample_values) > 0:
+                                pd.to_numeric(sample_values, errors='raise')
+                                numeric_feature_cols.append(col)
+                        except (ValueError, TypeError):
+                            # Skip non-numeric columns
+                            print(f"[SECTOR-INIT] Skipping non-numeric feature: {col}")
+                            continue
+                
+                print(f"[SECTOR-INIT] Filtered to {len(numeric_feature_cols)} numeric features from {len(feature_cols)} total")
+                
+                if len(numeric_feature_cols) >= 2:  # Need at least 2 numeric features for meaningful clustering
+                    sectors_updated = sector_detector.update_sectors(
+                        train_data_for_sectors, 
+                        initial_date,
+                        numeric_feature_cols,  # Use filtered numeric features
+                        strict_temporal=True  # Enable temporal safety
+                    )
+                    
+                    if sectors_updated:
+                        sector_info = sector_detector.get_sector_info()
+                        print(f"[SECTOR-INIT] Successfully detected {len(sector_info)} initial sectors using data up to {initial_date}")
+                        for sector_id, tickers in sector_info.items():
+                            print(f"  Sector {sector_id}: {len(tickers)} stocks")
+                        
+                        # Store numeric features for later use during training updates
+                        sector_detector.numeric_feature_cols = numeric_feature_cols
+                    else:
+                        print("[SECTOR-INIT] Failed to detect initial sectors, disabling sector detection")
+                        sector_detector = None
                 else:
-                    print("[SECTOR-INIT] Failed to detect initial sectors, disabling sector detection")
+                    print(f"[SECTOR-INIT] Insufficient numeric features ({len(numeric_feature_cols)}), disabling sector detection")
                     sector_detector = None
             else:
                 print("[SECTOR-INIT] No training data available for sector detection, disabling sector detection")
@@ -2131,7 +2157,7 @@ def main():
                 sectors_updated = sector_detector.update_sectors(
                     train_data_for_sectors, 
                     current_training_date,  # Use actual current training date
-                    feature_cols,
+                    getattr(sector_detector, 'numeric_feature_cols', feature_cols),  # Use stored numeric features
                     strict_temporal=True  # Enable temporal safety
                 )
                 
@@ -2177,8 +2203,8 @@ def main():
                 processed_batches_train += 1
                 
                 if batch_idx % 25 == 0:  # Log progress
-                    sector_status = "with sector normalization" if sector_detector is not None else "global normalization"
-                    print(f"[TRAINING] Epoch {epoch+1}, Batch {batch_idx}: Loss: {batch_loss.item():.6f}, Days: {num_valid_days} ({sector_status})")
+                    normalization_status = "with sector-aware normalization" if sector_detector is not None else "with global normalization"
+                    print(f"[TRAINING] Epoch {epoch+1}, Batch {batch_idx}: Loss: {batch_loss.item():.6f}, Days: {num_valid_days} ({normalization_status})")
 
         epoch_end_time = time.time()
         epoch_duration = epoch_end_time - epoch_start_time
@@ -2338,7 +2364,7 @@ def main():
                             sectors_updated = sector_detector.update_sectors(
                                 all_historical_data, 
                                 current_prediction_date,  # Only use data up to this date
-                                feature_cols,
+                                getattr(sector_detector, 'numeric_feature_cols', feature_cols),  # Use stored numeric features
                                 strict_temporal=True  # Ensure no future data leakage
                             )
                             
@@ -2990,14 +3016,41 @@ class DynamicSectorDetector:
         ticker_features = []
         tickers = []
         
-        for ticker in recent_data.index.get_level_values('ticker').unique():
-            ticker_data = recent_data.xs(ticker, level='ticker')
-            if len(ticker_data) > 0:
-                # Use mean features over the recent period
-                avg_features = ticker_data.mean(axis=0).values
-                if not np.any(np.isnan(avg_features)):
-                    ticker_features.append(avg_features)
-                    tickers.append(ticker)
+        # CRITICAL FIX: Filter to only numeric columns before computing means
+        if len(recent_data) > 0:
+            # Test which columns are actually numeric
+            numeric_columns = []
+            for col in feature_names:
+                if col in recent_data.columns:
+                    try:
+                        # Test if this column can be converted to numeric
+                        sample_values = recent_data[col].dropna().head(10)
+                        if len(sample_values) > 0:
+                            pd.to_numeric(sample_values, errors='raise')
+                            numeric_columns.append(col)
+                    except (ValueError, TypeError):
+                        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Skipping non-numeric column {col} in feature calculation")
+                        continue
+            
+            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Using {len(numeric_columns)} numeric columns for feature calculation from {len(feature_names)} total")
+            
+            if len(numeric_columns) < 2:
+                print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Insufficient numeric columns ({len(numeric_columns)}), cannot proceed")
+                return False
+            
+            # Now calculate features using only numeric columns
+            for ticker in recent_data.index.get_level_values('ticker').unique():
+                ticker_data = recent_data.xs(ticker, level='ticker')
+                if len(ticker_data) > 0:
+                    # Use mean features over the recent period - only for numeric columns
+                    numeric_ticker_data = ticker_data[numeric_columns]
+                    avg_features = numeric_ticker_data.mean(axis=0).values
+                    if not np.any(np.isnan(avg_features)):
+                        ticker_features.append(avg_features)
+                        tickers.append(ticker)
+        else:
+            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: No recent data available")
+            return False
         
         if len(ticker_features) < self.min_stocks_per_sector * 2:
             print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Insufficient data: only {len(ticker_features)} valid tickers")
@@ -3005,9 +3058,43 @@ class DynamicSectorDetector:
         
         ticker_features = np.array(ticker_features)
         
-        # Select and prepare features for clustering
+        # CRITICAL FIX: Filter feature_names to only numeric features before clustering
+        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Filtering {len(feature_names)} features to numeric only")
+        numeric_feature_names = []
+        
+        # Get a sample of the data to test which features are numeric
+        if len(ticker_features) > 0:
+            sample_data = recent_data.head(10)  # Use recent_data for testing
+            
+            for i, feature_name in enumerate(feature_names):
+                if feature_name in sample_data.columns:
+                    try:
+                        # Test if we can convert to numeric successfully
+                        sample_values = sample_data[feature_name].dropna()
+                        if len(sample_values) > 0:
+                            pd.to_numeric(sample_values, errors='raise')
+                            numeric_feature_names.append(feature_name)
+                            print(f"[SECTOR-DETECTOR] ✅ Numeric feature: {feature_name}")
+                    except (ValueError, TypeError):
+                        print(f"[SECTOR-DETECTOR] ❌ Skipping non-numeric feature: {feature_name}")
+                        continue
+            
+            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Filtered to {len(numeric_feature_names)} numeric features from {len(feature_names)} total")
+            
+            if len(numeric_feature_names) < 2:
+                print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Insufficient numeric features ({len(numeric_feature_names)}), cannot cluster")
+                return False
+            
+            # ticker_features is already filtered to only numeric columns, no need to re-index
+            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Using {ticker_features.shape[1]} numeric features for clustering")
+        else:
+            print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: No ticker features available")
+            return False
+        
+        # Select and prepare features for clustering (using already filtered numeric_columns)
+        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Using {len(numeric_columns)} numeric features for clustering")
         try:
-            clustering_features = self._select_clustering_features(ticker_features, feature_names)
+            clustering_features = self._select_clustering_features(ticker_features, numeric_columns)
         except Exception as e:
             print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Feature selection failed: {e}")
             print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Falling back to simple feature selection")
@@ -3064,6 +3151,16 @@ class DynamicSectorDetector:
                 stability_score = stable_count / len(common_tickers)
         
         self.sector_assignments = new_assignments
+        
+        # Store the numeric features that were actually used for future updates
+        if hasattr(self, 'numeric_feature_cols'):
+            # Update the stored numeric features if they changed
+            self.numeric_feature_cols = numeric_feature_names
+        else:
+            # First time storing numeric features
+            self.numeric_feature_cols = numeric_feature_names
+        
+        print(f"[SECTOR-DETECTOR] TEMPORAL-SAFE: Stored {len(self.numeric_feature_cols)} numeric features for future use")
         
         # Setup KNN for new stock assignment
         self.knn_model = NearestNeighbors(n_neighbors=5, metric='euclidean')
