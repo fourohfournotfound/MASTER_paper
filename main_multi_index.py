@@ -1704,7 +1704,7 @@ def main():
             for batch_idx, batch_data in enumerate(test_loader):
                 # OPTIMIZED: Use simple processing for predictions - much faster
                 for day_data in batch_data:
-                    if processed_days >= len(test_dataset.unique_dates):
+                    if processed_days >= len(test_dataset.dates):
                         break  # Don't process more days than available
                         
                     X_day = day_data['X'].to(device, non_blocking=True)  # (N_stocks, seq_len, features)
