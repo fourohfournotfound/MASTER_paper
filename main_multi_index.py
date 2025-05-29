@@ -20,6 +20,19 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau # For LR scheduling
 from master import MASTERModel
 # Import specific functions we need without importing the entire base_model
 from base_model import zscore, drop_extreme
+# Import leak-free implementations
+from data_leakage_fixes import (
+    zscore_per_day, 
+    robust_loss_with_outlier_handling,
+    apply_feature_clipping,
+    temporal_split_with_purge,
+    safe_batch_forward,
+    validate_temporal_integrity,
+    detect_feature_target_leakage,
+    validate_sequence_temporal_order,
+    create_leak_free_criterion,
+    log_data_leakage_prevention_summary
+)
 
 # Setup basic logging
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
@@ -459,26 +472,31 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     feature_columns = potential_feature_cols
     print(f"[OPTIMIZED] Feature selection completed. Total features: {len(feature_columns)}")
 
-    # --- OPTIMIZED Data Splitting ---
-    # Convert dates once and reuse
-    train_val_split_dt = pd.to_datetime(train_val_split_date_str)
-    val_test_split_dt = pd.to_datetime(val_test_split_date_str)
-    forecast_horizon = 1
-    PURGE_WINDOW = lookback + forecast_horizon
-
-    train_end_excl = train_val_split_dt - pd.Timedelta(days=PURGE_WINDOW)
-    valid_end_excl = val_test_split_dt - pd.Timedelta(days=PURGE_WINDOW)
-
-    # More efficient boolean indexing
-    dates = df.index.get_level_values('date')
-    train_mask = dates < train_end_excl
-    valid_mask = (dates >= train_val_split_dt) & (dates < valid_end_excl)
-    test_mask = dates >= val_test_split_dt
-
-    # Use views instead of copies where possible to save memory
-    train_df = df.loc[train_mask].copy()  # Only copy when necessary
-    valid_df = df.loc[valid_mask].copy() if valid_mask.any() else pd.DataFrame()
-    test_df = df.loc[test_mask].copy() if test_mask.any() else pd.DataFrame()
+    # --- LEAK-FREE Data Splitting with Proper Purge Windows ---
+    print(f"[LEAK-FREE] Applying temporal split with purge windows...")
+    
+    # Log data leakage prevention summary
+    log_data_leakage_prevention_summary()
+    
+    # Use leak-free temporal splitting with purge windows
+    train_df, valid_df, test_df = temporal_split_with_purge(
+        data=df,
+        train_end_date=train_val_split_date_str,
+        val_start_date=train_val_split_date_str,
+        val_end_date=val_test_split_date_str,
+        test_start_date=val_test_split_date_str,
+        purge_days=2,  # Increased purge window for better safety
+        lookback_window=lookback,
+        forecast_horizon=1
+    )
+    
+    # Validate temporal integrity
+    validate_temporal_integrity(train_df, valid_df, test_df, min_purge_days=1)
+    
+    print(f"[LEAK-FREE] Temporal splitting completed with validation:")
+    print(f"  Train: {len(train_df)} samples")
+    print(f"  Valid: {len(valid_df)} samples") 
+    print(f"  Test:  {len(test_df)} samples")
 
     # --- FIXED: MARKET FEATURE CALCULATION AFTER SPLITTING (NO LOOK-AHEAD BIAS) ---
     def _calculate_market_features_safe(df_split, market_col_name, window=20):
@@ -1359,28 +1377,19 @@ def vectorized_batch_forward(pytorch_model, criterion, batch_data, device, is_tr
         if len(y_day) == 0:
             continue
             
-        # Apply drop_extreme for training if we have enough stocks
+        # LEAK-FREE: Apply feature clipping and per-day zscore instead of drop_extreme
         if len(y_day) >= 10 and is_training:
-            try:
-                label_mask_day, y_dropped = drop_extreme(y_day.clone())
-                if label_mask_day.dim() > 1:
-                    label_mask_day = label_mask_day.squeeze(-1)
-                    
-                if torch.any(label_mask_day):
-                    X_day_filtered = X_day[label_mask_day]
-                    y_day_processed = zscore(y_dropped)
-                else:
-                    # If drop_extreme removes everything, use all stocks with zscore
-                    X_day_filtered = X_day
-                    y_day_processed = zscore(y_day.clone())
-            except:
-                # If drop_extreme fails, fall back to zscore all
-                X_day_filtered = X_day
-                y_day_processed = zscore(y_day.clone())
+            # Apply feature clipping (safe - doesn't use labels)
+            X_day_filtered = apply_feature_clipping(X_day, clip_std=3.0)
+            
+            # Use per-day zscore normalization (safe)
+            day_indices_for_zscore = torch.zeros(len(y_day), device=device, dtype=torch.long)
+            y_day_processed = zscore_per_day(y_day.clone(), day_indices_for_zscore)
         else:
             # For validation or small batches, use all stocks
             X_day_filtered = X_day
-            y_day_processed = zscore(y_day.clone())
+            day_indices_for_zscore = torch.zeros(len(y_day), device=device, dtype=torch.long)  
+            y_day_processed = zscore_per_day(y_day.clone(), day_indices_for_zscore)
         
         if X_day_filtered.shape[0] > 0:
             final_X_list.append(X_day_filtered)
@@ -1431,58 +1440,18 @@ def vectorized_batch_forward(pytorch_model, criterion, batch_data, device, is_tr
 
 def simple_batch_forward(pytorch_model, criterion, batch_list, device, is_training=True):
     """
-    OPTIMIZED: Simple batch processing for better performance.
-    Works with simple_collate_fn that just returns a list of day data.
+    LEAK-FREE: Replace problematic drop_extreme with robust loss functions.
+    Uses safe_batch_forward from data_leakage_fixes module.
     """
-    if not batch_list:
-        return None, 0
-    
-    all_X = []
-    all_y = []
-    
-    # Simple processing - just concatenate day data
-    for day_data in batch_list:
-        X_day = day_data['X'].to(device, non_blocking=True)  # (N_stocks, seq_len, features)
-        y_day = day_data['y_original'].to(device, non_blocking=True)  # (N_stocks, 1)
-        
-        if y_day.dim() > 1 and y_day.shape[-1] == 1:
-            y_day = y_day.squeeze(-1)
-        
-        if X_day.shape[0] > 0:
-            # Apply drop_extreme and zscore if training and enough samples
-            if is_training and len(y_day) >= 10:
-                try:
-                    mask, y_filtered = drop_extreme(y_day.clone())
-                    if torch.any(mask):
-                        X_day = X_day[mask]
-                        y_day = zscore(y_filtered)
-                    else:
-                        y_day = zscore(y_day)
-                except:
-                    y_day = zscore(y_day)
-            else:
-                y_day = zscore(y_day)
-            
-            if X_day.shape[0] > 0:
-                all_X.append(X_day)
-                all_y.append(y_day)
-    
-    if not all_X:
-        return None, 0
-    
-    # Concatenate all data
-    X_batch = torch.cat(all_X, dim=0)
-    y_batch = torch.cat(all_y, dim=0)
-    
-    # Forward pass
-    preds = pytorch_model(X_batch)
-    if preds.dim() > 1:
-        preds = preds.squeeze()
-    
-    # Calculate loss
-    loss = criterion(preds, y_batch)
-    
-    return loss, len(batch_list)
+    return safe_batch_forward(
+        model=pytorch_model,
+        criterion=criterion,
+        batch_data=batch_list,
+        device=device,
+        is_training=is_training,
+        use_robust_loss=True,
+        loss_type='huber'  # Use robust Huber loss instead of drop_extreme
+    )
 
 # Add performance monitoring utility
 def monitor_performance(func_name):
