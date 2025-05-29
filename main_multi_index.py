@@ -622,7 +622,15 @@ def parse_args():
     parser.add_argument('--d_model', type=int, default=256, help="Dimension of the model (Transformer).")
     parser.add_argument('--t_nhead', type=int, default=4, help="Heads for Temporal Attention.")
     parser.add_argument('--s_nhead', type=int, default=2, help="Heads for Cross-sectional Attention.")
-    parser.add_argument('--beta', type=float, default=5.0, help="Beta for Gate mechanism or RegRankLoss.")
+    parser.add_argument('--beta', type=float, default=5.0, help="Beta for Gate mechanism or ranking loss.")
+    
+    # Loss function arguments
+    parser.add_argument('--loss_type', type=str, default='listfold_opt',
+                       choices=['regrank', 'listfold', 'listfold_opt'],
+                       help="Loss function type: 'regrank' (original), 'listfold' (ListFold for long-short), 'listfold_opt' (optimized ListFold)")
+    parser.add_argument('--listfold_transformation', type=str, default='exponential',
+                       choices=['exponential', 'sigmoid'],
+                       help="Transformation function for ListFold loss: 'exponential' (better theory) or 'sigmoid' (binary classification consistent)")
     
     # Gate configuration arguments
     parser.add_argument('--gate_method', type=str, default='auto', 
@@ -960,7 +968,9 @@ def main():
         GPU=args.gpu, 
         seed=args.seed,
         save_path=str(save_path), 
-        save_prefix=f"paper_master_arch_d{args.d_model}" 
+        save_prefix=f"paper_master_arch_d{args.d_model}",
+        loss_type=args.loss_type,
+        listfold_transformation=args.listfold_transformation
     )
     
     # OPTIMIZED: Remove redundant device transfers - handled by lazy loading
