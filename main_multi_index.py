@@ -23,7 +23,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
-from master import MASTERModel
+from master import MASTERModel, HybridMASTERModel, create_master_model
 # Import specific functions we need without importing the entire base_model
 from base_model import zscore, drop_extreme
 
@@ -1199,6 +1199,17 @@ def parse_args():
     parser.add_argument('--val_test_split_date', type=str, default=TRAIN_TEST_SPLIT_DATE)
     parser.add_argument('--save_path', type=str, default='model_output/')
     
+    # Hybrid Architecture Options
+    parser.add_argument('--efficiency_mode', type=str, default='balanced',
+                        choices=['paper_exact', 'balanced', 'fast', 'ultra_fast'],
+                        help='Architecture efficiency mode: paper_exact (original), balanced (good trade-off), fast (high speed), ultra_fast (maximum speed)')
+    
+    parser.add_argument('--seq_len', type=int, default=8,
+                        help='Sequence length for TSMixer components (used in hybrid modes)')
+    
+    parser.add_argument('--use_hybrid', action='store_true', default=False,
+                        help='Use HybridMASTERModel instead of standard MASTERModel')
+    
     args = parser.parse_args()
     
     # Handle paper architecture flag
@@ -1507,26 +1518,69 @@ def main():
     logger.info(f"Train samples: {len(X_train)}, Valid samples: {len(X_valid) if X_valid is not None else 0}, Test samples: {len(X_test) if X_test is not None else 0}")
     logger.info(f"Train unique days: {len(train_dataset)}, Valid unique days: {len(valid_dataset) if valid_dataset else 0}, Test unique days: {len(test_dataset) if test_dataset else 0}")
 
-    model_wrapper = MASTERModel( 
-        d_feat=d_feat_total, # Pass total features to the wrapper
-        d_model=args.d_model,
-        t_nhead=args.t_nhead,
-        s_nhead=args.s_nhead,
-        T_dropout_rate=args.dropout, 
-        S_dropout_rate=args.dropout,
-        beta=args.beta, 
-        gate_input_start_index=gate_input_start_index, 
-        gate_input_end_index=gate_input_end_index,     
-        n_epochs=args.epochs, 
-        lr=args.lr,
-        GPU=args.gpu, 
-        seed=args.seed,
-        save_path=str(save_path), 
-        save_prefix=f"paper_master_arch_d{args.d_model}",
-        loss_type=args.loss_type,
-        listfold_transformation=args.listfold_transformation,
-        use_paper_architecture=args.use_paper_architecture  # Enable paper-aligned architecture
-    )
+    # Model creation with hybrid support
+    if args.use_hybrid:
+        logger.info(f"🚀 Creating Hybrid MASTER Model with {args.efficiency_mode} mode")
+        
+        # Use HybridMASTERModel with efficiency mode
+        model_wrapper = HybridMASTERModel( 
+            d_feat=d_feat_total,
+            d_model=args.d_model,
+            t_nhead=args.t_nhead,
+            s_nhead=args.s_nhead,
+            T_dropout_rate=args.dropout, 
+            S_dropout_rate=args.dropout,
+            beta=args.beta,
+            gate_input_start_index=gate_input_start_index, 
+            gate_input_end_index=gate_input_end_index,     
+            n_epochs=args.epochs, 
+            lr=args.lr,
+            GPU=args.gpu, 
+            seed=args.seed,
+            save_path=str(save_path), 
+            save_prefix=f"hybrid_master_{args.efficiency_mode}_d{args.d_model}",
+            loss_type=args.loss_type,
+            listfold_transformation=args.listfold_transformation,
+            use_paper_architecture=args.use_paper_architecture,
+            efficiency_mode=args.efficiency_mode,
+            seq_len=args.seq_len
+        )
+        
+        # Log efficiency stats
+        model_info = model_wrapper.get_model_info()
+        logger.info(f"Hybrid Model Statistics:")
+        logger.info(f"  Architecture: {model_info['architecture_type']}")
+        logger.info(f"  Efficiency Mode: {model_info['efficiency_mode']}")
+        logger.info(f"  Parameters: {model_info['model_parameters']:,}")
+        if 'speed_multiplier' in model_info:
+            logger.info(f"  Expected Speed: {model_info['speed_multiplier']:.1f}x faster than paper_exact")
+            logger.info(f"  Expected Memory: {model_info['memory_multiplier']:.1f}x usage")
+            logger.info(f"  Expected Accuracy: {model_info['accuracy_retention']:.1%} retention")
+        
+    else:
+        logger.info("🏛️ Creating Standard Paper-Aligned MASTER Model")
+        
+        # Use standard MASTERModel
+        model_wrapper = MASTERModel( 
+            d_feat=d_feat_total, # Pass total features to the wrapper
+            d_model=args.d_model,
+            t_nhead=args.t_nhead,
+            s_nhead=args.s_nhead,
+            T_dropout_rate=args.dropout, 
+            S_dropout_rate=args.dropout,
+            beta=args.beta, 
+            gate_input_start_index=gate_input_start_index, 
+            gate_input_end_index=gate_input_end_index,     
+            n_epochs=args.epochs, 
+            lr=args.lr,
+            GPU=args.gpu, 
+            seed=args.seed,
+            save_path=str(save_path), 
+            save_prefix=f"paper_master_arch_d{args.d_model}",
+            loss_type=args.loss_type,
+            listfold_transformation=args.listfold_transformation,
+            use_paper_architecture=args.use_paper_architecture  # Enable paper-aligned architecture
+        )
     
     # OPTIMIZED: Remove redundant device transfers - handled by lazy loading
     pytorch_model = model_wrapper.model  # No .to(device) here
