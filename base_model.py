@@ -14,18 +14,54 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn as nn
 
-from data_leakage_fixes import (
-    zscore_per_day, 
-    robust_loss_with_outlier_handling,
-    apply_feature_clipping
-)
-
 # Setup basic logging for this module if not already configured globally
 logger = logging.getLogger(__name__)
 # Ensure a handler is configured for the logger if running this module standalone or if not configured by the main script.
 if not logger.handlers:
     logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Simple inline implementations for leak-free functions used in this file
+def zscore_per_day_simple(x, day_indices, epsilon=1e-8):
+    """Simple per-day zscore implementation for base_model.py"""
+    if x.numel() == 0:
+        return x
+    
+    normalized_x = torch.zeros_like(x)
+    unique_days = torch.unique(day_indices)
+    
+    for day_idx in unique_days:
+        day_mask = (day_indices == day_idx)
+        day_x = x[day_mask]
+        
+        if day_x.numel() == 0:
+            continue
+            
+        day_mean = day_x.mean()
+        day_std = day_x.std()
+        
+        if day_std < epsilon or torch.isnan(day_std) or torch.isinf(day_std):
+            normalized_x[day_mask] = torch.zeros_like(day_x)
+        else:
+            normalized_x[day_mask] = (day_x - day_mean) / (day_std + epsilon)
+    
+    return normalized_x
+
+def apply_feature_clipping_simple(features, clip_std=3.0):
+    """Simple feature clipping implementation for base_model.py"""
+    if features.numel() == 0:
+        return features
+    
+    clipped_features = features.clone()
+    mean_val = clipped_features.mean()
+    std_val = clipped_features.std()
+    
+    if std_val > 1e-8:
+        lower_bound = mean_val - clip_std * std_val
+        upper_bound = mean_val + clip_std * std_val
+        clipped_features = torch.clamp(clipped_features, lower_bound, upper_bound)
+    
+    return clipped_features
 
 def calc_ic(pred, label):
     df = pd.DataFrame({'pred':pred, 'label':label})
@@ -290,14 +326,14 @@ class SequenceModel():
 
                 # LEAK-FREE: Replace drop_extreme with robust loss and per-day normalization
                 # Apply feature clipping (safe - doesn't use labels)
-                processed_features = apply_feature_clipping(batch_features, clip_std=3.0)
+                processed_features = apply_feature_clipping_simple(batch_features, clip_std=3.0)
                 
                 # Create day indices for each sample in the batch  
                 samples_per_day = processed_features.shape[0] // current_accumulation
                 day_indices = torch.arange(current_accumulation, device=self.device, dtype=torch.long).repeat_interleave(samples_per_day)
                 
                 # Use per-day zscore normalization (safe)
-                processed_labels = zscore_per_day(batch_labels.clone(), day_indices)
+                processed_labels = zscore_per_day_simple(batch_labels.clone(), day_indices)
                 
                 # No more drop_extreme - use all preprocessed data
                 # Split into chunks if too large for GPU memory
