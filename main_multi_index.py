@@ -846,12 +846,40 @@ def determine_gate_indices(method, n_features_total, feature_cols, market_col_na
         return gate_start_index, gate_end_index
         
     elif method == 'calculated_market':
-        # Use the single calculated market feature
+        # Use the 6-dimensional market status features as per paper
+        market_status_cols = [
+            f'{market_col_name}_current_price',
+            f'{market_col_name}_price_mean',  
+            f'{market_col_name}_price_std',
+            f'{market_col_name}_volume_mean',
+            f'{market_col_name}_volume_std',
+            f'{market_col_name}_current_volume'
+        ]
+        
+        # Find the indices of these market status features
         try:
-            gate_idx = feature_cols.index(market_col_name)
-            return gate_idx, gate_idx + 1
-        except ValueError:
-            logger.error(f"Calculated market feature '{market_col_name}' not found in feature columns.")
+            gate_indices = []
+            for col in market_status_cols:
+                if col in feature_cols:
+                    gate_indices.append(feature_cols.index(col))
+            
+            if len(gate_indices) == 6:
+                # All 6 market status components found
+                return min(gate_indices), max(gate_indices) + 1
+            elif len(gate_indices) > 0:
+                # Some market status components found, use them
+                logger.warning(f"Only {len(gate_indices)} of 6 market status components found. Using available ones.")
+                return min(gate_indices), max(gate_indices) + 1
+            else:
+                # Fallback to looking for the base market feature name
+                if market_col_name in feature_cols:
+                    gate_idx = feature_cols.index(market_col_name)
+                    return gate_idx, gate_idx + 1
+                else:
+                    logger.error(f"No market features found with base name '{market_col_name}'")
+                    return None, None
+        except ValueError as e:
+            logger.error(f"Error finding market features: {e}")
             return None, None
             
     elif method == 'last_n':
@@ -873,26 +901,45 @@ def determine_gate_indices(method, n_features_total, feature_cols, market_col_na
         
     elif method == 'auto':
         # Smart detection: try different strategies based on dataset size and feature names
-        # Strategy 1: If we have the calculated market feature, use it
+        # Strategy 1: Look for 6-dimensional market status components (paper specification)
+        market_status_cols = [
+            f'{market_col_name}_current_price',
+            f'{market_col_name}_price_mean',  
+            f'{market_col_name}_price_std',
+            f'{market_col_name}_volume_mean',
+            f'{market_col_name}_volume_std',
+            f'{market_col_name}_current_volume'
+        ]
+        
+        gate_indices = []
+        for col in market_status_cols:
+            if col in feature_cols:
+                gate_indices.append(feature_cols.index(col))
+        
+        if len(gate_indices) >= 3:  # At least half of the market status components
+            logger.info(f"Auto mode: Found {len(gate_indices)} market status components, using them as gate inputs")
+            return min(gate_indices), max(gate_indices) + 1
+        
+        # Strategy 2: If we have the single calculated market feature, use it
         if market_col_name in feature_cols:
             try:
                 gate_idx = feature_cols.index(market_col_name)
-                logger.info(f"Auto mode: Using calculated market feature '{market_col_name}' at index {gate_idx}")
+                logger.info(f"Auto mode: Using single calculated market feature '{market_col_name}' at index {gate_idx}")
                 return gate_idx, gate_idx + 1
             except ValueError:
                 pass
         
-        # Strategy 2: Look for market-like feature names
+        # Strategy 3: Look for market-like feature names
         market_keywords = ['market', 'mrkt', 'index', 'vix', 'vol', 'volatility', 'macro', 'sentiment']
         for i, col_name in enumerate(feature_cols):
             if any(keyword.lower() in col_name.lower() for keyword in market_keywords):
                 logger.info(f"Auto mode: Found market-like feature '{col_name}' at index {i}, using as gate input")
                 return i, i + 1
         
-        # Strategy 3: Based on dataset size, use different defaults
+        # Strategy 4: Based on dataset size, use different defaults
         if n_features_total >= 50:
-            # Large dataset: use last 10% as market features (similar to paper's approach)
-            n_market_features = max(1, int(n_features_total * 0.1))
+            # Large dataset: use last 6 features as market features (for paper's 6-dimensional status)
+            n_market_features = 6
             start_idx = n_features_total - n_market_features
             logger.info(f"Auto mode: Large dataset ({n_features_total} features), using last {n_market_features} features as market features")
             return start_idx, n_features_total
@@ -906,7 +953,7 @@ def determine_gate_indices(method, n_features_total, feature_cols, market_col_na
 
 def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback, 
                           train_val_split_date_str, val_test_split_date_str,
-                          gate_method='auto', gate_n_features=1, gate_percentage=0.1,
+                          gate_method='auto', gate_n_features=6, gate_percentage=0.1,
                           gate_start_index=None, gate_end_index=None):
     """
     OPTIMIZED version of load_and_prepare_data with significant performance improvements:
@@ -1002,18 +1049,42 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     # --- PAPER-ALIGNED: MARKET STATUS REPRESENTATION (REPLACES MARKET FEATURE CALCULATION) ---
     def _calculate_paper_market_status(df_split, market_feature_col_name, d_prime=5):
         """
-        Calculate market status representation as per MASTER paper.
+        Calculate market status representation as per MASTER paper using actual market index data.
         
-        Replaces the simple market volatility with the paper's 6-dimensional market status:
+        Uses the paper's full 6-dimensional market status:
         [current_price, price_mean, price_std, volume_mean, volume_std, current_volume]
+        
+        Since we have OHLC data:
+        - current_price = closeadj (adjusted close price)
+        - current_volume = volume 
         """
         if df_split.empty or 'closeadj' not in df_split.columns or 'volume' not in df_split.columns:
             return df_split
         
         from master import MarketStatusRepresentation, prepare_market_index_data
         
-        # Get market prices and volumes (cross-sectional means as per paper)
-        market_prices, market_volumes = prepare_market_index_data(df_split)
+        # IMPROVED: Use actual market index data if available, otherwise fall back to cross-sectional means
+        # Check if we have a market index ticker (like SPY, QQQ, etc.)
+        market_tickers = ['SPY', 'QQQ', 'IWM', 'VTI', 'VOO']  # Common market index ETFs
+        available_tickers = df_split.index.get_level_values('ticker').unique()
+        market_ticker = None
+        
+        # Try to find a market index ticker in the data
+        for ticker in market_tickers:
+            if ticker in available_tickers:
+                market_ticker = ticker
+                break
+        
+        if market_ticker:
+            # Use actual market index data
+            print(f"[PAPER-ALIGNED] Using {market_ticker} as market index")
+            market_data = df_split.loc[market_ticker]
+            market_prices = market_data['closeadj']
+            market_volumes = market_data['volume']
+        else:
+            # Fall back to cross-sectional means (original method)
+            print(f"[PAPER-ALIGNED] No market index found, using cross-sectional means")
+            market_prices, market_volumes = prepare_market_index_data(df_split)
         
         # Initialize market status calculator
         market_status_calc = MarketStatusRepresentation(d_prime=d_prime)
@@ -1026,19 +1097,26 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
             m_tau = market_status_calc.construct_market_status(
                 market_prices, market_volumes, pd.Timestamp(date)
             )
-            # We'll use the first component (current_price) as the single market feature for now
-            # In full paper implementation, all 6 components would be used separately
-            market_status_data.append(m_tau[0])  # current_price
+            # Use ALL 6 components as per paper specification
+            market_status_data.append(m_tau)  # Full 6-dimensional vector
             dates_list.append(date)
         
-        # Create market status series
-        market_status_series = pd.Series(market_status_data, index=dates_list)
+        # Create DataFrame with all 6 market status components
+        market_status_df = pd.DataFrame(market_status_data, index=dates_list, columns=[
+            f'{market_feature_col_name}_current_price',
+            f'{market_feature_col_name}_price_mean',  
+            f'{market_feature_col_name}_price_std',
+            f'{market_feature_col_name}_volume_mean',
+            f'{market_feature_col_name}_volume_std',
+            f'{market_feature_col_name}_current_volume'
+        ])
         
-        # Map to all stocks on each date
-        date_to_status = market_status_series.to_dict()
-        df_split[market_feature_col_name] = df_split.index.get_level_values('date').map(date_to_status)
+        # Map to all stocks on each date (broadcast each component to all stocks)
+        for col in market_status_df.columns:
+            date_to_status = market_status_df[col].to_dict()
+            df_split[col] = df_split.index.get_level_values('date').map(date_to_status)
         
-        print(f"[PAPER-ALIGNED] Market status calculated using 6-dimensional representation (using current_price component)")
+        print(f"[PAPER-ALIGNED] Market status calculated using full 6-dimensional representation as per paper")
         
         return df_split
 
@@ -1064,9 +1142,24 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
         
         return keep_cols, dropped_cols
 
-    # Include market feature in feature columns list
-    if market_feature_col_name not in feature_columns and not train_df.empty:
-        feature_columns.append(market_feature_col_name)
+    # --- PAPER-ALIGNED: Include all 6 market status components ---
+    market_status_cols = [
+        f'{market_feature_col_name}_current_price',
+        f'{market_feature_col_name}_price_mean',  
+        f'{market_feature_col_name}_price_std',
+        f'{market_feature_col_name}_volume_mean',
+        f'{market_feature_col_name}_volume_std',
+        f'{market_feature_col_name}_current_volume'
+    ]
+    
+    # Add all 6 market status components to feature columns if not already present
+    added_market_features = 0
+    for col in market_status_cols:
+        if col not in feature_columns and not train_df.empty and col in train_df.columns:
+            feature_columns.append(col)
+            added_market_features += 1
+    
+    print(f"[PAPER-ALIGNED] Added {added_market_features} market status components to features (total: {len(market_status_cols)} expected)")
 
     feature_columns, dropped_cols = _drop_nan_cols_optimized(train_df, feature_columns)
 
@@ -1183,8 +1276,8 @@ def parse_args():
     parser.add_argument('--gate_method', type=str, default='auto', 
                        choices=['auto', 'calculated_market', 'last_n', 'percentage', 'manual'],
                        help="Method for determining gate indices: 'auto' (smart detection), 'calculated_market' (use single calculated market feature), 'last_n' (last N features), 'percentage' (last X%% of features), 'manual' (specify indices)")
-    parser.add_argument('--gate_n_features', type=int, default=1, 
-                       help="Number of features to use for gate when using 'last_n' method (default: 1)")
+    parser.add_argument('--gate_n_features', type=int, default=6, 
+                       help="Number of features to use for gate when using 'last_n' method (default: 6 for paper's 6-dimensional market status)")
     parser.add_argument('--gate_percentage', type=float, default=0.1, 
                        help="Percentage of features to use for gate when using 'percentage' method (default: 0.1 = 10%%)")
     parser.add_argument('--gate_start_index', type=int, default=None,
