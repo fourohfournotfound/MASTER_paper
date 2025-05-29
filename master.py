@@ -297,6 +297,195 @@ class RegRankLoss(nn.Module):
         return loss_terms.sum() / num_pairs
 
 
+class ListFoldLoss(nn.Module):
+    """
+    ListFold Loss for Long-Short Portfolio Strategies
+    
+    Based on: "Constructing long-short stock portfolio with a new listwise learn-to-rank algorithm"
+    by Zhang et al. (2020)
+    
+    This loss is specifically designed for long-short strategies where both top and bottom
+    rankings matter equally, making it ideal for stock portfolio construction.
+    
+    Two variants:
+    - ListFold-exp: Uses exponential transformation (better theoretical properties)
+    - ListFold-sgm: Uses sigmoid transformation (consistent with binary classification)
+    """
+    
+    def __init__(self, transformation='exponential', beta=1.0):
+        super().__init__()
+        self.transformation = transformation
+        self.beta = beta
+        
+        if transformation == 'exponential':
+            self.psi = lambda x: torch.exp(self.beta * x)
+        elif transformation == 'sigmoid':
+            self.psi = lambda x: torch.sigmoid(self.beta * x)
+        else:
+            raise ValueError("transformation must be 'exponential' or 'sigmoid'")
+    
+    def forward(self, pred, target):
+        """
+        Args:
+            pred: Predicted scores for stocks, shape (N,) or (N, 1)
+            target: Target scores/labels for ranking, shape (N,) or (N, 1)
+        
+        Returns:
+            ListFold loss value
+        """
+        if pred.dim() > 1: 
+            pred = pred.squeeze()
+        if target.dim() > 1: 
+            target = target.squeeze()
+            
+        # Handle edge cases
+        if pred.dim() == 0 or target.dim() == 0:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        if pred.shape[0] != target.shape[0]:
+            logger.error(f"Shape mismatch in ListFoldLoss: pred {pred.shape}, target {target.shape}")
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        n_stocks = pred.shape[0]
+        
+        # Need even number of stocks for pairing, if odd, ignore the middle one
+        if n_stocks < 2:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        # Sort stocks by target to get ground truth ranking
+        sorted_indices = torch.argsort(target, descending=True)
+        sorted_pred = pred[sorted_indices]
+        
+        # For odd number of stocks, we'll use n_pairs = (n_stocks // 2)
+        n_pairs = n_stocks // 2
+        
+        # If we have odd number of stocks, we'll only use the even number of top stocks
+        if n_stocks % 2 == 1:
+            sorted_pred = sorted_pred[:-1]  # Remove the middle stock
+            n_stocks = n_stocks - 1
+        
+        loss_terms = []
+        
+        # ListFold loss: pair i-th stock with (2n+1-i)-th stock
+        for i in range(n_pairs):
+            # Indices for top and bottom stocks in the sorted order
+            top_idx = i  # i-th best stock
+            bottom_idx = n_stocks - 1 - i  # (2n+1-i)-th stock (from bottom)
+            
+            # Scores of the paired stocks
+            f_top = sorted_pred[top_idx]
+            f_bottom = sorted_pred[bottom_idx]
+            
+            # Numerator: ψ(f_i - f_{2n+1-i})
+            numerator = self.psi(f_top - f_bottom)
+            
+            # Denominator: sum of ψ(f_u - f_v) for all valid pairs at this step
+            # This includes all remaining unpaired stocks
+            remaining_start = i
+            remaining_end = n_stocks - i
+            
+            if remaining_end <= remaining_start + 1:
+                # Not enough stocks left for pairing
+                break
+                
+            denominator = torch.tensor(0.0, device=pred.device)
+            
+            # Sum over all pairs (u,v) where remaining_start <= u != v <= remaining_end-1
+            for u in range(remaining_start, remaining_end):
+                for v in range(remaining_start, remaining_end):
+                    if u != v:
+                        denominator += self.psi(sorted_pred[u] - sorted_pred[v])
+            
+            # Avoid division by zero
+            if denominator <= 0:
+                denominator = torch.tensor(1e-8, device=pred.device)
+            
+            # Add log term for this pair
+            loss_term = torch.log(numerator) - torch.log(denominator)
+            loss_terms.append(loss_term)
+        
+        if not loss_terms:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        # Return negative log-likelihood (we want to minimize the loss)
+        total_loss = -torch.stack(loss_terms).sum()
+        
+        return total_loss
+
+
+class ListFoldLossOptimized(nn.Module):
+    """
+    Optimized version of ListFold Loss for better computational efficiency.
+    
+    This version reduces the computational complexity of the denominator calculation
+    while maintaining the core ListFold algorithm properties.
+    """
+    
+    def __init__(self, transformation='exponential', beta=1.0):
+        super().__init__()
+        self.transformation = transformation
+        self.beta = beta
+        
+        if transformation == 'exponential':
+            self.psi = lambda x: torch.exp(self.beta * x)
+        elif transformation == 'sigmoid':
+            self.psi = lambda x: torch.sigmoid(self.beta * x)
+        else:
+            raise ValueError("transformation must be 'exponential' or 'sigmoid'")
+    
+    def forward(self, pred, target):
+        """Optimized ListFold loss computation"""
+        if pred.dim() > 1: pred = pred.squeeze()
+        if target.dim() > 1: target = target.squeeze()
+            
+        if pred.dim() == 0 or target.dim() == 0 or pred.shape[0] < 2:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        n_stocks = pred.shape[0]
+        
+        # Sort by target (ground truth ranking)
+        sorted_indices = torch.argsort(target, descending=True)
+        sorted_pred = pred[sorted_indices]
+        
+        # Use even number of stocks
+        if n_stocks % 2 == 1:
+            sorted_pred = sorted_pred[:-1]
+            n_stocks = n_stocks - 1
+        
+        n_pairs = n_stocks // 2
+        
+        total_loss = torch.tensor(0.0, device=pred.device)
+        
+        for i in range(n_pairs):
+            top_idx = i
+            bottom_idx = n_stocks - 1 - i
+            
+            # Score difference for this pair
+            score_diff = sorted_pred[top_idx] - sorted_pred[bottom_idx]
+            
+            # Numerator: ψ(score_diff)
+            numerator = self.psi(score_diff)
+            
+            # Simplified denominator: sum over remaining stocks
+            remaining_scores = sorted_pred[i:n_stocks-i]
+            
+            # Pairwise differences for remaining stocks
+            if len(remaining_scores) >= 2:
+                score_matrix = remaining_scores.unsqueeze(0) - remaining_scores.unsqueeze(1)
+                # Remove diagonal elements (self-differences)
+                mask = ~torch.eye(len(remaining_scores), dtype=torch.bool, device=pred.device)
+                valid_diffs = score_matrix[mask]
+                denominator = torch.sum(self.psi(valid_diffs))
+            else:
+                denominator = torch.tensor(1e-8, device=pred.device)
+            
+            # Add log probability for this pair
+            if numerator > 0 and denominator > 0:
+                total_loss -= (torch.log(numerator) - torch.log(denominator))
+        
+        return total_loss
+
+
 # This class implements the architecture from the paper's `MASTER` class
 class PaperMASTERArchitecture(nn.Module):
     """
@@ -419,7 +608,18 @@ class PaperMASTERArchitecture(nn.Module):
 class MASTERModel():  # Remove SequenceModel inheritance
     def __init__(self, d_feat, d_model=256, t_nhead=4, s_nhead=2, T_dropout_rate=0.5, S_dropout_rate=0.5, 
                  beta=5.0, gate_input_start_index=0, gate_input_end_index=1, n_epochs=100, lr=0.001, 
-                 GPU=None, seed=None, save_path=None, save_prefix="master_model"):
+                 GPU=None, seed=None, save_path=None, save_prefix="master_model", 
+                 loss_type="regrank", listfold_transformation="exponential"):
+        """
+        MASTER Model for Stock Ranking
+        
+        Args:
+            loss_type: Type of loss function to use. Options:
+                - "regrank": Original RegRankLoss (default)
+                - "listfold": ListFold loss for long-short strategies  
+                - "listfold_opt": Optimized ListFold loss
+            listfold_transformation: Transformation for ListFold loss ("exponential" or "sigmoid")
+        """
 
         # OPTIMIZED: Minimal initialization to avoid expensive base class setup
         self.n_epochs = n_epochs
@@ -428,6 +628,8 @@ class MASTERModel():  # Remove SequenceModel inheritance
         self.seed = seed
         self.save_path = Path(save_path) if save_path else Path("model_output")
         self.save_prefix = save_prefix
+        self.loss_type = loss_type
+        self.listfold_transformation = listfold_transformation
         
         # FAST setup - only essential attributes without heavy operations
         self.early_stop = 20
@@ -475,8 +677,18 @@ class MASTERModel():  # Remove SequenceModel inheritance
         # FAST optimizer setup
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         
-        # FAST loss function setup
-        self.loss_fn = RegRankLoss(beta=self.beta)
+        # ENHANCED: Loss function setup with ListFold support
+        if self.loss_type == "regrank":
+            self.loss_fn = RegRankLoss(beta=self.beta)
+            logger.info(f"Using RegRankLoss with beta={self.beta}")
+        elif self.loss_type == "listfold":
+            self.loss_fn = ListFoldLoss(transformation=self.listfold_transformation, beta=self.beta)
+            logger.info(f"Using ListFoldLoss with transformation={self.listfold_transformation}, beta={self.beta}")
+        elif self.loss_type == "listfold_opt":
+            self.loss_fn = ListFoldLossOptimized(transformation=self.listfold_transformation, beta=self.beta)
+            logger.info(f"Using ListFoldLossOptimized with transformation={self.listfold_transformation}, beta={self.beta}")
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}. Choose from 'regrank', 'listfold', 'listfold_opt'")
         
         logger.info("MASTERModel (Fast Init) initialized.")
     
