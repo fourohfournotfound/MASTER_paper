@@ -16,23 +16,396 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt # Added for plotting
 from torch.optim.lr_scheduler import ReduceLROnPlateau # For LR scheduling
+import torch.nn as nn
+
+# Add the current script directory to Python path to ensure imports work
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 
 from master import MASTERModel
 # Import specific functions we need without importing the entire base_model
 from base_model import zscore, drop_extreme
-# Import leak-free implementations
-from data_leakage_fixes import (
-    zscore_per_day, 
-    robust_loss_with_outlier_handling,
-    apply_feature_clipping,
-    temporal_split_with_purge,
-    safe_batch_forward,
-    validate_temporal_integrity,
-    detect_feature_target_leakage,
-    validate_sequence_temporal_order,
-    create_leak_free_criterion,
-    log_data_leakage_prevention_summary
-)
+
+# ============================================================================
+# EMBEDDED DATA LEAKAGE PREVENTION FUNCTIONS
+# ============================================================================
+
+def zscore_per_day(x: torch.Tensor, day_indices: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+    """
+    LEAK-FREE: Apply z-score normalization per day instead of across multiple days.
+    
+    This prevents contamination where labels from day t+1 affect the normalization
+    of labels from day t during batch processing.
+    
+    Args:
+        x: Tensor of labels [N_total_stocks]
+        day_indices: Tensor indicating which day each stock belongs to [N_total_stocks]
+        epsilon: Small constant for numerical stability
+        
+    Returns:
+        Z-score normalized tensor with same shape as input
+    """
+    if x.numel() == 0:
+        return x
+    
+    normalized_x = torch.zeros_like(x)
+    unique_days = torch.unique(day_indices)
+    
+    for day_idx in unique_days:
+        day_mask = (day_indices == day_idx)
+        day_x = x[day_mask]
+        
+        if day_x.numel() == 0:
+            continue
+            
+        # Calculate stats only for this day
+        day_mean = day_x.mean()
+        day_std = day_x.std()
+        
+        # Check for problematic std (zero, very small, NaN, or Inf)
+        if day_std < epsilon or torch.isnan(day_std) or torch.isinf(day_std):
+            # If no variance, set z-scores to 0
+            normalized_x[day_mask] = torch.zeros_like(day_x)
+        else:
+            normalized_x[day_mask] = (day_x - day_mean) / (day_std + epsilon)
+    
+    return normalized_x
+
+
+def robust_loss_with_outlier_handling(predictions: torch.Tensor, 
+                                    targets: torch.Tensor,
+                                    loss_type: str = 'huber',
+                                    huber_delta: float = 1.0) -> torch.Tensor:
+    """
+    LEAK-FREE: Replace drop_extreme with robust loss functions that handle outliers
+    without using future information.
+    
+    Args:
+        predictions: Model predictions [N]
+        targets: Target labels [N]  
+        loss_type: Type of robust loss ('huber', 'mse')
+        huber_delta: Delta parameter for Huber loss
+        
+    Returns:
+        Computed loss value
+    """
+    # Filter out NaN values
+    valid_mask = ~(torch.isnan(predictions) | torch.isnan(targets))
+    if not torch.any(valid_mask):
+        return torch.tensor(0.0, device=predictions.device, requires_grad=True)
+    
+    pred_valid = predictions[valid_mask]
+    target_valid = targets[valid_mask]
+    
+    if loss_type == 'huber':
+        # Huber loss is robust to outliers without using target information
+        loss_fn = nn.HuberLoss(delta=huber_delta)
+        return loss_fn(pred_valid, target_valid)
+    else:  # Default to MSE
+        return nn.functional.mse_loss(pred_valid, target_valid)
+
+
+def apply_feature_clipping(features: torch.Tensor, 
+                          clip_std: float = 3.0,
+                          per_feature: bool = True) -> torch.Tensor:
+    """
+    LEAK-FREE: Clip features (not labels) to handle outliers.
+    
+    This operates on features only and doesn't use any label information,
+    making it safe from data leakage.
+    
+    Args:
+        features: Input features [N, seq_len, n_features] or [N, n_features]
+        clip_std: Number of standard deviations for clipping
+        per_feature: Whether to clip per feature dimension
+        
+    Returns:
+        Clipped features with same shape as input
+    """
+    if features.numel() == 0:
+        return features
+    
+    # Create a copy to avoid modifying the original
+    clipped_features = features.clone()
+    
+    if per_feature:
+        # Clip each feature dimension independently
+        if features.dim() == 3:  # [N, seq_len, n_features]
+            # Reshape to [N*seq_len, n_features] for easier processing
+            orig_shape = features.shape
+            features_2d = clipped_features.view(-1, orig_shape[-1])
+            
+            for i in range(features_2d.shape[1]):
+                feature_col = features_2d[:, i]
+                mean_val = feature_col.mean()
+                std_val = feature_col.std()
+                
+                if std_val > 1e-8:  # Avoid division by zero
+                    lower_bound = mean_val - clip_std * std_val
+                    upper_bound = mean_val + clip_std * std_val
+                    features_2d[:, i] = torch.clamp(feature_col, lower_bound, upper_bound)
+            
+            clipped_features = features_2d.view(orig_shape)
+        else:
+            # 2D case: [N, n_features]
+            for i in range(clipped_features.shape[1]):
+                feature_col = clipped_features[:, i]
+                mean_val = feature_col.mean()
+                std_val = feature_col.std()
+                
+                if std_val > 1e-8:
+                    lower_bound = mean_val - clip_std * std_val
+                    upper_bound = mean_val + clip_std * std_val
+                    clipped_features[:, i] = torch.clamp(feature_col, lower_bound, upper_bound)
+    else:
+        # Global clipping across all features
+        mean_val = clipped_features.mean()
+        std_val = clipped_features.std()
+        
+        if std_val > 1e-8:
+            lower_bound = mean_val - clip_std * std_val
+            upper_bound = mean_val + clip_std * std_val
+            clipped_features = torch.clamp(clipped_features, lower_bound, upper_bound)
+    
+    return clipped_features
+
+
+def temporal_split_with_purge(data: pd.DataFrame,
+                            train_end_date: str,
+                            val_start_date: str,
+                            val_end_date: str,
+                            test_start_date: str,
+                            purge_days: int = 1,
+                            lookback_window: int = 8,
+                            forecast_horizon: int = 1) -> tuple:
+    """
+    LEAK-FREE: Implement proper temporal splitting with purge windows.
+    
+    This ensures no data leakage between train/validation/test sets by:
+    1. Adding purge windows between splits
+    2. Ensuring no overlap in the temporal sequences
+    3. Maintaining proper chronological order
+    
+    Args:
+        data: Multi-index DataFrame with (ticker, date) index
+        train_end_date: End date for training data (exclusive)
+        val_start_date: Start date for validation data  
+        val_end_date: End date for validation data (exclusive)
+        test_start_date: Start date for test data
+        purge_days: Number of days to purge between splits
+        lookback_window: Number of days for sequence lookback
+        forecast_horizon: Number of days for forecasting
+        
+    Returns:
+        Tuple of (train_df, valid_df, test_df)
+    """
+    # Convert string dates to datetime
+    train_end_dt = pd.to_datetime(train_end_date)
+    val_start_dt = pd.to_datetime(val_start_date)
+    val_end_dt = pd.to_datetime(val_end_date)
+    test_start_dt = pd.to_datetime(test_start_date)
+    
+    # Calculate effective split dates with purge windows
+    train_effective_end = train_end_dt - pd.Timedelta(days=purge_days)
+    val_effective_start = val_start_dt + pd.Timedelta(days=purge_days)
+    val_effective_end = val_end_dt - pd.Timedelta(days=purge_days)
+    test_effective_start = test_start_dt + pd.Timedelta(days=purge_days)
+    
+    # Get date index
+    dates = data.index.get_level_values('date')
+    
+    # Create splits with proper purging
+    train_mask = dates <= train_effective_end
+    valid_mask = (dates >= val_effective_start) & (dates <= val_effective_end)
+    test_mask = dates >= test_effective_start
+    
+    train_df = data[train_mask].copy() if train_mask.any() else pd.DataFrame()
+    valid_df = data[valid_mask].copy() if valid_mask.any() else pd.DataFrame()
+    test_df = data[test_mask].copy() if test_mask.any() else pd.DataFrame()
+    
+    # Validate splits don't overlap
+    if not train_df.empty and not valid_df.empty:
+        train_last_date = train_df.index.get_level_values('date').max()
+        valid_first_date = valid_df.index.get_level_values('date').min()
+        assert train_last_date < valid_first_date, f"Train/Valid overlap: {train_last_date} >= {valid_first_date}"
+    
+    if not valid_df.empty and not test_df.empty:
+        valid_last_date = valid_df.index.get_level_values('date').max()
+        test_first_date = test_df.index.get_level_values('date').min()
+        assert valid_last_date < test_first_date, f"Valid/Test overlap: {valid_last_date} >= {test_first_date}"
+    
+    print(f"[LEAK-FREE] Temporal splitting completed with validation:")
+    print(f"  Train: {len(train_df)} samples, dates {train_df.index.get_level_values('date').min()} to {train_df.index.get_level_values('date').max()}")
+    print(f"  Valid: {len(valid_df)} samples, dates {valid_df.index.get_level_values('date').min()} to {valid_df.index.get_level_values('date').max()}")
+    print(f"  Test:  {len(test_df)} samples, dates {test_df.index.get_level_values('date').min()} to {test_df.index.get_level_values('date').max()}")
+    
+    return train_df, valid_df, test_df
+
+
+def safe_batch_forward(model: nn.Module,
+                      criterion: nn.Module,
+                      batch_data: list,
+                      device: torch.device,
+                      is_training: bool = True,
+                      use_robust_loss: bool = True,
+                      loss_type: str = 'huber') -> tuple:
+    """
+    LEAK-FREE: Process batch without using target information for filtering.
+    
+    Replaces the problematic drop_extreme usage with robust loss functions
+    and per-day normalization.
+    
+    Args:
+        model: PyTorch model
+        criterion: Loss function (will be replaced if use_robust_loss=True)
+        batch_data: List of day data dictionaries
+        device: Target device
+        is_training: Whether in training mode
+        use_robust_loss: Whether to use robust loss instead of drop_extreme
+        loss_type: Type of robust loss ('huber', 'mse')
+        
+    Returns:
+        Tuple of (loss, num_valid_days)
+    """
+    if not batch_data:
+        return None, 0
+    
+    all_X = []
+    all_y = []
+    day_indices = []
+    current_day_idx = 0
+    
+    # Collect data from all days
+    for day_data in batch_data:
+        X_day = day_data['X'].to(device, non_blocking=True)
+        y_day = day_data['y_original'].to(device, non_blocking=True)
+        
+        if y_day.dim() > 1 and y_day.shape[-1] == 1:
+            y_day = y_day.squeeze(-1)
+        
+        if X_day.shape[0] > 0:
+            # Apply feature clipping (SAFE - doesn't use labels)
+            X_day_clipped = apply_feature_clipping(X_day, clip_std=3.0)
+            
+            all_X.append(X_day_clipped)
+            all_y.append(y_day)
+            
+            # Track which day each sample belongs to
+            day_idx_tensor = torch.full((X_day.shape[0],), current_day_idx, 
+                                      device=device, dtype=torch.long)
+            day_indices.append(day_idx_tensor)
+            
+            current_day_idx += 1
+    
+    if not all_X:
+        return None, 0
+    
+    # Concatenate all data
+    X_batch = torch.cat(all_X, dim=0)
+    y_batch = torch.cat(all_y, dim=0)
+    day_indices_batch = torch.cat(day_indices, dim=0)
+    
+    # Apply per-day z-score normalization (SAFE)
+    y_normalized = zscore_per_day(y_batch, day_indices_batch)
+    
+    # Forward pass
+    predictions = model(X_batch)
+    if predictions.dim() > 1:
+        predictions = predictions.squeeze()
+    
+    # Use robust loss function instead of drop_extreme
+    if use_robust_loss:
+        loss = robust_loss_with_outlier_handling(
+            predictions, y_normalized, 
+            loss_type=loss_type
+        )
+    else:
+        # Standard loss with NaN filtering
+        valid_mask = ~(torch.isnan(predictions) | torch.isnan(y_normalized))
+        if torch.any(valid_mask):
+            loss = criterion(predictions[valid_mask], y_normalized[valid_mask])
+        else:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    return loss, len(batch_data)
+
+
+def validate_temporal_integrity(train_df: pd.DataFrame,
+                              valid_df: pd.DataFrame,
+                              test_df: pd.DataFrame,
+                              min_purge_days: int = 1) -> bool:
+    """
+    Validate that temporal splits maintain proper chronological order
+    and have adequate purge windows.
+    
+    Args:
+        train_df, valid_df, test_df: DataFrames with temporal index
+        min_purge_days: Minimum required purge window
+        
+    Returns:
+        True if validation passes, raises AssertionError otherwise
+    """
+    def get_date_range(df):
+        if df.empty:
+            return None, None
+        dates = df.index.get_level_values('date')
+        return dates.min(), dates.max()
+    
+    train_start, train_end = get_date_range(train_df)
+    valid_start, valid_end = get_date_range(valid_df)
+    test_start, test_end = get_date_range(test_df)
+    
+    # Check train-validation gap
+    if train_end and valid_start:
+        gap_days = (valid_start - train_end).days
+        assert gap_days >= min_purge_days, f"Train-Valid gap ({gap_days} days) < minimum ({min_purge_days} days)"
+    
+    # Check validation-test gap
+    if valid_end and test_start:
+        gap_days = (test_start - valid_end).days
+        assert gap_days >= min_purge_days, f"Valid-Test gap ({gap_days} days) < minimum ({min_purge_days} days)"
+    
+    print("✓ Temporal integrity validation passed")
+    return True
+
+
+def log_data_leakage_prevention_summary():
+    """Log a summary of applied data leakage prevention measures."""
+    
+    summary = """
+    =====================================
+    DATA LEAKAGE PREVENTION APPLIED
+    =====================================
+    
+    ✓ FIXED: Label-driven filtering (drop_extreme)
+      → Replaced with robust Huber loss
+      → No longer filters samples based on target values
+      
+    ✓ FIXED: Cross-temporal label normalization  
+      → Replaced with per-day z-score normalization
+      → Prevents contamination across time periods
+      
+    ✓ FIXED: Temporal data splitting
+      → Added purge windows between train/valid/test
+      → Ensured proper chronological ordering
+      
+    ✓ ADDED: Feature clipping (not label clipping)
+      → Handles outliers without using target information
+      → Maintains model robustness
+      
+    ✓ ADDED: Validation guard-rails
+      → Temporal integrity checks
+      → Sequence order validation
+      
+    =====================================
+    """
+    
+    print(summary)
+
+# ============================================================================
+# END OF EMBEDDED DATA LEAKAGE PREVENTION FUNCTIONS
+# ============================================================================
 
 # Setup basic logging
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
