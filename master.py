@@ -12,8 +12,6 @@ from torch.utils.data import DataLoader
 import torch.optim as optim
 from pathlib import Path
 
-from base_model import calc_ic, zscore, drop_extreme  # Only import what we need
-
 # Setup logger for this module
 logger = logging.getLogger(__name__)
 
@@ -797,3 +795,293 @@ class ListFoldLoss(nn.Module):
                         denominator += self.psi(sorted_pred[u] - sorted_pred[v])
             
             # Avoid division by zero
+            if denominator <= 0:
+                denominator = torch.tensor(1e-8, device=pred.device)
+            
+            # Add log term for this pair
+            loss_term = torch.log(numerator) - torch.log(denominator)
+            loss_terms.append(loss_term)
+        
+        if not loss_terms:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        # Return negative log-likelihood (we want to minimize the loss)
+        total_loss = -torch.stack(loss_terms).sum()
+        
+        return total_loss
+
+
+class ListFoldLossOptimized(nn.Module):
+    """
+    Optimized version of ListFold Loss for better computational efficiency.
+    
+    This version reduces the computational complexity of the denominator calculation
+    while maintaining the core ListFold algorithm properties.
+    """
+    
+    def __init__(self, transformation='exponential', beta=1.0):
+        super().__init__()
+        self.transformation = transformation
+        self.beta = beta
+        
+        if transformation == 'exponential':
+            self.psi = lambda x: torch.exp(self.beta * x)
+        elif transformation == 'sigmoid':
+            self.psi = lambda x: torch.sigmoid(self.beta * x)
+        else:
+            raise ValueError("transformation must be 'exponential' or 'sigmoid'")
+    
+    def forward(self, pred, target):
+        """Optimized ListFold loss computation"""
+        if pred.dim() > 1: pred = pred.squeeze()
+        if target.dim() > 1: target = target.squeeze()
+            
+        if pred.dim() == 0 or target.dim() == 0 or pred.shape[0] < 2:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        n_stocks = pred.shape[0]
+        
+        # Sort by target (ground truth ranking)
+        sorted_indices = torch.argsort(target, descending=True)
+        sorted_pred = pred[sorted_indices]
+        
+        # Use even number of stocks
+        if n_stocks % 2 == 1:
+            sorted_pred = sorted_pred[:-1]
+            n_stocks = n_stocks - 1
+        
+        n_pairs = n_stocks // 2
+        
+        total_loss = torch.tensor(0.0, device=pred.device)
+        
+        for i in range(n_pairs):
+            top_idx = i
+            bottom_idx = n_stocks - 1 - i
+            
+            # Score difference for this pair
+            score_diff = sorted_pred[top_idx] - sorted_pred[bottom_idx]
+            
+            # Numerator: ψ(score_diff)
+            numerator = self.psi(score_diff)
+            
+            # Simplified denominator: sum over remaining stocks
+            remaining_scores = sorted_pred[i:n_stocks-i]
+            
+            # Pairwise differences for remaining stocks
+            if len(remaining_scores) >= 2:
+                score_matrix = remaining_scores.unsqueeze(0) - remaining_scores.unsqueeze(1)
+                # Remove diagonal elements (self-differences)
+                mask = ~torch.eye(len(remaining_scores), dtype=torch.bool, device=pred.device)
+                valid_diffs = score_matrix[mask]
+                denominator = torch.sum(self.psi(valid_diffs))
+            else:
+                denominator = torch.tensor(1e-8, device=pred.device)
+            
+            # Add log probability for this pair
+            if numerator > 0 and denominator > 0:
+                total_loss -= (torch.log(numerator) - torch.log(denominator))
+        
+        return total_loss
+
+
+class MASTERModel():  # Remove SequenceModel inheritance
+    def __init__(self, d_feat, d_model=256, t_nhead=4, s_nhead=2, T_dropout_rate=0.5, S_dropout_rate=0.5, 
+                 beta=5.0, gate_input_start_index=0, gate_input_end_index=1, n_epochs=100, lr=0.001, 
+                 GPU=None, seed=None, save_path=None, save_prefix="master_model", 
+                 loss_type="mse", listfold_transformation="exponential", use_paper_architecture=True):
+        """
+        MASTER Model for Stock Ranking - NOW PAPER-ALIGNED BY DEFAULT
+        
+        Args:
+            loss_type: Type of loss function to use. Options:
+                - "mse": MSE loss (MASTER paper default)
+                - "regrank": Original RegRankLoss  
+                - "listfold": ListFold loss for long-short strategies  
+                - "listfold_opt": Optimized ListFold loss
+            listfold_transformation: Transformation for ListFold loss ("exponential" or "sigmoid")
+            use_paper_architecture: Whether to use paper-aligned architecture (default: True)
+        """
+
+        # OPTIMIZED: Minimal initialization to avoid expensive base class setup
+        self.n_epochs = n_epochs
+        self.lr = lr
+        self.device = torch.device(f"cuda:{GPU}" if GPU is not None and torch.cuda.is_available() else "cpu")
+        self.seed = seed
+        self.save_path = Path(save_path) if save_path else Path("model_output")
+        self.save_prefix = save_prefix
+        self.loss_type = loss_type
+        self.listfold_transformation = listfold_transformation
+        self.use_paper_architecture = use_paper_architecture
+        
+        # FAST setup - only essential attributes without heavy operations
+        self.early_stop = 20
+        self.patience = 10
+        self.decay_rate = 0.9
+        self.min_lr = 1e-05
+        self.metric = "loss"
+        
+        # Only set seed if needed - skip complex setup
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            if self.device.type == 'cuda':
+                torch.cuda.manual_seed_all(self.seed)
+        
+        # Create save directory efficiently
+        self.save_path.mkdir(parents=True, exist_ok=True)
+        
+        # Model parameters
+        self.d_feat_input_total = d_feat 
+        self.d_model = d_model
+        self.t_nhead = t_nhead
+        self.s_nhead = s_nhead
+        self.T_dropout_rate = T_dropout_rate
+        self.S_dropout_rate = S_dropout_rate
+        self.beta = beta 
+        self.gate_input_start_index = gate_input_start_index
+        self.gate_input_end_index = gate_input_end_index
+        
+        # FAST model creation - use paper-aligned architecture by default
+        if use_paper_architecture:
+            # Calculate market status dimension (6-dimensional as per paper)
+            market_status_dim = 6  # Fixed: current_price, price_mean, price_std, volume_mean, volume_std, current_volume
+            
+            # Calculate actual stock feature dimension (total features minus market features)
+            market_features_count = gate_input_end_index - gate_input_start_index
+            stock_feature_dim = self.d_feat_input_total - market_features_count
+            
+            self.model = PaperMASTERArchitecture(
+                d_feat_stock=stock_feature_dim,  # FIXED: Use actual stock features count
+                market_status_dim=market_status_dim,
+                d_model=self.d_model,
+                t_nhead=self.t_nhead,
+                s_nhead=self.s_nhead,
+                dropout=self.T_dropout_rate,
+                beta=self.beta
+            )
+            
+            # Store gate indices on the model for easy access during batch processing
+            self.model.gate_input_start_index = gate_input_start_index
+            self.model.gate_input_end_index = gate_input_end_index
+            
+            logger.info("Using Paper-Aligned MASTER Architecture (exact paper implementation)")
+        else:
+            # Legacy architecture (preserved for compatibility)
+            # Calculate actual stock feature dimension (total features minus market features)
+            market_features_count = gate_input_end_index - gate_input_start_index
+            stock_feature_dim = self.d_feat_input_total - market_features_count
+            
+            self.model = PaperMASTERArchitecture(
+                d_feat_stock=stock_feature_dim,  # FIXED: Use actual stock features count
+                market_status_dim=self.gate_input_end_index - self.gate_input_start_index,
+                d_model=self.d_model,
+                t_nhead=self.t_nhead,
+                s_nhead=self.s_nhead,
+                dropout=self.T_dropout_rate,
+                beta=self.beta
+            )
+            
+            # Store gate indices on the model for easy access during batch processing
+            self.model.gate_input_start_index = gate_input_start_index
+            self.model.gate_input_end_index = gate_input_end_index
+        
+        # Lazy initialization - only move to device when needed for first training
+        self._device_moved = False
+        
+        # FAST optimizer setup
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        
+        # ENHANCED: Loss function setup with paper-aligned MSE as default
+        if self.loss_type == "mse":
+            self.loss_fn = nn.MSELoss()
+            logger.info(f"Using MSE Loss (MASTER paper default)")
+        elif self.loss_type == "regrank":
+            self.loss_fn = RegRankLoss(beta=self.beta)
+            logger.info(f"Using RegRankLoss with beta={self.beta}")
+        elif self.loss_type == "listfold":
+            self.loss_fn = ListFoldLoss(transformation=self.listfold_transformation, beta=self.beta)
+            logger.info(f"Using ListFoldLoss with transformation={self.listfold_transformation}, beta={self.beta}")
+        elif self.loss_type == "listfold_opt":
+            self.loss_fn = ListFoldLossOptimized(transformation=self.listfold_transformation, beta=self.beta)
+            logger.info(f"Using ListFoldLossOptimized with transformation={self.listfold_transformation}, beta={self.beta}")
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}. Choose from 'mse', 'regrank', 'listfold', 'listfold_opt'")
+        
+        logger.info("MASTERModel (Paper-Aligned) initialized.")
+    
+    def _ensure_device(self):
+        """Lazy device transfer - only when actually needed"""
+        if not self._device_moved:
+            self.model = self.model.to(self.device)
+            if self.device.type == 'cuda':
+                self.loss_fn = self.loss_fn.to(self.device)
+            self._device_moved = True
+
+    def forward_paper_aligned(self, stock_features: torch.Tensor, market_status: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass using paper-aligned architecture with separated inputs
+        
+        Args:
+            stock_features: Stock-specific features (N_stocks, T_lookback, d_feat_stock)
+            market_status: Market status vector (N_stocks, market_status_dim)
+            
+        Returns:
+            predictions: Stock predictions (N_stocks,) or (N_stocks, 1)
+        """
+        self._ensure_device()
+        return self.model(stock_features, market_status)
+
+    def predict_paper_aligned(self, stock_features: torch.Tensor, market_status: torch.Tensor) -> torch.Tensor:
+        """
+        Make predictions using paper-aligned architecture
+        """
+        self.model.eval()
+        with torch.no_grad():
+            predictions = self.forward_paper_aligned(stock_features, market_status)
+        return predictions.squeeze() if predictions.dim() > 1 else predictions
+
+
+# ============================================================================
+# PAPER-ALIGNED MARKET STATUS UTILITIES
+# ============================================================================
+
+def prepare_market_index_data(df: pd.DataFrame) -> tuple:
+    """
+    Prepare market index price and volume series from the dataset as per MASTER paper
+    
+    Args:
+        df: Multi-index DataFrame with (ticker, date) index
+        
+    Returns:
+        market_prices: Series of daily market index prices (cross-sectional mean)
+        market_volumes: Series of daily market index volumes (cross-sectional mean)
+    """
+    # Calculate daily market index as cross-sectional means (paper method)
+    daily_market_data = df.groupby(level='date').agg({
+        'closeadj': 'mean',  # Market index price
+        'volume': 'mean'     # Market index volume
+    })
+    
+    market_prices = daily_market_data['closeadj']
+    market_volumes = daily_market_data['volume']
+    
+    return market_prices, market_volumes
+
+
+def normalize_returns_per_day(targets: np.ndarray, dates: list) -> np.ndarray:
+    """
+    Normalize returns using daily z-score as specified in the MASTER paper:
+    r_u = Norm_S(ř_u) where ř_u is the raw return ratio
+    
+    This replaces global normalization with paper-specified daily z-score normalization.
+    """
+    df_temp = pd.DataFrame({
+        'date': dates,
+        'target': targets
+    })
+    
+    # Group by date and normalize (daily z-score as per paper)
+    def zscore_normalize(group):
+        return (group - group.mean()) / (group.std() + 1e-8)
+    
+    normalized = df_temp.groupby('date')['target'].transform(zscore_normalize)
+    return normalized.values
