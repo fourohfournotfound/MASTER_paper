@@ -223,15 +223,18 @@ def safe_batch_forward(model: nn.Module,
                       use_robust_loss: bool = True,
                       loss_type: str = 'huber') -> tuple:
     """
-    OPTIMIZED: Streamlined batch processing with minimal overhead.
-    ~20x faster than the original complex version.
+    PAPER-ALIGNED: Updated batch processing to handle both legacy and paper-aligned architectures.
     
-    Replaces the problematic drop_extreme usage with robust loss functions
-    and per-day normalization.
+    For paper-aligned architecture:
+    - Separates stock features from market status
+    - Calls model with both arguments: model(stock_features, market_status)
+    
+    For legacy architecture:
+    - Uses combined features: model(X_batch)
     
     Args:
-        model: PyTorch model
-        criterion: Loss function (will be replaced if use_robust_loss=True)
+        model: PyTorch model (MASTERModel.model)
+        criterion: Loss function 
         batch_data: List of day data dictionaries
         device: Target device
         is_training: Whether in training mode
@@ -292,8 +295,61 @@ def safe_batch_forward(model: nn.Module,
     # Fast per-day z-score normalization (SAFE)
     y_normalized = zscore_per_day(y_batch, day_indices[:current_idx])
     
-    # Forward pass
-    predictions = model(X_batch)
+    # PAPER-ALIGNED: Check if model uses paper architecture
+    if hasattr(model, 'gate') and hasattr(model.gate, 'market_dim'):
+        # Paper-aligned architecture: separate stock features from market status
+        
+        # Use the actual gate indices from the model configuration
+        if hasattr(model, 'gate_input_start_index') and hasattr(model, 'gate_input_end_index'):
+            gate_start = model.gate_input_start_index
+            gate_end = model.gate_input_end_index
+            
+            # Split features using actual gate indices
+            stock_features = torch.cat([
+                X_batch[:, :, :gate_start],           # Features before gate
+                X_batch[:, :, gate_end:]              # Features after gate (if any)
+            ], dim=-1) if gate_end < X_batch.shape[-1] else X_batch[:, :, :gate_start]
+            
+            # Extract market features from gate indices
+            market_features = X_batch[:, :, gate_start:gate_end]  # (N, T, gate_features)
+            
+            # For market status, use the last timestep's market features
+            market_status_raw = market_features[:, -1, :]  # (N, gate_features)
+            
+            # Convert to 6-dimensional market status as per paper
+            # If we have multiple gate features, use them; otherwise expand single feature
+            if market_status_raw.shape[-1] == 6:
+                market_status = market_status_raw
+            elif market_status_raw.shape[-1] == 1:
+                # Expand single market feature to 6-dimensional status vector
+                single_market_val = market_status_raw[:, 0].unsqueeze(1)  # (N, 1)
+                market_status = torch.cat([
+                    single_market_val,  # current_price
+                    single_market_val,  # price_mean (placeholder)
+                    torch.zeros_like(single_market_val),  # price_std
+                    single_market_val,  # volume_mean (placeholder)
+                    torch.zeros_like(single_market_val),  # volume_std
+                    single_market_val   # current_volume (placeholder)
+                ], dim=1)  # (N, 6)
+            else:
+                # For other sizes, take first 6 or pad to 6
+                if market_status_raw.shape[-1] >= 6:
+                    market_status = market_status_raw[:, :6]
+                else:
+                    # Pad to 6 dimensions
+                    pad_size = 6 - market_status_raw.shape[-1]
+                    padding = torch.zeros(market_status_raw.shape[0], pad_size, device=market_status_raw.device)
+                    market_status = torch.cat([market_status_raw, padding], dim=1)
+            
+            # Forward pass with separated inputs
+            predictions = model(stock_features, market_status)
+        else:
+            # Fallback: use legacy approach if gate indices not available
+            predictions = model(X_batch)
+    else:
+        # Legacy architecture: use combined features
+        predictions = model(X_batch)
+    
     if predictions.dim() > 1:
         predictions = predictions.squeeze()
     
@@ -579,65 +635,150 @@ def choose_sequence_method(data_multi_index, features_list, target_list, lookbac
         return create_sequences_multi_index_vectorized(data_multi_index, features_list, target_list, lookback_window, forecast_horizon)
 
 class DailyGroupedTimeSeriesDataset(Dataset):
+    """
+    Dataset that groups data by day for efficient batch processing.
+    Now supports both legacy and paper-aligned architectures.
+    """
     def __init__(self, X_sequences, y_targets, multi_index, device=None, pin_memory=False, preprocess_labels=False):
         """
-        SIMPLIFIED Dataset - removed expensive pre-processing that was causing slowdowns.
-        Now uses lazy loading for better performance.
+        Args:
+            X_sequences: Features sequences [N, T, F]
+            y_targets: Target values [N]
+            multi_index: MultiIndex with (ticker, date)
+            device: Target device for tensors
+            pin_memory: Whether to pin memory for faster GPU transfer
+            preprocess_labels: Whether to apply label preprocessing (kept for compatibility)
         """
-        if not isinstance(multi_index, pd.MultiIndex):
-            raise ValueError("multi_index must be a Pandas MultiIndex.")
-        if not ('date' in multi_index.names and 'ticker' in multi_index.names):
-            raise ValueError("multi_index must have 'ticker' and 'date' as level names.")
+        self.device = device
+        self.pin_memory = pin_memory
+        self.preprocess_labels = preprocess_labels
 
+        # Convert inputs to numpy for consistency
+        if isinstance(X_sequences, torch.Tensor):
+            X_sequences = X_sequences.cpu().numpy()
+        if isinstance(y_targets, torch.Tensor):
+            y_targets = y_targets.cpu().numpy()
+
+        # Store raw sequences and targets
         self.X_sequences = X_sequences
         self.y_targets = y_targets
         self.multi_index = multi_index
-        self.target_device = device
-        self.pin_memory = pin_memory
-        self.preprocess_labels = preprocess_labels
+
+        # Group data by date for daily batching
+        self._group_data_by_date()
         
-        # Get unique dates efficiently
-        self.unique_dates = sorted(self.multi_index.get_level_values('date').unique())
+    def _group_data_by_date(self):
+        """Group sequences by date for batch processing"""
+        self.daily_data = {}
         
-        # Create a simple mapping from date to indices - much faster than pre-processing everything
-        self.date_to_indices = {}
-        for i, date_val in enumerate(self.unique_dates):
-            date_mask = self.multi_index.get_level_values('date') == date_val
-            self.date_to_indices[date_val] = np.where(date_mask)[0]
+        # Get unique dates maintaining order
+        unique_dates = self.multi_index.get_level_values('date').unique()
         
-        print(f"[DailyGroupedTimeSeriesDataset] SIMPLIFIED initialization for {len(self.unique_dates)} unique dates - using lazy loading")
+        for i, (ticker, date) in enumerate(self.multi_index):
+            if date not in self.daily_data:
+                self.daily_data[date] = {
+                    'X': [],
+                    'y_original': [],
+                    'indices': []
+                }
+            
+            self.daily_data[date]['X'].append(self.X_sequences[i])
+            self.daily_data[date]['y_original'].append(self.y_targets[i])
+            self.daily_data[date]['indices'].append(i)
+        
+        # Convert lists to arrays for each date
+        for date in self.daily_data:
+            self.daily_data[date]['X'] = torch.tensor(
+                np.array(self.daily_data[date]['X']), 
+                dtype=torch.float32, 
+                pin_memory=self.pin_memory
+            )
+            self.daily_data[date]['y_original'] = torch.tensor(
+                np.array(self.daily_data[date]['y_original']), 
+                dtype=torch.float32, 
+                pin_memory=self.pin_memory
+            )
+        
+        self.dates = list(self.daily_data.keys())
 
     def __len__(self):
-        """Returns the number of unique days in the dataset."""
-        return len(self.unique_dates)
+        """Return number of unique trading days"""
+        return len(self.dates)
 
     def __getitem__(self, idx):
         """
-        SIMPLIFIED: Returns data for a single day with lazy tensor conversion.
-        Much faster than pre-processing everything.
+        Get data for a specific trading day
+        
+        Returns:
+            dict: Dictionary containing daily batch data
         """
-        selected_date = self.unique_dates[idx]
-        day_indices = self.date_to_indices[selected_date]
+        date = self.dates[idx]
+        daily_batch = self.daily_data[date].copy()
         
-        # Get data for this day - lazy conversion to tensors
-        X_day = self.X_sequences[day_indices]
-        y_day = self.y_targets[day_indices]
+        # Apply device transfer if specified
+        if self.device:
+            daily_batch['X'] = daily_batch['X'].to(self.device, non_blocking=True)
+            daily_batch['y_original'] = daily_batch['y_original'].to(self.device, non_blocking=True)
         
-        # Convert to tensors only when needed
-        X_tensor = torch.tensor(X_day, dtype=torch.float32)
-        y_tensor = torch.tensor(y_day, dtype=torch.float32)
-        
-        # Simple return without complex pre-processing
-        return {
-            'X': X_tensor,
-            'y_original': y_tensor,
-            'label_mask': None,  # Will be processed in training loop if needed
-            'y_processed': None  # Will be processed in training loop if needed
-        }
+        daily_batch['date'] = date
+        return daily_batch
+
+    def get_date_at_index(self, idx):
+        """Get the date for a given index"""
+        return self.dates[idx]
 
     def get_index(self):
-        """Returns the original multi_index, useful for aligning predictions."""
+        """Get the MultiIndex for compatibility"""
         return self.multi_index
+
+
+class PaperAlignedDataset(Dataset):
+    """
+    Dataset for paper-aligned MASTER architecture that separates stock features and market status.
+    
+    This handles the separation of stock-specific features and market status vectors
+    as required by the exact paper implementation.
+    """
+    
+    def __init__(self, 
+                 stock_sequences: np.ndarray,
+                 market_status_vectors: np.ndarray,
+                 targets: np.ndarray,
+                 dates: list,
+                 tickers: list = None,
+                 device=None):
+        """
+        Args:
+            stock_sequences: (N, T, d_feat_stock) - stock-specific features only
+            market_status_vectors: (N, 6) - market status as per paper
+            targets: (N,) - target labels
+            dates: List of dates for each sample
+            tickers: List of tickers for each sample (optional)
+            device: Target device
+        """
+        self.stock_sequences = torch.tensor(stock_sequences, dtype=torch.float32)
+        self.market_status_vectors = torch.tensor(market_status_vectors, dtype=torch.float32)
+        self.targets = torch.tensor(targets, dtype=torch.float32)
+        self.dates = dates
+        self.tickers = tickers
+        self.device = device
+        
+        if device:
+            self.stock_sequences = self.stock_sequences.to(device)
+            self.market_status_vectors = self.market_status_vectors.to(device)
+            self.targets = self.targets.to(device)
+    
+    def __len__(self):
+        return len(self.stock_sequences)
+    
+    def __getitem__(self, idx):
+        return {
+            'stock_features': self.stock_sequences[idx],
+            'market_status': self.market_status_vectors[idx],
+            'target': self.targets[idx],
+            'date': self.dates[idx],
+            'ticker': self.tickers[idx] if self.tickers else None
+        }
 
 def preprocess_data(df, features_list, label_column, lookback_window, scaler=None, fit_scaler=False):
     """
@@ -858,33 +999,55 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     print(f"  Valid: {len(valid_df)} samples") 
     print(f"  Test:  {len(test_df)} samples")
 
-    # --- FIXED: MARKET FEATURE CALCULATION AFTER SPLITTING (NO LOOK-AHEAD BIAS) ---
-    def _calculate_market_features_safe(df_split, market_col_name, window=20):
-        """Calculate market features for a data split without look-ahead bias."""
-        if df_split.empty or 'closeadj' not in df_split.columns:
+    # --- PAPER-ALIGNED: MARKET STATUS REPRESENTATION (REPLACES MARKET FEATURE CALCULATION) ---
+    def _calculate_paper_market_status(df_split, market_feature_col_name, d_prime=5):
+        """
+        Calculate market status representation as per MASTER paper.
+        
+        Replaces the simple market volatility with the paper's 6-dimensional market status:
+        [current_price, price_mean, price_std, volume_mean, volume_std, current_volume]
+        """
+        if df_split.empty or 'closeadj' not in df_split.columns or 'volume' not in df_split.columns:
             return df_split
         
-        # Calculate daily market average (cross-sectional mean) for this split only
-        daily_avg_closeadj = df_split.groupby(level='date')['closeadj'].mean()
+        from master import MarketStatusRepresentation, prepare_market_index_data
         
-        # Calculate rolling volatility using only past data (causal)
-        market_volatility = daily_avg_closeadj.rolling(
-            window=window, 
-            min_periods=1
-        ).std().ffill()  # Forward fill only - no backward fill
+        # Get market prices and volumes (cross-sectional means as per paper)
+        market_prices, market_volumes = prepare_market_index_data(df_split)
         
-        # Map volatility to all stocks on each date
-        date_to_vol = market_volatility.to_dict()
-        df_split[market_col_name] = df_split.index.get_level_values('date').map(date_to_vol)
+        # Initialize market status calculator
+        market_status_calc = MarketStatusRepresentation(d_prime=d_prime)
+        
+        # For each date, calculate the 6-dimensional market status
+        market_status_data = []
+        dates_list = []
+        
+        for date in df_split.index.get_level_values('date').unique():
+            m_tau = market_status_calc.construct_market_status(
+                market_prices, market_volumes, pd.Timestamp(date)
+            )
+            # We'll use the first component (current_price) as the single market feature for now
+            # In full paper implementation, all 6 components would be used separately
+            market_status_data.append(m_tau[0])  # current_price
+            dates_list.append(date)
+        
+        # Create market status series
+        market_status_series = pd.Series(market_status_data, index=dates_list)
+        
+        # Map to all stocks on each date
+        date_to_status = market_status_series.to_dict()
+        df_split[market_feature_col_name] = df_split.index.get_level_values('date').map(date_to_status)
+        
+        print(f"[PAPER-ALIGNED] Market status calculated using 6-dimensional representation (using current_price component)")
         
         return df_split
 
-    # Apply market feature calculation to each split independently
-    print(f"[FIXED] Calculating market features per split to prevent look-ahead bias...")
-    train_df = _calculate_market_features_safe(train_df, market_feature_col_name)
-    valid_df = _calculate_market_features_safe(valid_df, market_feature_col_name) if not valid_df.empty else valid_df
-    test_df = _calculate_market_features_safe(test_df, market_feature_col_name) if not test_df.empty else test_df
-    print(f"[FIXED] Market features calculated safely for all splits")
+    # Apply paper-aligned market status calculation to each split independently
+    print(f"[PAPER-ALIGNED] Calculating market status per split to prevent look-ahead bias...")
+    train_df = _calculate_paper_market_status(train_df, market_feature_col_name)
+    valid_df = _calculate_paper_market_status(valid_df, market_feature_col_name) if not valid_df.empty else valid_df
+    test_df = _calculate_paper_market_status(test_df, market_feature_col_name) if not test_df.empty else test_df
+    print(f"[PAPER-ALIGNED] Market status calculated for all splits using paper methodology")
 
     # --- OPTIMIZED NaN Column Dropping ---
     def _drop_nan_cols_optimized(slice_df: pd.DataFrame, cols: list, threshold: float = 0.30):
@@ -990,27 +1153,33 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
 
 def parse_args():
     print("[main_multi_index.py] Parsing arguments.")
-    parser = argparse.ArgumentParser(description="Train MASTER model on multi-index stock data.")
+    parser = argparse.ArgumentParser(description="Train MASTER model on multi-index stock data - Paper Aligned by Default.")
     parser.add_argument('--csv', type=str, required=True, help="Path to the input CSV file.")
     parser.add_argument('--epochs', type=int, default=50, help="Number of training epochs.")
-    parser.add_argument('--lr', type=float, default=0.001, help="Learning rate.")
+    parser.add_argument('--lr', type=float, default=1e-5, help="Learning rate (paper default: 1e-5).")
     parser.add_argument('--d_feat', type=int, default=None, help="Dimension of features (if None, inferred).")
-    parser.add_argument('--dropout', type=float, default=0.5, help="Dropout rate for MASTERModel attention.")
+    parser.add_argument('--dropout', type=float, default=0.1, help="Dropout rate for MASTER attention (paper default: 0.1).")
     
     parser.add_argument('--d_model', type=int, default=256, help="Dimension of the model (Transformer).")
-    parser.add_argument('--t_nhead', type=int, default=4, help="Heads for Temporal Attention.")
-    parser.add_argument('--s_nhead', type=int, default=2, help="Heads for Cross-sectional Attention.")
-    parser.add_argument('--beta', type=float, default=5.0, help="Beta for Gate mechanism or ranking loss.")
+    parser.add_argument('--t_nhead', type=int, default=4, help="Heads for Temporal Attention (paper default: 4).")
+    parser.add_argument('--s_nhead', type=int, default=2, help="Heads for Cross-sectional Attention (paper default: 2).")
+    parser.add_argument('--beta', type=float, default=5.0, help="Beta for Gate mechanism (paper default: 5.0 for CSI300, 2.0 for CSI800).")
     
-    # Loss function arguments
-    parser.add_argument('--loss_type', type=str, default='listfold_opt',
-                       choices=['regrank', 'listfold', 'listfold_opt'],
-                       help="Loss function type: 'regrank' (original), 'listfold' (ListFold for long-short), 'listfold_opt' (optimized ListFold)")
+    # Loss function arguments - PAPER ALIGNED
+    parser.add_argument('--loss_type', type=str, default='mse',
+                       choices=['mse', 'regrank', 'listfold', 'listfold_opt'],
+                       help="Loss function type: 'mse' (MASTER paper default), 'regrank' (original), 'listfold' (ListFold for long-short), 'listfold_opt' (optimized ListFold)")
     parser.add_argument('--listfold_transformation', type=str, default='exponential',
                        choices=['exponential', 'sigmoid'],
                        help="Transformation function for ListFold loss: 'exponential' (better theory) or 'sigmoid' (binary classification consistent)")
     
-    # Gate configuration arguments
+    # Paper alignment control
+    parser.add_argument('--use_paper_architecture', action='store_true', default=True,
+                       help="Use paper-aligned MASTER architecture (default: True)")
+    parser.add_argument('--disable_paper_architecture', action='store_true', default=False,
+                       help="Disable paper-aligned architecture and use legacy version")
+    
+    # Gate configuration arguments (kept for compatibility)
     parser.add_argument('--gate_method', type=str, default='auto', 
                        choices=['auto', 'calculated_market', 'last_n', 'percentage', 'manual'],
                        help="Method for determining gate indices: 'auto' (smart detection), 'calculated_market' (use single calculated market feature), 'last_n' (last N features), 'percentage' (last X%% of features), 'manual' (specify indices)")
@@ -1025,13 +1194,20 @@ def parse_args():
     
     parser.add_argument('--gpu', type=int, default=None, help="GPU ID (e.g., 0). None for CPU.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed.")
-    parser.add_argument('--lookback', type=int, default=LOOKBACK_WINDOW, help="Lookback window.")
+    parser.add_argument('--lookback', type=int, default=LOOKBACK_WINDOW, help="Lookback window (paper default: 8).")
     parser.add_argument('--train_val_split_date', type=str, default=VALIDATION_SPLIT_DATE)
     parser.add_argument('--val_test_split_date', type=str, default=TRAIN_TEST_SPLIT_DATE)
     parser.add_argument('--save_path', type=str, default='model_output/')
     
     args = parser.parse_args()
+    
+    # Handle paper architecture flag
+    if args.disable_paper_architecture:
+        args.use_paper_architecture = False
+    
     print(f"[main_multi_index.py] Arguments parsed: {args}")
+    print(f"[PAPER-ALIGNED] Using paper architecture: {args.use_paper_architecture}")
+    print(f"[PAPER-ALIGNED] Using loss type: {args.loss_type}")
     return args
 
 def calculate_sortino_ratio(daily_returns, risk_free_rate=0.0, target_return=0.0, periods_per_year=252):
@@ -1348,7 +1524,8 @@ def main():
         save_path=str(save_path), 
         save_prefix=f"paper_master_arch_d{args.d_model}",
         loss_type=args.loss_type,
-        listfold_transformation=args.listfold_transformation
+        listfold_transformation=args.listfold_transformation,
+        use_paper_architecture=args.use_paper_architecture  # Enable paper-aligned architecture
     )
     
     # OPTIMIZED: Remove redundant device transfers - handled by lazy loading
@@ -1537,8 +1714,8 @@ def main():
                         y_day = y_day.squeeze(-1)
                     
                     if X_day.shape[0] > 0:
-                        # Simple forward pass without preprocessing (this is inference)
-                        preds = pytorch_model(X_day)  # (N_stocks, 1)
+                        # PAPER-ALIGNED: Use helper function for predictions
+                        preds = predict_with_model(pytorch_model, X_day, use_paper_architecture=args.use_paper_architecture)
                         if preds.dim() > 1:
                             preds = preds.squeeze()  # (N_stocks,)
                         
@@ -1546,7 +1723,7 @@ def main():
                         actuals_cpu = y_day.cpu().numpy()
                         
                         # Get the current date being processed
-                        current_date = test_dataset.unique_dates[processed_days]
+                        current_date = test_dataset.dates[processed_days]
                         
                         # Get tickers for this day efficiently
                         day_mask = test_dataset.multi_index.get_level_values('date') == current_date
@@ -1770,7 +1947,7 @@ def vectorized_batch_forward(pytorch_model, criterion, batch_data, device, is_tr
         return None, 0
     
     # Single vectorized forward pass for ALL processed stocks from ALL days
-    preds = pytorch_model(X_final)  # [total_processed_stocks, 1]
+    preds = predict_with_model(pytorch_model, X_final, use_paper_architecture=True)
     preds = preds.squeeze()  # [total_processed_stocks]
     y_final = y_final.squeeze()  # [total_processed_stocks]
     
@@ -1855,6 +2032,72 @@ def test_permuted_dates():
     perm_indices = np.random.permutation(len(X_permuted))
     X_permuted = X_permuted[perm_indices]
     # Train model - accuracy should be near random
+
+def predict_with_model(model, X_batch, use_paper_architecture=True):
+    """
+    Helper function to make predictions with either paper-aligned or legacy architecture.
+    
+    Args:
+        model: The PyTorch model
+        X_batch: Input features (N, T, F)
+        use_paper_architecture: Whether model uses paper-aligned architecture
+        
+    Returns:
+        Model predictions
+    """
+    if use_paper_architecture and hasattr(model, 'gate') and hasattr(model.gate, 'market_dim'):
+        # Paper-aligned architecture: separate stock features from market status
+        
+        # Use the actual gate indices from the model configuration
+        if hasattr(model, 'gate_input_start_index') and hasattr(model, 'gate_input_end_index'):
+            gate_start = model.gate_input_start_index
+            gate_end = model.gate_input_end_index
+            
+            # Split features using actual gate indices
+            stock_features = torch.cat([
+                X_batch[:, :, :gate_start],           # Features before gate
+                X_batch[:, :, gate_end:]              # Features after gate (if any)
+            ], dim=-1) if gate_end < X_batch.shape[-1] else X_batch[:, :, :gate_start]
+            
+            # Extract market features from gate indices
+            market_features = X_batch[:, :, gate_start:gate_end]  # (N, T, gate_features)
+            
+            # For market status, use the last timestep's market features
+            market_status_raw = market_features[:, -1, :]  # (N, gate_features)
+            
+            # Convert to 6-dimensional market status as per paper
+            # If we have multiple gate features, use them; otherwise expand single feature
+            if market_status_raw.shape[-1] == 6:
+                market_status = market_status_raw
+            elif market_status_raw.shape[-1] == 1:
+                # Expand single market feature to 6-dimensional status vector
+                single_market_val = market_status_raw[:, 0].unsqueeze(1)  # (N, 1)
+                market_status = torch.cat([
+                    single_market_val,  # current_price
+                    single_market_val,  # price_mean (placeholder)
+                    torch.zeros_like(single_market_val),  # price_std
+                    single_market_val,  # volume_mean (placeholder)
+                    torch.zeros_like(single_market_val),  # volume_std
+                    single_market_val   # current_volume (placeholder)
+                ], dim=1)  # (N, 6)
+            else:
+                # For other sizes, take first 6 or pad to 6
+                if market_status_raw.shape[-1] >= 6:
+                    market_status = market_status_raw[:, :6]
+                else:
+                    # Pad to 6 dimensions
+                    pad_size = 6 - market_status_raw.shape[-1]
+                    padding = torch.zeros(market_status_raw.shape[0], pad_size, device=market_status_raw.device)
+                    market_status = torch.cat([market_status_raw, padding], dim=1)
+            
+            # Forward pass with separated inputs
+            return model(stock_features, market_status)
+        else:
+            # Fallback: use legacy approach if gate indices not available
+            return model(X_batch)
+    else:
+        # Legacy architecture: use combined features
+        return model(X_batch)
 
 if __name__ == "__main__":
     print("[main_multi_index.py] Script execution started from __main__.") # DIAGNOSTIC PRINT
