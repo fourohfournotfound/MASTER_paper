@@ -432,8 +432,8 @@ def load_and_prepare_data_optimized(csv_path, feature_cols_start_idx, lookback,
     if 'label' not in df.columns:
         label_source_col = 'closeadj'  # Primary choice
         if label_source_col in df.columns:
-            # Calculate returns (from t-1 to t)
-            df['returns'] = df.groupby(level='ticker')[label_source_col].pct_change(1)
+            # Method 1: Calculate forward returns directly
+            df['returns'] = df.groupby(level='ticker')[label_source_col].pct_change(1).shift(-1)
 
             # Shift to create forward-looking targets (return from t to t+1)
             df['label'] = df.groupby(level='ticker')['returns'].shift(-1)
