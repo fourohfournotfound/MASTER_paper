@@ -14,6 +14,12 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.nn as nn
 
+from data_leakage_fixes import (
+    zscore_per_day, 
+    robust_loss_with_outlier_handling,
+    apply_feature_clipping
+)
+
 # Setup basic logging for this module if not already configured globally
 logger = logging.getLogger(__name__)
 # Ensure a handler is configured for the logger if running this module standalone or if not configured by the main script.
@@ -282,11 +288,18 @@ class SequenceModel():
                     noise = torch.randn_like(batch_features) * self.train_noise
                     batch_features = batch_features + noise
 
-                # Process the entire large batch
-                mask, processed_labels = drop_extreme(batch_labels)
-                processed_features = batch_features[mask, :, :]
-                processed_labels = zscore(processed_labels)
+                # LEAK-FREE: Replace drop_extreme with robust loss and per-day normalization
+                # Apply feature clipping (safe - doesn't use labels)
+                processed_features = apply_feature_clipping(batch_features, clip_std=3.0)
                 
+                # Create day indices for each sample in the batch  
+                samples_per_day = processed_features.shape[0] // current_accumulation
+                day_indices = torch.arange(current_accumulation, device=self.device, dtype=torch.long).repeat_interleave(samples_per_day)
+                
+                # Use per-day zscore normalization (safe)
+                processed_labels = zscore_per_day(batch_labels.clone(), day_indices)
+                
+                # No more drop_extreme - use all preprocessed data
                 # Split into chunks if too large for GPU memory
                 chunk_size = min(len(processed_features), 2048)  # Larger chunks
                 total_loss = 0.0
